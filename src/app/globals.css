@@ -1,0 +1,19 @@
+:root{
+  color-scheme: light;
+  --bg: #fbfdfb;
+  --ink: #0f172a;
+  --muted: rgba(15,23,42,.7);
+  --border: rgba(15,23,42,.12);
+  --card: #ffffff;
+  --primary: #1f7a4a;
+  --primary-ink: #ffffff;
+}
+*{ box-sizing: border-box; }
+body{
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+  background: var(--bg);
+  color: var(--ink);
+}
+a{ color: inherit; text-decoration: none; }
+h1,h2,h3{ margin: 0; }
