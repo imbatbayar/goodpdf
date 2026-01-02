@@ -1,11 +1,11 @@
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
+export const runtime = "nodejs";
 
 import { NextResponse } from "next/server";
+import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { supabaseServer } from "@/lib/supabase/server";
-
-// worker-local/worker.mjs-тай нэг мөр
-const BUCKET_OUT = process.env.BUCKET_OUT || "jobs-output";
 
 function json(ok: boolean, error?: string, status = 200) {
   return NextResponse.json(
@@ -14,12 +14,30 @@ function json(ok: boolean, error?: string, status = 200) {
   );
 }
 
+// R2 env (Next сервер талаас уншина)
+const R2_ENDPOINT = process.env.R2_ENDPOINT!;
+const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID!;
+const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY!;
+const R2_BUCKET_OUT = process.env.R2_BUCKET_OUT || "goodpdf-out";
+
+const r2 = new S3Client({
+  region: "auto",
+  endpoint: R2_ENDPOINT,
+  credentials: {
+    accessKeyId: R2_ACCESS_KEY_ID,
+    secretAccessKey: R2_SECRET_ACCESS_KEY,
+  },
+  // Cloudflare R2 дээр ихэнхдээ safe
+  forcePathStyle: true,
+});
+
 export async function GET(req: Request) {
   try {
     const { searchParams } = new URL(req.url);
     const jobId = searchParams.get("jobId");
     if (!jobId) return json(false, "Missing jobId", 400);
 
+    // DB-ээс job-г уншиж privacy/expiry дүрмээ хэвээр барина
     const { data: job, error } = await supabaseServer
       .from("jobs")
       .select("id,status,output_zip_path,zip_path,expires_at,cleaned_at,confirmed_at")
@@ -31,55 +49,36 @@ export async function GET(req: Request) {
 
     const status = (job as any).status as string;
 
-    const cleaned =
-      (job as any).cleaned_at != null || status === "CLEANED";
-
-    const confirmed =
-      (job as any).confirmed_at != null || status === "DONE_CONFIRMED";
+    const cleaned = (job as any).cleaned_at != null || status === "CLEANED";
+    const confirmed = (job as any).confirmed_at != null || status === "DONE_CONFIRMED";
 
     const expiresAt = (job as any).expires_at ?? null;
     const expired = expiresAt ? Date.now() > Date.parse(expiresAt) : false;
 
-    // ✅ Privacy-first: cleaned/confirmed/expired бол татах боломжгүй (Gone)
     if (cleaned) return json(false, "Expired (cleaned)", 410);
     if (confirmed) return json(false, "No longer available", 410);
     if (expired) return json(false, "Expired", 410);
 
-    // ✅ Only downloadable when DONE
     if (status !== "DONE") {
       return json(false, `Not downloadable (status=${status})`, 409);
     }
 
-    // ✅ Standard: output_zip_path first
+    // ✅ Worker чинь үүнийг DB-д бичдэг: output_zip_path = "{jobId}/goodpdf.zip"
     const outPath =
-      (job as any).output_zip_path || (job as any).zip_path || null;
+      (job as any).output_zip_path || (job as any).zip_path || `${jobId}/goodpdf.zip`;
 
-    if (!outPath) {
-      // DONE мөр байлаа ч path алга бол storage delete / cleanup болсон гэж үзнэ
-      return json(false, "Expired (output removed)", 410);
-    }
+    // R2 Signed GET (60 sec)
+    const signedUrl = await getSignedUrl(
+      r2,
+      new GetObjectCommand({
+        Bucket: R2_BUCKET_OUT,
+        Key: outPath,
+        ResponseContentDisposition: `attachment; filename="goodpdf-${jobId}.zip"`,
+      }),
+      { expiresIn: 60 }
+    );
 
-    // Optional: storage дээр байхгүй бол signedUrl хийхгүй (410)
-    // supabase storage .exists API байхгүй тул download оролдож шалгана (бага зардалтай, зөвхөн 1 файл)
-    const { error: headErr } = await supabaseServer.storage
-      .from(BUCKET_OUT)
-      .download(outPath);
-
-    if (headErr) {
-      // аль хэдийн устсан эсвэл path буруу
-      return json(false, "Expired (file missing)", 410);
-    }
-
-    const { data: signed, error: signErr } = await supabaseServer.storage
-      .from(BUCKET_OUT)
-      .createSignedUrl(outPath, 60, { download: `goodpdf-${jobId}.zip` });
-
-    if (signErr || !signed?.signedUrl) {
-      return json(false, signErr?.message || "Failed to sign URL", 500);
-    }
-
-    // ✅ Redirect-г browser navigation-аар дагуулна (CORS асуудалгүй)
-    return NextResponse.redirect(signed.signedUrl, 307);
+    return NextResponse.redirect(signedUrl, 307);
   } catch (e: any) {
     return json(false, e?.message || "Server error", 500);
   }

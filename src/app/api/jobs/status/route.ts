@@ -2,7 +2,7 @@ export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
 import { NextResponse } from "next/server";
-import { supabaseServer } from "@/lib/supabase/server";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 function res(ok: boolean, data?: any, error?: string, status = 200) {
   return NextResponse.json(
@@ -17,7 +17,7 @@ export async function GET(req: Request) {
     const jobId = searchParams.get("jobId");
     if (!jobId) return res(false, null, "Missing jobId", 400);
 
-    const { data: job, error } = await supabaseServer
+    const { data: job, error } = await supabaseAdmin
       .from("jobs")
       .select(
         "id,status,progress,output_zip_path,zip_path,error_text,expires_at,confirmed_at,cleaned_at"

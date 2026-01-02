@@ -20,7 +20,7 @@ export class JobService {
     cb.onStep?.("Creating job…");
     cb.onProgress?.(2);
 
-    // 1) Create job + signed upload info
+    // 1) Create job (✅ presigned URL хэрэггүй болсон)
     const createRes = await fetch("/api/jobs/create", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -35,31 +35,23 @@ export class JobService {
 
     if (!createRes?.ok) throw new Error(createRes?.error || "Create job failed");
 
-    const { jobId, upload } = createRes.data as {
-      jobId: string;
-      upload: { url: string; token: string };
-    };
-
+    const { jobId } = createRes.data as { jobId: string };
     cb.onJobId?.(jobId);
 
-    // 2) Upload bytes
+    // 2) Upload (✅ UI -> API -> R2). CORS асуудалгүй.
     cb.onStep?.("Uploading…");
     cb.onProgress?.(10);
 
-    const up = await fetch(`/api/jobs/upload?jobId=${encodeURIComponent(jobId)}`, {
-      method: "PUT",
-      body: args.file,
-      headers: {
-        "content-type": "application/pdf",
-        "x-upload-url": upload.url,
-        "x-upload-token": upload.token,
-      },
-    });
+    const form = new FormData();
+    // ⚠️ route.ts дээр formData.get("file") гэж авдаг тул нэр нь "file" байна
+    form.append("file", args.file, args.file.name);
 
-    if (!up.ok) {
-      const txt = await up.text().catch(() => "");
-      throw new Error(`Upload failed (${up.status}) ${txt}`);
-    }
+    const upRes = await fetch(`/api/jobs/upload-file?jobId=${encodeURIComponent(jobId)}`, {
+      method: "POST",
+      body: form,
+    }).then((r) => r.json());
+
+    if (!upRes?.ok) throw new Error(upRes?.error || "Upload failed");
 
     cb.onProgress?.(33);
 
@@ -95,7 +87,6 @@ export class JobService {
 
   /**
    * ✅ Browser download-г user click дээрээс trigger хийх helper
-   * (popup-оор биш, tab дээр navigation маягаар ажилладаг)
    */
   triggerDownload(url: string) {
     window.location.href = url;
