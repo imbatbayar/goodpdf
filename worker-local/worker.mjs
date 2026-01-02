@@ -18,11 +18,24 @@ const QPDF_EXE = process.env.QPDF_EXE || "qpdf";
 const SEVEN_Z_EXE = process.env.SEVEN_Z_EXE || "7z";
 
 const POLL_MS = Number(process.env.POLL_MS || 2000);
-const CONCURRENCY = Number(process.env.CONCURRENCY || 1);
+const CONCURRENCY = Math.max(1, Number(process.env.CONCURRENCY || 1));
 
-// Buckets (prod-доо нэг мөр болгоё)
+// Buckets
 const BUCKET_IN = process.env.BUCKET_IN || "job-input";
 const BUCKET_OUT = process.env.BUCKET_OUT || "jobs-output";
+
+// Job TTL + stale хамгаалалт
+const OUTPUT_TTL_MINUTES = Number(process.env.OUTPUT_TTL_MINUTES || 60); // ✅ DONE болсон output хэдэн минутын дараа УСТАХ вэ
+const STALE_PROCESSING_MINUTES = Number(
+  process.env.STALE_PROCESSING_MINUTES || 15
+);
+
+// ✅ Auto-cleanup loop (expired болсон job-уудын input/output-г storage-оос арилгана)
+const CLEANUP_EVERY_MS = Number(process.env.CLEANUP_EVERY_MS || 30000); // 30s тутам шалгана
+const DO_CLEANUP = String(process.env.DO_CLEANUP || "1") === "1"; // 0 бол унтраана
+
+// Worker identity
+const WORKER_ID = `${os.hostname()}_${process.pid}`;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error(
@@ -69,6 +82,16 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function addMinutesIso(m) {
+  return new Date(Date.now() + m * 60 * 1000).toISOString();
+}
+
+function clampInt(n, lo, hi) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return lo;
+  return Math.max(lo, Math.min(hi, Math.floor(x)));
+}
+
 async function updateJob(jobId, patch) {
   const { error } = await supabase.from("jobs").update(patch).eq("id", jobId);
   if (error) throw error;
@@ -92,10 +115,7 @@ async function uploadFile(
   const buf = await fsp.readFile(localPath);
   const { error } = await supabase.storage
     .from(bucket)
-    .upload(remotePath, buf, {
-      contentType,
-      upsert: true,
-    });
+    .upload(remotePath, buf, { contentType, upsert: true });
   if (error) throw error;
 }
 
@@ -113,10 +133,6 @@ async function getTotalPages(pdfPath) {
 // ----------------------
 // Queue
 // ----------------------
-/**
- * ✅ Зорилгод нийцсэн queue:
- * - зөвхөн UPLOADED (upload бүрэн дууссан)
- */
 async function fetchQueue(limit = 1) {
   const { data, error } = await supabase
     .from("jobs")
@@ -129,11 +145,6 @@ async function fetchQueue(limit = 1) {
   return data || [];
 }
 
-/**
- * ✅ Atomic claim:
- * - status=UPLOADED байгаа үед л PROCESSING болгож “би авлаа” гэж баталгаажуулна.
- * - ингэснээр давхар worker нэг job-г зэрэг авахгүй.
- */
 async function claimJob(jobId) {
   const { data, error } = await supabase
     .from("jobs")
@@ -142,6 +153,8 @@ async function claimJob(jobId) {
       progress: 1,
       processing_started_at: nowIso(),
       error_text: null,
+      claimed_by: WORKER_ID,
+      claimed_at: nowIso(),
     })
     .eq("id", jobId)
     .eq("status", "UPLOADED")
@@ -152,15 +165,124 @@ async function claimJob(jobId) {
   return !!data;
 }
 
+async function requeueStaleProcessing(minutes) {
+  const cutoff = new Date(Date.now() - minutes * 60 * 1000).toISOString();
+  const { error } = await supabase
+    .from("jobs")
+    .update({
+      status: "UPLOADED",
+      progress: 0,
+      error_text: "Requeued: stale PROCESSING",
+      processing_started_at: null,
+      claimed_by: null,
+      claimed_at: null,
+    })
+    .eq("status", "PROCESSING")
+    .lt("processing_started_at", cutoff);
+
+  if (error) throw error;
+}
+
+// ----------------------
+// ✅ Auto Cleanup (expires_at өнгөрмөгц input+output storage-оос устгана)
+// ----------------------
+async function deleteFromBucket(bucket, filePath) {
+  if (!filePath) return;
+  try {
+    const { error } = await supabase.storage.from(bucket).remove([filePath]);
+    if (error) throw error;
+  } catch {
+    // best-effort delete
+  }
+}
+
+async function markCleaned(jobId, extra = {}) {
+  // Зарим үед job_status enum-д CLEANED байхгүй байж магадгүй.
+  // Тийм үед status update нь алдаа өгнө. Тэгвэл fallback: status-г оролдохгүй, зөвхөн cleaned_at + path-уудыг null болгоно.
+  const basePatch = {
+    status: "CLEANED",
+    cleaned_at: nowIso(),
+    input_path: null,
+    output_zip_path: null,
+    zip_path: null,
+    ...extra,
+  };
+
+  const { error: err1 } = await supabase
+    .from("jobs")
+    .update(basePatch)
+    .eq("id", jobId);
+
+  if (!err1) return;
+
+  const msg = String(err1.message || err1);
+  const looksLikeEnum =
+    msg.toLowerCase().includes("invalid input value") &&
+    msg.toLowerCase().includes("enum");
+
+  if (!looksLikeEnum) {
+    // өөр алдаа бол throw
+    throw err1;
+  }
+
+  // fallback: status-г оролдохгүй
+  const fallbackPatch = {
+    cleaned_at: nowIso(),
+    input_path: null,
+    output_zip_path: null,
+    zip_path: null,
+    error_text: "CLEANED (enum missing)",
+    ...extra,
+  };
+
+  const { error: err2 } = await supabase
+    .from("jobs")
+    .update(fallbackPatch)
+    .eq("id", jobId);
+  if (err2) throw err2;
+}
+
+async function cleanupExpiredJobs(limit = 25) {
+  const now = nowIso();
+
+  const { data: jobs, error } = await supabase
+    .from("jobs")
+    .select("id,input_path,output_zip_path,zip_path,expires_at,status")
+    .eq("status", "DONE")
+    .lt("expires_at", now)
+    .order("expires_at", { ascending: true })
+    .limit(limit);
+
+  if (error) throw error;
+  if (!jobs || jobs.length === 0) return 0;
+
+  for (const j of jobs) {
+    try {
+      const outPath = j.output_zip_path || j.zip_path || null;
+
+      // storage delete
+      await deleteFromBucket(BUCKET_IN, j.input_path);
+      await deleteFromBucket(BUCKET_OUT, outPath);
+
+      // db mark
+      await markCleaned(j.id);
+
+      console.log(`[cleanup] cleaned job=${j.id}`);
+    } catch (e) {
+      console.error("[cleanup] failed job=", j?.id, e?.message || e);
+    }
+  }
+
+  return jobs.length;
+}
+
 // ----------------------
 // Core pipeline
 // ----------------------
 function mapQualityToGsPreset(q) {
-  // DB/UI: ORIGINAL | GOOD | MAX
   if (!q || q === "GOOD") return "/ebook";
   if (q === "MAX") return "/printer";
-  if (q === "ORIGINAL") return null; // recompress хийхгүй
-  // backward-compat (хуучин утгууд байвал)
+  if (q === "ORIGINAL") return null;
   if (q === "low") return "/screen";
   if (q === "high") return "/printer";
   return "/ebook";
@@ -168,8 +290,6 @@ function mapQualityToGsPreset(q) {
 
 async function compressPdfWithGhostscript(inputPdf, outputPdf, qualityMode) {
   const preset = mapQualityToGsPreset(qualityMode);
-
-  // ORIGINAL = copy (чанар алдагдуулахгүй)
   if (!preset) {
     await fsp.copyFile(inputPdf, outputPdf);
     return;
@@ -187,13 +307,7 @@ async function compressPdfWithGhostscript(inputPdf, outputPdf, qualityMode) {
   ]);
 }
 
-/**
- * ✅ MB target split (adaptive)
- * - part бүр targetMB-ээс доош оруулах гэж оролдоно (headroom-той)
- * - PDF бүр өөр тул “яг таг” гэж амлахгүй, гэхдээ практикт 10MB барина.
- */
 async function splitPdfByMbTarget(inputPdf, splitMb, outDir) {
-  // splitMb<=0 => нэг файл
   if (!splitMb || splitMb <= 0) {
     const out = path.join(outDir, "part_001.pdf");
     await fsp.copyFile(inputPdf, out);
@@ -207,13 +321,11 @@ async function splitPdfByMbTarget(inputPdf, splitMb, outDir) {
     return [out];
   }
 
-  // Headroom: PDF overhead + zip overhead-ийг бодоод 3% үлдээе
   const targetBytes = Math.max(
     256 * 1024,
     Math.floor(splitMb * 1024 * 1024 * 0.97)
   );
 
-  // Эхний estimate: bytes/page
   const totalBytes = await getFileSizeBytes(inputPdf);
   const bytesPerPage = Math.max(1024, Math.floor(totalBytes / totalPages));
   let estPages = Math.max(1, Math.floor(targetBytes / bytesPerPage));
@@ -231,7 +343,6 @@ async function splitPdfByMbTarget(inputPdf, splitMb, outDir) {
       "--",
       outPath,
     ]);
-
     const sz = await getFileSizeBytes(outPath);
     return { outPath, size: sz };
   }
@@ -243,34 +354,25 @@ async function splitPdfByMbTarget(inputPdf, splitMb, outDir) {
   while (start <= totalPages) {
     let end = Math.min(totalPages, start + estPages - 1);
 
-    // 1) эхний үүсгэлт
     let best = await makePart(start, end, partIndex);
 
-    // 2) Хэтэрвэл end-г багасгана (binary-ish shrink)
     if (best.size > targetBytes && end > start) {
       let lo = start;
       let hi = end;
-      let chosen = end;
 
       while (lo < hi) {
         const mid = Math.floor((lo + hi) / 2);
-
-        // mid хүртэл жижигрүүлж туршина
         const trialEnd = Math.max(start, mid);
         const trial = await makePart(start, trialEnd, partIndex);
 
         if (trial.size > targetBytes && trialEnd > start) {
-          // дахиад багасгана
           hi = trialEnd - 1;
         } else {
-          // багтлаа => өсгөх боломж байна
-          chosen = trialEnd;
           best = trial;
           lo = trialEnd + 1;
         }
       }
     } else {
-      // 3) Дутуу жижиг байвал бага зэрэг өсгөж болно (greedy expand)
       while (end < totalPages) {
         const trialEnd = Math.min(
           totalPages,
@@ -280,9 +382,7 @@ async function splitPdfByMbTarget(inputPdf, splitMb, outDir) {
         if (trial.size <= targetBytes) {
           end = trialEnd;
           best = trial;
-        } else {
-          break;
-        }
+        } else break;
       }
     }
 
@@ -295,29 +395,29 @@ async function splitPdfByMbTarget(inputPdf, splitMb, outDir) {
 }
 
 async function zipOutputs(files, zipPath) {
-  // 7z a -tzip out.zip file1 file2 ...
   await run(SEVEN_Z_EXE, ["a", "-tzip", zipPath, ...files]);
+}
+
+async function setProgressSafe(jobId, p) {
+  const val = clampInt(p, 0, 100);
+  await updateJob(jobId, { progress: val });
 }
 
 async function processOneJob(job) {
   const jobId = job.id;
 
-  // ✅ input_path байхгүй бол энэ нь upload/DB mismatch
   if (!job.input_path) {
     await updateJob(jobId, {
       status: "FAILED",
       progress: 0,
       error_text: "Missing input_path (upload not completed or DB mismatch)",
+      done_at: nowIso(),
     });
     return;
   }
 
-  // ✅ Atomic claim (UPLOADED -> PROCESSING)
   const claimed = await claimJob(jobId);
-  if (!claimed) {
-    // өөр worker аль хэдийн авсан
-    return;
-  }
+  if (!claimed) return;
 
   const userId = job.user_id || "dev";
   const wd = tmpDir(jobId);
@@ -327,39 +427,33 @@ async function processOneJob(job) {
   fs.mkdirSync(partsDir, { recursive: true });
 
   try {
-    await updateJob(jobId, { progress: 5 });
+    await setProgressSafe(jobId, 5);
 
-    // 1) download input
     await downloadToFile(BUCKET_IN, job.input_path, inPdf);
-    await updateJob(jobId, { progress: 15 });
+    await setProgressSafe(jobId, 15);
 
-    // 2) compress (ORIGINAL|GOOD|MAX)
     const quality = job.quality || "GOOD";
     await compressPdfWithGhostscript(inPdf, compressedPdf, quality);
-    await updateJob(jobId, { progress: 55 });
+    await setProgressSafe(jobId, 55);
 
-    // 3) split by target MB
     const splitMb = Number(job.split_mb || 0);
     const parts = await splitPdfByMbTarget(compressedPdf, splitMb, partsDir);
-    await updateJob(jobId, { progress: 80 });
+    await setProgressSafe(jobId, 80);
 
-    // 4) zip
     const zipLocal = path.join(wd, `out_${sha()}.zip`);
     await zipOutputs(parts, zipLocal);
-    await updateJob(jobId, { progress: 90 });
+    await setProgressSafe(jobId, 90);
 
-    // 5) upload output zip
     const outKey = `${userId}/${jobId}/out.zip`;
     await uploadFile(BUCKET_OUT, outKey, zipLocal, "application/zip");
 
-    // 6) DONE (DB талдаа download/status эндээс уншина)
     await updateJob(jobId, {
       status: "DONE",
       progress: 100,
       output_zip_path: outKey,
-      zip_path: outKey, // backward compat
+      zip_path: outKey,
       done_at: nowIso(),
-      expires_at: null, // TTL-г дараагийн алхамд тохируулна
+      expires_at: addMinutesIso(OUTPUT_TTL_MINUTES),
       error_text: null,
     });
   } catch (e) {
@@ -368,10 +462,10 @@ async function processOneJob(job) {
     await updateJob(jobId, {
       status: "FAILED",
       progress: 0,
-      error_text: msg.slice(0, 1800),
+      error_text: String(msg).slice(0, 1800),
+      done_at: nowIso(),
     });
   } finally {
-    // cleanup best-effort
     try {
       fs.rmSync(wd, { recursive: true, force: true });
     } catch {}
@@ -383,14 +477,30 @@ async function processOneJob(job) {
 // ----------------------
 async function main() {
   console.log("goodpdf local worker started", {
+    WORKER_ID,
     POLL_MS,
     CONCURRENCY,
     BUCKET_IN,
     BUCKET_OUT,
+    OUTPUT_TTL_MINUTES,
+    STALE_PROCESSING_MINUTES,
+    DO_CLEANUP,
+    CLEANUP_EVERY_MS,
   });
+
+  let lastCleanupAt = 0;
 
   while (true) {
     try {
+      await requeueStaleProcessing(STALE_PROCESSING_MINUTES);
+
+      // ✅ 10 минут өнгөрсөн DONE job-уудыг бүрэн арилгана (input+output)
+      const nowMs = Date.now();
+      if (DO_CLEANUP && nowMs - lastCleanupAt > CLEANUP_EVERY_MS) {
+        lastCleanupAt = nowMs;
+        await cleanupExpiredJobs(25);
+      }
+
       const jobs = await fetchQueue(CONCURRENCY);
 
       if (jobs.length === 0) {
@@ -398,19 +508,21 @@ async function main() {
         continue;
       }
 
-      for (const j of jobs) {
-        console.log(
-          "Picked job",
-          j.id,
-          "status=",
-          j.status,
-          "splitMb=",
-          j.split_mb,
-          "quality=",
-          j.quality
-        );
-        await processOneJob(j);
-      }
+      await Promise.all(
+        jobs.map(async (j) => {
+          console.log(
+            "Picked job",
+            j.id,
+            "status=",
+            j.status,
+            "splitMb=",
+            j.split_mb,
+            "quality=",
+            j.quality
+          );
+          await processOneJob(j);
+        })
+      );
     } catch (e) {
       console.error("Loop error:", e?.message || e);
       await new Promise((r) => setTimeout(r, POLL_MS));
