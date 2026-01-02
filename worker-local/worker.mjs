@@ -21,7 +21,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 // R2 (S3-compatible)
-const R2_ENDPOINT = process.env.R2_ENDPOINT; // https://<accountid>.r2.cloudflarestorage.com
+const R2_ENDPOINT = process.env.R2_ENDPOINT;
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
 const R2_BUCKET_IN = process.env.R2_BUCKET_IN || "goodpdf-in";
@@ -115,6 +115,17 @@ function clampInt(n, lo, hi) {
   return Math.max(lo, Math.min(hi, Math.floor(x)));
 }
 
+function clampPct(n, fallback = 0) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return fallback;
+  return Math.max(0, Math.min(100, Math.round(x)));
+}
+
+function bytesToMb1(bytes) {
+  const mb = Number(bytes) / (1024 * 1024);
+  return Math.round(mb * 10) / 10; // 1 decimal
+}
+
 function sanitizeBaseName(name) {
   const base = String(name || "file")
     .replace(/\.[^/.]+$/, "")
@@ -129,38 +140,20 @@ function sanitizeBaseName(name) {
   return clean || "file";
 }
 
-function isEnumError(err) {
-  const msg = String(err?.message || err || "").toLowerCase();
-  return msg.includes("invalid input value") && msg.includes("enum");
-}
-
 async function updateJob(jobId, patch) {
   const { error } = await supabase.from("jobs").update(patch).eq("id", jobId);
   if (error) throw error;
 }
 
-/**
- * ✅ status enum нь PROCESSING/DONE/FAILED/CLEANED-г зөвшөөрөхгүй үед
- * status-г алгасаад бусад талбаруудаар “state”-аа тэмдэглэж явна.
- */
-async function updateJobStatusSafe(
-  jobId,
-  patchWithStatus,
-  fallbackPatchNoStatus
-) {
-  const { error: e1 } = await supabase
-    .from("jobs")
-    .update(patchWithStatus)
-    .eq("id", jobId);
-  if (!e1) return;
-
-  if (!isEnumError(e1)) throw e1;
-
-  const { error: e2 } = await supabase
-    .from("jobs")
-    .update(fallbackPatchNoStatus)
-    .eq("id", jobId);
-  if (e2) throw e2;
+async function updateStage(jobId, patch) {
+  // patch: { status?, stage?, progress?, compress_progress?, split_progress?, ... }
+  // Keep values clean
+  const p = { ...patch };
+  if (p.progress != null) p.progress = clampPct(p.progress);
+  if (p.compress_progress != null)
+    p.compress_progress = clampPct(p.compress_progress);
+  if (p.split_progress != null) p.split_progress = clampPct(p.split_progress);
+  await updateJob(jobId, p);
 }
 
 // ----------------------
@@ -252,7 +245,7 @@ async function renamePartsToStandard(rawParts, partsDir, splitMb) {
     await fsp.rename(rawParts[i], stdPath);
 
     const bytes = await getFileSizeBytes(stdPath);
-    const sizeMb = Math.round((bytes / (1024 * 1024)) * 10) / 10;
+    const sizeMb = bytesToMb1(bytes);
     const label = `${Number(splitMb || 0)}-${idx}`;
 
     meta.push({ name: stdName, bytes, sizeMb, label });
@@ -271,8 +264,8 @@ async function fetchQueue(limit = 1) {
     .select(
       "id,user_id,input_path,quality,split_mb,status,progress,created_at,file_name,file_size_bytes,claimed_by,processing_started_at,done_at"
     )
-    .in("status", ["UPLOADED"])
-    .is("claimed_by", null) // ✅ status enum асуудалтай үед ч давхар баригдахаас хамгаална
+    .in("status", ["QUEUED"])
+    .is("claimed_by", null)
     .order("created_at", { ascending: false })
     .limit(limit);
 
@@ -281,48 +274,29 @@ async function fetchQueue(limit = 1) {
 }
 
 async function claimJob(jobId) {
-  const patchWithStatus = {
+  // atomic-ish claim: status QUEUED хэвээр үед л claim
+  const patch = {
     status: "PROCESSING",
+    stage: "QUEUE",
     progress: 1,
+    compress_progress: 0,
+    split_progress: 0,
     processing_started_at: nowIso(),
     error_text: null,
     claimed_by: WORKER_ID,
     claimed_at: nowIso(),
   };
 
-  const fallbackNoStatus = {
-    // status enum PROCESSING-г зөвшөөрөхгүй бол status-г орхино
-    progress: 1,
-    processing_started_at: nowIso(),
-    error_text: null,
-    claimed_by: WORKER_ID,
-    claimed_at: nowIso(),
-  };
-
-  // atomic-ish claim: status UPLOADED хэвээр үед л claim хийе
   const { data, error } = await supabase
     .from("jobs")
-    .update(patchWithStatus)
+    .update(patch)
     .eq("id", jobId)
-    .eq("status", "UPLOADED")
+    .eq("status", "QUEUED")
     .select("id")
     .maybeSingle();
 
-  if (!error) return !!data;
-
-  // enum error → fallback update (status-г өөрчлөхгүй)
-  if (!isEnumError(error)) throw error;
-
-  const { data: d2, error: e2 } = await supabase
-    .from("jobs")
-    .update(fallbackNoStatus)
-    .eq("id", jobId)
-    .eq("status", "UPLOADED")
-    .select("id")
-    .maybeSingle();
-
-  if (e2) throw e2;
-  return !!d2;
+  if (error) throw error;
+  return !!data;
 }
 
 async function requeueStaleProcessing(minutes) {
@@ -331,7 +305,10 @@ async function requeueStaleProcessing(minutes) {
     .from("jobs")
     .update({
       status: "UPLOADED",
+      stage: null,
       progress: 0,
+      compress_progress: 0,
+      split_progress: 0,
       error_text: "Requeued: stale PROCESSING",
       processing_started_at: null,
       claimed_by: null,
@@ -340,45 +317,22 @@ async function requeueStaleProcessing(minutes) {
     .eq("status", "PROCESSING")
     .lt("processing_started_at", cutoff);
 
-  // enum PROCESSING байхгүй бол энэ update “алдах” магадлалтай — best-effort
-  if (error && !isEnumError(error)) throw error;
+  if (error) throw error;
 }
 
 // ----------------------
 // ✅ Auto Cleanup (expires_at өнгөрмөгц R2 input+output устгана)
 // ----------------------
 async function markCleaned(jobId, extra = {}) {
-  const basePatch = {
+  await updateJob(jobId, {
     status: "CLEANED",
     cleaned_at: nowIso(),
     input_path: null,
     output_zip_path: null,
     zip_path: null,
+    stage: "CLEANUP",
     ...extra,
-  };
-
-  const { error: err1 } = await supabase
-    .from("jobs")
-    .update(basePatch)
-    .eq("id", jobId);
-  if (!err1) return;
-
-  if (!isEnumError(err1)) throw err1;
-
-  const fallbackPatch = {
-    cleaned_at: nowIso(),
-    input_path: null,
-    output_zip_path: null,
-    zip_path: null,
-    error_text: "CLEANED (enum missing)",
-    ...extra,
-  };
-
-  const { error: err2 } = await supabase
-    .from("jobs")
-    .update(fallbackPatch)
-    .eq("id", jobId);
-  if (err2) throw err2;
+  });
 }
 
 async function cleanupExpiredJobs(limit = 25) {
@@ -416,16 +370,23 @@ async function cleanupExpiredJobs(limit = 25) {
 // Core pipeline
 // ----------------------
 function mapQualityToGsPreset(q) {
+  // Canonical quality:
+  // ORIGINAL -> no compression
+  // GOOD -> balanced (ebook preset)
   if (!q || q === "GOOD") return "/ebook";
-  if (q === "MAX") return "/printer";
   if (q === "ORIGINAL") return null;
+
+  // legacy fallback (keep)
+  if (q === "MAX") return "/printer";
   if (q === "low") return "/screen";
   if (q === "high") return "/printer";
   return "/ebook";
 }
 
 async function compressPdfWithGhostscript(inputPdf, outputPdf, qualityMode) {
-  const preset = mapQualityToGsPreset(qualityMode);
+  const preset = mapQualityToGsPreset(
+    String(qualityMode || "GOOD").toUpperCase()
+  );
   if (!preset) {
     await fsp.copyFile(inputPdf, outputPdf);
     return;
@@ -443,10 +404,15 @@ async function compressPdfWithGhostscript(inputPdf, outputPdf, qualityMode) {
   ]);
 }
 
-async function splitPdfByMbTarget(inputPdf, splitMb, outDir) {
+/**
+ * Split by target MB.
+ * We report split progress using "end page / total pages".
+ */
+async function splitPdfByMbTarget(inputPdf, splitMb, outDir, onProgress) {
   if (!splitMb || splitMb <= 0) {
     const out = path.join(outDir, "part_001.pdf");
     await fsp.copyFile(inputPdf, out);
+    if (onProgress) await onProgress(100);
     return [out];
   }
 
@@ -454,6 +420,7 @@ async function splitPdfByMbTarget(inputPdf, splitMb, outDir) {
   if (!totalPages) {
     const out = path.join(outDir, "part_001.pdf");
     await fsp.copyFile(inputPdf, out);
+    if (onProgress) await onProgress(100);
     return [out];
   }
 
@@ -479,7 +446,7 @@ async function splitPdfByMbTarget(inputPdf, splitMb, outDir) {
       outPath,
     ]);
     const sz = await getFileSizeBytes(outPath);
-    return { outPath, size: sz };
+    return { outPath, size: sz, endPage: end };
   }
 
   const parts = [];
@@ -522,18 +489,19 @@ async function splitPdfByMbTarget(inputPdf, splitMb, outDir) {
     parts.push(best.outPath);
     partIndex++;
     start = end + 1;
+
+    if (onProgress) {
+      const pct = clampPct((best.endPage / totalPages) * 100, 0);
+      await onProgress(Math.min(99, pct)); // done үед 100 болгоно
+    }
   }
 
+  if (onProgress) await onProgress(100);
   return parts;
 }
 
 async function zipOutputs(files, zipPath) {
   await run(SEVEN_Z_EXE, ["a", "-tzip", zipPath, ...files]);
-}
-
-async function setProgressSafe(jobId, p) {
-  const val = clampInt(p, 0, 100);
-  await updateJob(jobId, { progress: val });
 }
 
 // ----------------------
@@ -569,7 +537,18 @@ async function processOneJob(job) {
   const outZipKey = outputZipKeyFor(job);
 
   try {
-    await setProgressSafe(jobId, 5);
+    // ---- PRECHECK / DOWNLOAD ----
+    await updateStage(jobId, {
+      stage: "DOWNLOAD",
+      progress: 5,
+      compress_progress: 0,
+      split_progress: 0,
+      // reset summary fields for safety
+      compressed_mb: null,
+      parts_count: null,
+      max_part_mb: null,
+      target_mb: Number(job.split_mb || 0) || null,
+    });
 
     const exists = await r2Exists(R2_BUCKET_IN, inputKey);
     if (!exists)
@@ -587,18 +566,52 @@ async function processOneJob(job) {
       await updateJob(jobId, { input_path: inputKey });
     }
 
-    await setProgressSafe(jobId, 15);
+    await updateStage(jobId, { progress: 12 });
 
-    const quality = job.quality || "GOOD";
+    // ---- COMPRESS ----
+    const quality = String(job.quality || "GOOD").toUpperCase();
+    await updateStage(jobId, {
+      stage: "COMPRESS",
+      progress: 15,
+      compress_progress: quality === "ORIGINAL" ? 100 : 0,
+      split_progress: 0,
+    });
+
     await compressPdfWithGhostscript(inPdf, compressedPdf, quality);
 
     const compressedBytes = await getFileSizeBytes(compressedPdf);
-    await updateJob(jobId, { compressed_bytes: compressedBytes });
+    const compressedMb =
+      quality === "ORIGINAL" ? null : bytesToMb1(compressedBytes);
 
-    await setProgressSafe(jobId, 55);
+    await updateJob(jobId, {
+      compressed_bytes: compressedBytes,
+      compressed_mb: compressedMb,
+    });
 
+    await updateStage(jobId, {
+      progress: 55,
+      compress_progress: 100,
+    });
+
+    // ---- SPLIT ----
     const splitMb = Number(job.split_mb || 0);
-    const rawParts = await splitPdfByMbTarget(compressedPdf, splitMb, partsDir);
+    await updateStage(jobId, {
+      stage: "SPLIT",
+      progress: 60,
+      split_progress: 0,
+      target_mb: splitMb || null,
+    });
+
+    const rawParts = await splitPdfByMbTarget(
+      compressedPdf,
+      splitMb,
+      partsDir,
+      async (pct) => {
+        // overall progress ~ 60..90
+        const overall = 60 + clampPct(pct, 0) * 0.3; // 60..90
+        await updateStage(jobId, { split_progress: pct, progress: overall });
+      }
+    );
 
     const { renamedPaths: parts, meta: partsMeta } =
       await renamePartsToStandard(rawParts, partsDir, splitMb);
@@ -608,14 +621,22 @@ async function processOneJob(job) {
       (s, x) => s + Number(x.bytes || 0),
       0
     );
+    const maxPartMb =
+      partsMeta.length > 0
+        ? Math.max(...partsMeta.map((x) => Number(x.sizeMb || 0)))
+        : null;
 
     await updateJob(jobId, {
       parts_count: partsCount,
       parts_json: partsMeta,
       total_parts_bytes: totalPartsBytes,
+      max_part_mb: maxPartMb,
     });
 
-    await setProgressSafe(jobId, 80);
+    await updateStage(jobId, { progress: 90, split_progress: 100 });
+
+    // ---- ZIP ----
+    await updateStage(jobId, { stage: "ZIP", progress: 92 });
 
     const baseName = sanitizeBaseName(job.file_name || "file");
     const zipLocal = path.join(wd, `goodPDF - ${baseName}.zip`);
@@ -625,37 +646,33 @@ async function processOneJob(job) {
     const zipBytes = await getFileSizeBytes(zipLocal);
     await updateJob(jobId, { output_zip_bytes: zipBytes });
 
-    await setProgressSafe(jobId, 90);
+    await updateStage(jobId, { stage: "UPLOAD_OUT", progress: 95 });
 
+    // ---- UPLOAD OUT ----
     await r2UploadFile(R2_BUCKET_OUT, outZipKey, zipLocal, "application/zip");
 
-    // ✅ DONE (enum асуудалтай бол status-г орхино)
-    await updateJobStatusSafe(
-      jobId,
-      {
-        status: "DONE",
-        progress: 100,
-        output_zip_path: outZipKey,
-        zip_path: outZipKey,
-        done_at: nowIso(),
-        expires_at: addMinutesIso(OUTPUT_TTL_MINUTES),
-        error_text: null,
-      },
-      {
-        // status-г өөрчилж чадахгүй үед ч UI/Download логик хийхэд хангалттай мэдээлэл үлдээнэ
-        progress: 100,
-        output_zip_path: outZipKey,
-        zip_path: outZipKey,
-        done_at: nowIso(),
-        expires_at: addMinutesIso(OUTPUT_TTL_MINUTES),
-        error_text: null,
-      }
-    );
+    // ---- DONE ----
+    await updateJob(jobId, {
+      status: "DONE",
+      stage: "DONE",
+      progress: 100,
+      output_zip_path: outZipKey,
+      zip_path: outZipKey,
+      done_at: nowIso(),
+      expires_at: addMinutesIso(OUTPUT_TTL_MINUTES),
+      error_text: null,
+      // Ensure stage-progress finalized
+      compress_progress: 100,
+      split_progress: 100,
+    });
 
     console.log("[DONE]", jobId, {
       input: `${R2_BUCKET_IN}/${inputKey}`,
       out: `${R2_BUCKET_OUT}/${outZipKey}`,
+      quality,
+      splitMb,
       parts: partsCount,
+      maxPartMb,
       zipBytes,
       ttlMin: OUTPUT_TTL_MINUTES,
     });
@@ -663,21 +680,15 @@ async function processOneJob(job) {
     const msg = e?.stack || e?.message || String(e);
     console.error("FAILED job", jobId, msg);
 
-    // ✅ FAILED (enum асуудалтай бол status-г орхино)
-    await updateJobStatusSafe(
-      jobId,
-      {
-        status: "FAILED",
-        progress: 0,
-        error_text: String(msg).slice(0, 1800),
-        done_at: nowIso(),
-      },
-      {
-        progress: 0,
-        error_text: String(msg).slice(0, 1800),
-        done_at: nowIso(),
-      }
-    );
+    await updateJob(jobId, {
+      status: "FAILED",
+      stage: "FAILED",
+      progress: 0,
+      compress_progress: 0,
+      split_progress: 0,
+      error_text: String(msg).slice(0, 1800),
+      done_at: nowIso(),
+    });
   } finally {
     try {
       fs.rmSync(wd, { recursive: true, force: true });

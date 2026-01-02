@@ -11,6 +11,7 @@ import type { QualityMode } from "@/domain/jobs/quality";
 import { DEFAULT_SPLIT_MB } from "@/config/constants";
 import { useUploadFlow } from "@/services/hooks/useUploadFlow";
 import { Card } from "@/components/blocks/Card";
+import { DoneConfirmModal } from "@/components/modals/DoneConfirmModal";
 
 type Step = "PICK" | "SETTINGS" | "RUN";
 
@@ -18,8 +19,11 @@ export function UploadScreen() {
   const [step, setStep] = useState<Step>("PICK");
 
   const [file, setFile] = useState<File | null>(null);
+
+  // ✅ Default-ууд
   const [quality, setQuality] = useState<QualityMode>("GOOD");
   const [splitMb, setSplitMb] = useState<number>(DEFAULT_SPLIT_MB);
+  const [doneOpen, setDoneOpen] = useState(false);
 
   const flow = useUploadFlow();
 
@@ -29,25 +33,51 @@ export function UploadScreen() {
     return { name: file.name, mb: Math.round(mb * 100) / 100 };
   }, [file]);
 
-  const canNext = !!file && !flow.busy;
-  const canStart = !!file && !flow.busy;
+  const canUpload = !!file && !flow.busy && (flow.phase === "IDLE" || flow.phase === "ERROR");
+  const canStart = !!file && !flow.busy && flow.phase === "UPLOADED";
+  const canDownload = !flow.busy && flow.phase === "READY";
 
-  const start = async () => {
-    if (!file) return;
-    setStep("RUN");
-    await flow.start({ file, quality, splitMb });
-  };
-
-  // Done болчихоод Back дарвал дахин PICK руу буцна
   const resetToPick = () => {
     setFile(null);
     setQuality("GOOD");
     setSplitMb(DEFAULT_SPLIT_MB);
     setStep("PICK");
+    flow.resetAll();
+  };
+
+  const doUpload = async () => {
+    if (!file) return;
+    try {
+      await flow.uploadOnly(file, quality, splitMb);
+      // upload дуусмагц settings дээр үлдээнэ (user өөрчилж болно)
+      setStep("SETTINGS");
+    } catch {
+      // error нь flow.error дээр
+    }
+  };
+
+  const doStart = async () => {
+    if (!file) return;
+    setStep("RUN");
+    try {
+      await flow.startProcessing({ quality, splitMb });
+    } catch {
+      // error нь flow.error дээр
+    }
   };
 
   return (
-    <ScreenShell title="Upload" subtitle="Step-by-step flow (Pick → Settings → Run).">
+    <ScreenShell title="Upload" subtitle="Step-by-step flow (Pick → Upload → Settings → Run → Download).">
+      <DoneConfirmModal
+          open={doneOpen}
+          onClose={() => setDoneOpen(false)}
+          onDone={async () => {
+            await flow.confirmDone();
+            setDoneOpen(false);
+            resetToPick();
+          }}
+        />
+
       <div style={{ display: "grid", gap: 12, maxWidth: 760 }}>
         <StepHeader step={step} />
 
@@ -57,11 +87,45 @@ export function UploadScreen() {
             <FileDropzone
               onPick={(f) => {
                 setFile(f);
-                setStep("SETTINGS"); // файл сонгомогц дараагийн алхам руу автоматаар
               }}
             />
-            <div style={{ display: "flex", gap: 10 }}>
-              <Button disabled={!canNext} onClick={() => setStep("SETTINGS")}>
+
+            {fileMeta ? (
+              <Card>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                  <div style={{ fontWeight: 800, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {fileMeta.name}
+                  </div>
+                  <div style={{ color: "var(--muted)" }}>{fileMeta.mb}MB</div>
+                </div>
+              </Card>
+            ) : null}
+
+            {/* Upload progress card (энэ нь дараа popup болно) */}
+            {flow.phase === "UPLOADING" ? (
+              <Card>
+                <div style={{ display: "grid", gap: 10 }}>
+                  <div style={{ fontWeight: 900 }}>Uploading…</div>
+                  <Progress value={flow.uploadPct} />
+                  <div style={{ fontSize: 12, color: "var(--muted)" }}>{flow.uploadPct}%</div>
+                </div>
+              </Card>
+            ) : null}
+
+            {flow.error ? (
+              <Card>
+                <div style={{ display: "grid", gap: 8 }}>
+                  <div style={{ fontWeight: 900 }}>Error</div>
+                  <div style={{ fontSize: 12, color: "var(--muted)" }}>{flow.error}</div>
+                </div>
+              </Card>
+            ) : null}
+
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <Button disabled={!canUpload} onClick={doUpload}>
+                Upload
+              </Button>
+              <Button variant="secondary" disabled={!file || flow.busy} onClick={() => setStep("SETTINGS")}>
                 Next
               </Button>
             </div>
@@ -93,46 +157,57 @@ export function UploadScreen() {
               <Button variant="secondary" disabled={flow.busy} onClick={() => setStep("PICK")}>
                 Back
               </Button>
-              <Button disabled={!canStart} onClick={start}>
+
+              {/* ✅ Upload хийгдээгүй бол Start идэвхгүй */}
+              <Button disabled={!canStart} onClick={doStart}>
                 Start
               </Button>
+
+              <Button variant="ghost" disabled={flow.busy} onClick={resetToPick}>
+                New file
+              </Button>
             </div>
+
+            {flow.phase !== "UPLOADED" ? (
+              <div style={{ fontSize: 12, color: "var(--muted)" }}>
+                Upload хийсний дараа Start идэвхжинэ.
+              </div>
+            ) : null}
           </>
         )}
 
-        {/* STEP 3: RUN */}
+        {/* STEP 3: RUN + READY */}
         {step === "RUN" && (
           <>
-            <Card>
-              <div style={{ display: "grid", gap: 10 }}>
-                <div style={{ fontWeight: 900 }}>{flow.stepLabel || "Working…"}</div>
-                <Progress value={flow.progress} />
-                <div style={{ fontSize: 12, color: "var(--muted)" }}>
-                  {flow.progress < 34 ? "1/3 Upload" : flow.progress < 85 ? "2/3 Compress" : "3/3 Split & ZIP"}
-                </div>
-              </div>
-            </Card>
-
-            {flow.done ? (
+            {/* Processing progress card (энэ нь дараа popup болно) */}
+            {flow.phase === "PROCESSING" ? (
               <Card>
                 <div style={{ display: "grid", gap: 10 }}>
-                  <div style={{ fontWeight: 900 }}>Done 🎉</div>
-                  <div style={{ fontSize: 12, color: "var(--muted)" }}>
-                    Download товч дарж ZIP-ээ татна.
+                  <div style={{ fontWeight: 900 }}>Processing…</div>
+
+                  <div style={{ display: "grid", gap: 6 }}>
+                    <div style={{ fontSize: 12, color: "var(--muted)" }}>Compressing</div>
+                    <Progress value={flow.compressPct} />
+                    <div style={{ fontSize: 12, color: "var(--muted)" }}>{flow.compressPct}%</div>
                   </div>
 
-                  <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                    <Button
-                      onClick={async () => {
-                        await flow.confirmDone();
-                        resetToPick(); // ✅ step="PICK" болгож upload дэлгэц рүү буцаана
-                      }}
-                    >
-                      Done
-                    </Button>
+                  <div style={{ display: "grid", gap: 6 }}>
+                    <div style={{ fontSize: 12, color: "var(--muted)" }}>Splitting</div>
+                    <Progress value={flow.splitPct} />
+                    <div style={{ fontSize: 12, color: "var(--muted)" }}>{flow.splitPct}%</div>
+                  </div>
+                </div>
+              </Card>
+            ) : null}
 
-                    <Button variant="secondary" onClick={() => flow.downloadFallback()}>
-                      Download
+            {flow.error ? (
+              <Card>
+                <div style={{ display: "grid", gap: 8 }}>
+                  <div style={{ fontWeight: 900 }}>Error</div>
+                  <div style={{ fontSize: 12, color: "var(--muted)" }}>{flow.error}</div>
+                  <div style={{ display: "flex", gap: 10 }}>
+                    <Button variant="secondary" onClick={() => setStep("SETTINGS")}>
+                      Back to settings
                     </Button>
                     <Button variant="ghost" onClick={resetToPick}>
                       New file
@@ -142,12 +217,61 @@ export function UploadScreen() {
               </Card>
             ) : null}
 
-            {!flow.busy && !flow.done ? (
-              <div style={{ display: "flex", gap: 10 }}>
-                <Button variant="secondary" onClick={() => setStep("SETTINGS")}>
-                  Back to settings
-                </Button>
-              </div>
+            {/* ✅ READY summary + Download */}
+            {flow.phase === "READY" ? (
+              <Card>
+                <div style={{ display: "grid", gap: 10 }}>
+                  <div style={{ fontWeight: 900 }}>Ready ✅</div>
+
+                  <div style={{ display: "grid", gap: 6, fontSize: 13 }}>
+                    {quality === "GOOD" ? (
+                      <div>
+                        <span style={{ color: "var(--muted)" }}>Compressed:</span>{" "}
+                        {flow.result?.compressedMb != null ? `${flow.result.compressedMb}MB` : "—"}
+                      </div>
+                    ) : null}
+
+                    <div>
+                      <span style={{ color: "var(--muted)" }}>Split into:</span>{" "}
+                      {flow.result?.partsCount != null ? `${flow.result.partsCount} parts` : "—"}
+                    </div>
+
+                    <div>
+                      <span style={{ color: "var(--muted)" }}>Max part size:</span>{" "}
+                      {flow.result?.maxPartMb != null ? `${flow.result.maxPartMb}MB` : "—"}
+                    </div>
+
+                    <div style={{ fontSize: 12, color: "var(--muted)" }}>
+                      Each part will be up to {splitMb}MB.
+                    </div>
+                  </div>
+
+                  <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                    <Button
+                      disabled={!canDownload || !flow.downloadUrl}
+                      onClick={() => {
+                        // ✅ Download-ыг шинэ tab дээр эхлүүлнэ (popup энэ tab дээр үлдэнэ)
+                        window.open(flow.downloadUrl!, "_blank", "noopener,noreferrer");
+                        setDoneOpen(true);
+                      }}
+                    >
+                      Download
+                    </Button>
+
+                    {/* Done popup-г дараагийн алхам дээр оруулна. Одоохондоо confirmDone хийж reset. */}
+                    <Button variant="secondary" disabled={flow.busy} onClick={async () => {
+                      await flow.confirmDone();
+                      resetToPick();
+                    }}>
+                      Done
+                    </Button>
+
+                    <Button variant="ghost" disabled={flow.busy} onClick={resetToPick}>
+                      New file
+                    </Button>
+                  </div>
+                </div>
+              </Card>
             ) : null}
           </>
         )}
