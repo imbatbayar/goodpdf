@@ -1,4 +1,4 @@
-// worker-local/worker.mjs
+// worker-local/worker.mjs  (GOODPDF v2 — SPLIT ONLY, NO schema read, safe update)
 import "dotenv/config";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -28,7 +28,6 @@ const R2_BUCKET_IN = process.env.R2_BUCKET_IN || "goodpdf-in";
 const R2_BUCKET_OUT = process.env.R2_BUCKET_OUT || "goodpdf-out";
 
 // tools
-const GS_EXE = process.env.GS_EXE || "gswin64c";
 const QPDF_EXE = process.env.QPDF_EXE || "qpdf";
 const SEVEN_Z_EXE = process.env.SEVEN_Z_EXE || "7z";
 
@@ -36,21 +35,15 @@ const SEVEN_Z_EXE = process.env.SEVEN_Z_EXE || "7z";
 const POLL_MS = Number(process.env.POLL_MS || 2000);
 const CONCURRENCY = Math.max(1, Number(process.env.CONCURRENCY || 1));
 
-// ✅ privacy TTL: default 10 minutes (set at DONE)
+// privacy TTL (DONE → expires_at)
 const OUTPUT_TTL_MINUTES = Number(process.env.OUTPUT_TTL_MINUTES || 10);
 
-// ✅ stale processing guard
-const STALE_PROCESSING_MINUTES = Number(
-  process.env.STALE_PROCESSING_MINUTES || 15
-);
-
-// ✅ auto cleanup loop
+// cleanup loop
 const CLEANUP_EVERY_MS = Number(process.env.CLEANUP_EVERY_MS || 30000);
 const DO_CLEANUP = String(process.env.DO_CLEANUP || "1") === "1";
 
-// ✅ hard timeouts
+// hard timeouts
 const TIMEOUT_QPDF_MS = Number(process.env.TIMEOUT_QPDF_MS || 180_000);
-const TIMEOUT_GS_MS = Number(process.env.TIMEOUT_GS_MS || 240_000);
 const TIMEOUT_7Z_MS = Number(process.env.TIMEOUT_7Z_MS || 180_000);
 
 // Worker identity
@@ -80,23 +73,20 @@ const r2 = new S3Client({
     accessKeyId: R2_ACCESS_KEY_ID,
     secretAccessKey: R2_SECRET_ACCESS_KEY,
   },
-  // ✅ Cloudflare R2-д canonical
   forcePathStyle: true,
 });
 
 // ----------------------
-// Helpers (NO-HANG run)
+// Helpers
 // ----------------------
 function killProcessTree(pid) {
   if (!pid) return;
-
   if (process.platform === "win32") {
     try {
       spawn("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
     } catch {}
     return;
   }
-
   try {
     process.kill(-pid, "SIGKILL");
   } catch {
@@ -180,27 +170,50 @@ function sanitizeBaseName(name) {
     .replace(/\.[^/.]+$/, "")
     .trim()
     .slice(0, 80);
-
   const clean = base
     .replace(/[<>:"/\\|?*\x00-\x1F]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-
   return clean || "file";
 }
 
-async function updateJob(jobId, patch) {
-  const { error } = await supabase.from("jobs").update(patch).eq("id", jobId);
-  if (error) throw error;
+// ----------------------
+// ✅ Safe update: багана байхгүй бол автоматаар хасаад үргэлжлүүлнэ
+// ----------------------
+function pickMissingColumnName(msg) {
+  // Postgres: column "xxx" of relation "jobs" does not exist
+  const m = String(msg || "").match(
+    /column \"([a-zA-Z0-9_]+)\" .* does not exist/i
+  );
+  return m?.[1] || null;
+}
+
+async function updateJobSafe(jobId, patch) {
+  // patch empty бол update хийхгүй
+  if (!patch || Object.keys(patch).length === 0) return;
+
+  let p = { ...patch };
+  for (let i = 0; i < 6; i++) {
+    const { error } = await supabase.from("jobs").update(p).eq("id", jobId);
+    if (!error) return;
+
+    const col = pickMissingColumnName(error.message);
+    if (col && Object.prototype.hasOwnProperty.call(p, col)) {
+      // тухайн багана DB дээр байхгүй тул patch-ээс хасаад дахин оролдоно
+      delete p[col];
+      continue;
+    }
+    throw error;
+  }
 }
 
 async function updateStage(jobId, patch) {
-  const p = { ...patch };
+  const p = { ...(patch || {}) };
   if (p.progress != null) p.progress = clampPct(p.progress);
+  if (p.split_progress != null) p.split_progress = clampPct(p.split_progress);
   if (p.compress_progress != null)
     p.compress_progress = clampPct(p.compress_progress);
-  if (p.split_progress != null) p.split_progress = clampPct(p.split_progress);
-  await updateJob(jobId, p);
+  await updateJobSafe(jobId, p);
 }
 
 // ----------------------
@@ -261,7 +274,7 @@ async function r2DeleteMany(bucket, keys) {
 }
 
 // ----------------------
-// PDF helpers
+// PDF helpers (split-only)
 // ----------------------
 async function getFileSizeBytes(p) {
   const st = await fsp.stat(p);
@@ -276,7 +289,7 @@ async function getTotalPages(pdfPath) {
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
-async function renamePartsToStandard(rawParts, partsDir, splitMb) {
+async function renamePartsToStandard(rawParts, partsDir) {
   const meta = [];
   const renamedPaths = [];
 
@@ -292,169 +305,14 @@ async function renamePartsToStandard(rawParts, partsDir, splitMb) {
 
     const bytes = await getFileSizeBytes(stdPath);
     const sizeMb = bytesToMb1(bytes);
-    const label = `${Number(splitMb || 0)}-${idx}`;
 
-    meta.push({ name: stdName, bytes, sizeMb, label });
+    meta.push({ name: stdName, bytes, sizeMb });
     renamedPaths.push(stdPath);
   }
 
   return { renamedPaths, meta };
 }
 
-// ----------------------
-// Queue (DB)
-// ----------------------
-async function fetchQueue(limit = 1) {
-  const { data, error } = await supabase
-    .from("jobs")
-    .select(
-      "id,user_id,input_path,quality,split_mb,status,progress,created_at,file_name,file_size_bytes,claimed_by,processing_started_at,done_at"
-    )
-    // ✅ canonical: QUEUED is the worker entry point
-    // UPLOADED is kept for safety (legacy)
-    .in("status", ["QUEUED", "UPLOADED"])
-    .is("claimed_by", null)
-    .order("created_at", { ascending: false })
-    .limit(limit);
-
-  if (error) throw error;
-  return data || [];
-}
-
-async function claimJob(jobId) {
-  const patch = {
-    status: "PROCESSING",
-    stage: "QUEUE",
-    progress: 1,
-    compress_progress: 0,
-    split_progress: 0,
-    processing_started_at: nowIso(),
-    error_text: null,
-    claimed_by: WORKER_ID,
-    claimed_at: nowIso(),
-  };
-
-  const { data, error } = await supabase
-    .from("jobs")
-    .update(patch)
-    .eq("id", jobId)
-    .in("status", ["QUEUED", "UPLOADED"])
-    .select("id")
-    .maybeSingle();
-
-  if (error) throw error;
-  return !!data;
-}
-
-async function requeueStaleProcessing(minutes) {
-  const cutoff = new Date(Date.now() - minutes * 60 * 1000).toISOString();
-
-  const { error } = await supabase
-    .from("jobs")
-    .update({
-      status: "QUEUED",
-      stage: null,
-      progress: 0,
-      compress_progress: 0,
-      split_progress: 0,
-      error_text: "Requeued: stale PROCESSING",
-      processing_started_at: null,
-      claimed_by: null,
-      claimed_at: null,
-    })
-    .eq("status", "PROCESSING")
-    .lt("processing_started_at", cutoff);
-
-  if (error) throw error;
-}
-
-// ----------------------
-// ✅ Auto Cleanup (expires_at өнгөрмөгц R2 input+output устгана)
-// ----------------------
-async function markCleaned(jobId, extra = {}) {
-  await updateJob(jobId, {
-    status: "CLEANED",
-    cleaned_at: nowIso(),
-    input_path: null,
-    output_zip_path: null,
-    stage: "CLEANUP",
-    ...extra,
-  });
-}
-
-async function cleanupExpiredJobs(limit = 25) {
-  const now = nowIso();
-
-  const { data: jobs, error } = await supabase
-    .from("jobs")
-    .select(
-      "id,input_path,output_zip_path,expires_at,status,cleaned_at"
-    )
-    .is("cleaned_at", null)
-    .not("expires_at", "is", null)
-    .lt("expires_at", now)
-    // ✅ canonical: DONE jobs only get TTL cleanup
-    .eq("status", "DONE")
-    .order("expires_at", { ascending: true })
-    .limit(limit);
-
-  if (error) throw error;
-  if (!jobs || jobs.length === 0) return 0;
-
-  for (const j of jobs) {
-    try {
-      const inputKey = j.input_path || null;
-      const outKey = j.output_zip_path || null;
-
-      if (inputKey) await r2DeleteMany(R2_BUCKET_IN, [inputKey]);
-      if (outKey) await r2DeleteMany(R2_BUCKET_OUT, [outKey]);
-
-      await markCleaned(j.id);
-      console.log(`[cleanup] cleaned job=${j.id}`);
-    } catch (e) {
-      console.error("[cleanup] failed job=", j?.id, e?.message || e);
-    }
-  }
-
-  return jobs.length;
-}
-
-// ----------------------
-// Core pipeline
-// ----------------------
-function mapQualityToGsPreset(q) {
-  const Q = String(q || "GOOD").toUpperCase();
-  if (Q === "ORIGINAL") return null;
-  return "/ebook"; // GOOD default
-}
-
-async function compressPdfWithGhostscript(inputPdf, outputPdf, qualityMode) {
-  const preset = mapQualityToGsPreset(qualityMode);
-  if (!preset) {
-    await fsp.copyFile(inputPdf, outputPdf);
-    return;
-  }
-
-  await run(
-    GS_EXE,
-    [
-      "-sDEVICE=pdfwrite",
-      "-dCompatibilityLevel=1.4",
-      "-dPDFSETTINGS=" + preset,
-      "-dNOPAUSE",
-      "-dQUIET",
-      "-dBATCH",
-      `-sOutputFile=${outputPdf}`,
-      inputPdf,
-    ],
-    { timeoutMs: TIMEOUT_GS_MS }
-  );
-}
-
-/**
- * Split by target MB.
- * split progress = end page / total pages
- */
 async function splitPdfByMbTarget(inputPdf, splitMb, outDir, onProgress) {
   if (!splitMb || splitMb <= 0) {
     const out = path.join(outDir, "part_001.pdf");
@@ -555,12 +413,107 @@ async function zipOutputs(files, zipPath) {
 }
 
 // ----------------------
-// Job processing (R2 in/out)
+// Queue (DB) — select MINIMAL fields only
 // ----------------------
-function normalizeInputKey(job) {
-  return `${job.id}/input.pdf`.replace(/^\/+/, "");
+async function fetchQueue(limit = 1) {
+  const { data, error } = await supabase
+    .from("jobs")
+    .select(
+      "id,input_path,split_mb,status,created_at,file_name,file_size_bytes,claimed_by"
+    )
+    .in("status", ["QUEUED", "UPLOADED"])
+    .is("claimed_by", null)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (error) throw error;
+  return data || [];
 }
 
+async function claimJob(jobId) {
+  // claim-ийг хамгийн жижиг patch-аар хийе (schema зөрчил багасна)
+  const patch = {
+    status: "PROCESSING",
+    stage: "QUEUE",
+    progress: 1,
+    claimed_by: WORKER_ID,
+    claimed_at: nowIso(),
+    error_text: null,
+  };
+
+  // зөвхөн QUEUED дээр claim хийж lock үүсгэнэ
+  const { data, error } = await supabase
+    .from("jobs")
+    .update(patch)
+    .eq("id", jobId)
+    .eq("status", "QUEUED")
+    .select("id")
+    .maybeSingle();
+
+  if (error) return false;
+  return !!data;
+}
+
+// ----------------------
+// Cleanup — schema байхгүй багана байвал автоматаар алгасна
+// ----------------------
+let CLEANUP_DISABLED = false;
+
+async function cleanupExpiredJobs(limit = 25) {
+  if (CLEANUP_DISABLED) return 0;
+  const now = nowIso();
+
+  // expires_at / cleaned_at / output_zip_path байхгүй байж болно → алдахад cleanup-г унтраана
+  const { data: jobs, error } = await supabase
+    .from("jobs")
+    .select("id,input_path,output_zip_path,expires_at,status,cleaned_at")
+    .is("cleaned_at", null)
+    .not("expires_at", "is", null)
+    .lt("expires_at", now)
+    .eq("status", "DONE")
+    .order("expires_at", { ascending: true })
+    .limit(limit);
+
+  if (error) {
+    console.warn("[cleanup] disabled:", error.message);
+    CLEANUP_DISABLED = true;
+    return 0;
+  }
+
+  if (!jobs || jobs.length === 0) return 0;
+
+  for (const j of jobs) {
+    try {
+      const inputKey = j.input_path || null;
+      const outKey = j.output_zip_path || null;
+
+      if (inputKey) await r2DeleteMany(R2_BUCKET_IN, [inputKey]);
+      if (outKey) await r2DeleteMany(R2_BUCKET_OUT, [outKey]);
+
+      await updateJobSafe(j.id, {
+        status: "CLEANED",
+        stage: "CLEANUP",
+        cleaned_at: nowIso(),
+        input_path: null,
+        output_zip_path: null,
+      });
+
+      console.log(`[cleanup] cleaned job=${j.id}`);
+    } catch (e) {
+      console.error("[cleanup] failed job=", j?.id, e?.message || e);
+    }
+  }
+
+  return jobs.length;
+}
+
+// ----------------------
+// Job processing (R2 in/out) — SPLIT ONLY
+// ----------------------
+function normalizeInputKey(job) {
+  // canonical: {jobId}/input.pdf
+  return `${job.id}/input.pdf`.replace(/^\/+/, "");
+}
 function outputZipKeyFor(job) {
   return `${job.id}/goodpdf.zip`;
 }
@@ -573,7 +526,6 @@ async function processOneJob(job) {
 
   const wd = tmpDir(jobId);
   const inPdf = path.join(wd, "input.pdf");
-  const compressedPdf = path.join(wd, "compressed.pdf");
   const partsDir = path.join(wd, "parts");
   fs.mkdirSync(partsDir, { recursive: true });
 
@@ -581,17 +533,7 @@ async function processOneJob(job) {
   const outZipKey = outputZipKeyFor(job);
 
   try {
-    // ---- PRECHECK / DOWNLOAD ----
-    await updateStage(jobId, {
-      stage: "DOWNLOAD",
-      progress: 5,
-      compress_progress: 0,
-      split_progress: 0,
-      compressed_mb: null,
-      parts_count: null,
-      max_part_mb: null,
-      target_mb: Number(job.split_mb || 0) || null,
-    });
+    await updateStage(jobId, { stage: "DOWNLOAD", progress: 5 });
 
     const exists = await r2Exists(R2_BUCKET_IN, inputKey);
     if (!exists)
@@ -600,60 +542,33 @@ async function processOneJob(job) {
     await r2DownloadToFile(R2_BUCKET_IN, inputKey, inPdf);
 
     const originalBytes = await getFileSizeBytes(inPdf);
-    const existingOriginal = Number(job.file_size_bytes || 0);
-    if (!existingOriginal || existingOriginal !== originalBytes) {
-      await updateJob(jobId, { file_size_bytes: originalBytes });
-    }
-
-    if (job.input_path !== inputKey) {
-      await updateJob(jobId, { input_path: inputKey });
-    }
-
-    await updateStage(jobId, { progress: 12 });
-
-    // ---- COMPRESS ----
-    const quality = String(job.quality || "GOOD").toUpperCase();
-    await updateStage(jobId, {
-      stage: "COMPRESS",
-      progress: 15,
-      compress_progress: quality === "ORIGINAL" ? 100 : 0,
-      split_progress: 0,
+    await updateJobSafe(jobId, {
+      file_size_bytes: originalBytes,
+      input_path: inputKey,
     });
 
-    await compressPdfWithGhostscript(inPdf, compressedPdf, quality);
-
-    const compressedBytes = await getFileSizeBytes(compressedPdf);
-    const compressedMb =
-      quality === "ORIGINAL" ? null : bytesToMb1(compressedBytes);
-
-    await updateJob(jobId, {
-      compressed_bytes: compressedBytes,
-      compressed_mb: compressedMb,
-    });
-
-    await updateStage(jobId, { progress: 55, compress_progress: 100 });
+    await updateStage(jobId, { progress: 15 });
 
     // ---- SPLIT ----
     const splitMb = Number(job.split_mb || 0);
     await updateStage(jobId, {
       stage: "SPLIT",
-      progress: 60,
+      progress: 20,
       split_progress: 0,
-      target_mb: splitMb || null,
     });
 
     const rawParts = await splitPdfByMbTarget(
-      compressedPdf,
+      inPdf,
       splitMb,
       partsDir,
       async (pct) => {
-        const overall = 60 + clampPct(pct, 0) * 0.3; // 60..90
+        const overall = 20 + clampPct(pct, 0) * 0.65; // 20..85
         await updateStage(jobId, { split_progress: pct, progress: overall });
       }
     );
 
     const { renamedPaths: parts, meta: partsMeta } =
-      await renamePartsToStandard(rawParts, partsDir, splitMb);
+      await renamePartsToStandard(rawParts, partsDir);
 
     const partsCount = partsMeta.length;
     const totalPartsBytes = partsMeta.reduce(
@@ -665,17 +580,18 @@ async function processOneJob(job) {
         ? Math.max(...partsMeta.map((x) => Number(x.sizeMb || 0)))
         : null;
 
-    await updateJob(jobId, {
+    // optional metadata — байхгүй багана бол автоматаар хасагдана
+    await updateJobSafe(jobId, {
       parts_count: partsCount,
       parts_json: partsMeta,
       total_parts_bytes: totalPartsBytes,
       max_part_mb: maxPartMb,
     });
 
-    await updateStage(jobId, { progress: 90, split_progress: 100 });
+    await updateStage(jobId, { progress: 85, split_progress: 100 });
 
     // ---- ZIP ----
-    await updateStage(jobId, { stage: "ZIP", progress: 92 });
+    await updateStage(jobId, { stage: "ZIP", progress: 88 });
 
     const baseName = sanitizeBaseName(job.file_name || "file");
     const zipLocal = path.join(wd, `goodPDF - ${baseName}.zip`);
@@ -683,30 +599,27 @@ async function processOneJob(job) {
     await zipOutputs(parts, zipLocal);
 
     const zipBytes = await getFileSizeBytes(zipLocal);
-    await updateJob(jobId, { output_zip_bytes: zipBytes });
+    await updateJobSafe(jobId, { output_zip_bytes: zipBytes });
 
-    await updateStage(jobId, { stage: "UPLOAD_OUT", progress: 95 });
+    await updateStage(jobId, { stage: "UPLOAD_OUT", progress: 94 });
 
-    // ---- UPLOAD OUT ----
     await r2UploadFile(R2_BUCKET_OUT, outZipKey, zipLocal, "application/zip");
 
     // ---- DONE ----
-    await updateJob(jobId, {
+    await updateJobSafe(jobId, {
       status: "DONE",
       stage: "DONE",
       progress: 100,
       output_zip_path: outZipKey,
       done_at: nowIso(),
-      expires_at: addMinutesIso(OUTPUT_TTL_MINUTES), // ✅ TTL is set HERE
+      expires_at: addMinutesIso(OUTPUT_TTL_MINUTES),
       error_text: null,
-      compress_progress: 100,
       split_progress: 100,
     });
 
     console.log("[DONE]", jobId, {
       input: `${R2_BUCKET_IN}/${inputKey}`,
       out: `${R2_BUCKET_OUT}/${outZipKey}`,
-      quality,
       splitMb,
       parts: partsCount,
       maxPartMb,
@@ -717,12 +630,10 @@ async function processOneJob(job) {
     const msg = e?.stack || e?.message || String(e);
     console.error("FAILED job", jobId, msg);
 
-    await updateJob(jobId, {
+    await updateJobSafe(jobId, {
       status: "FAILED",
       stage: "FAILED",
       progress: 0,
-      compress_progress: 0,
-      split_progress: 0,
       error_text: String(msg).slice(0, 1800),
       done_at: nowIso(),
     });
@@ -737,18 +648,16 @@ async function processOneJob(job) {
 // Main loop
 // ----------------------
 async function main() {
-  console.log("goodpdf local worker started", {
+  console.log("goodpdf local worker started (SPLIT ONLY)", {
     WORKER_ID,
     POLL_MS,
     CONCURRENCY,
     R2_BUCKET_IN,
     R2_BUCKET_OUT,
     OUTPUT_TTL_MINUTES,
-    STALE_PROCESSING_MINUTES,
     DO_CLEANUP,
     CLEANUP_EVERY_MS,
     TIMEOUT_QPDF_MS,
-    TIMEOUT_GS_MS,
     TIMEOUT_7Z_MS,
   });
 
@@ -756,8 +665,6 @@ async function main() {
 
   while (true) {
     try {
-      await requeueStaleProcessing(STALE_PROCESSING_MINUTES);
-
       const nowMs = Date.now();
       if (DO_CLEANUP && nowMs - lastCleanupAt > CLEANUP_EVERY_MS) {
         lastCleanupAt = nowMs;
@@ -779,9 +686,7 @@ async function main() {
             "status=",
             j.status,
             "splitMb=",
-            j.split_mb,
-            "quality=",
-            j.quality
+            j.split_mb
           );
           await processOneJob(j);
         })

@@ -11,32 +11,35 @@ function json(ok: boolean, data?: any, error?: string, status = 200) {
   return NextResponse.json({ ok, data, error }, { status });
 }
 
-
-const R2_ENDPOINT = process.env.R2_ENDPOINT!;
-const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID!;
-const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY!;
-const R2_BUCKET_IN = process.env.R2_BUCKET_IN || "goodpdf-in";
-
-if (!R2_ENDPOINT || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY) {
-  throw new Error("Missing R2_ENDPOINT / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY");
-}
-
-const r2 = new S3Client({
-  region: "auto",
-  endpoint: R2_ENDPOINT,
-  credentials: {
-    accessKeyId: R2_ACCESS_KEY_ID,
-    secretAccessKey: R2_SECRET_ACCESS_KEY,
-  },
-  forcePathStyle: true, // ✅ Cloudflare R2 presign-д хэрэгтэй
-});
-
 export async function POST(req: Request) {
   try {
+    const R2_ENDPOINT = process.env.R2_ENDPOINT!;
+    const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID!;
+    const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY!;
+    const R2_BUCKET_IN = process.env.R2_BUCKET_IN || "goodpdf-in";
+
+    if (!R2_ENDPOINT || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY) {
+      return json(
+        false,
+        null,
+        "Missing R2 env (R2_ENDPOINT/R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY)",
+        500
+      );
+    }
+
+    const r2 = new S3Client({
+      region: "auto",
+      endpoint: R2_ENDPOINT,
+      credentials: {
+        accessKeyId: R2_ACCESS_KEY_ID,
+        secretAccessKey: R2_SECRET_ACCESS_KEY,
+      },
+      forcePathStyle: true,
+    });
+
     const body = await req.json();
 
     const userId = String(body.userId || "");
-    const quality = String(body.quality || "GOOD").toUpperCase();
     const splitMb = Number(body.splitMb || 0) || 0;
 
     const fileName = String(body.fileName || "input.pdf");
@@ -46,9 +49,14 @@ export async function POST(req: Request) {
     if (!userId) return json(false, null, "Missing userId", 400);
     if (!fileName) return json(false, null, "Missing fileName", 400);
 
-    // 1) job row — canonical initial state
-    // - TTL/expires_at бол DONE дээр worker тавина. энд тавихгүй.
-    // - input_path бол үргэлж {jobId}/input.pdf байх ёстой.
+    // split-only: PDF only
+    if (!String(fileName).toLowerCase().endsWith(".pdf")) {
+      return json(false, null, "Only PDF files are supported", 400);
+    }
+    if (fileType && !String(fileType).toLowerCase().includes("pdf")) {
+      return json(false, null, "Only application/pdf is supported", 400);
+    }
+
     const { data: job, error: jErr } = await supabaseAdmin
       .from("jobs")
       .insert({
@@ -57,12 +65,15 @@ export async function POST(req: Request) {
         stage: "UPLOAD",
         progress: 0,
 
-        quality,
         split_mb: splitMb,
 
         file_name: fileName,
-        file_type: fileType,          // хэрвээ DB дээр байхгүй бол нэмнэ
+        file_type: fileType,
         file_size_bytes: fileSizeBytes,
+
+        // split-only: keep compress stable
+        compress_progress: 100,
+        split_progress: 0,
 
         error_text: null,
       })
@@ -74,7 +85,6 @@ export async function POST(req: Request) {
     const jobId = String(job.id);
     const key = `${jobId}/input.pdf`;
 
-    // input_path canonical-г нэг мөрөөр тогтооно
     const { error: upErr } = await supabaseAdmin
       .from("jobs")
       .update({ input_path: key })
@@ -82,8 +92,6 @@ export async function POST(req: Request) {
 
     if (upErr) return json(false, null, upErr.message, 500);
 
-    // 2) presigned PUT for R2
-    // ⚠️ ContentType-ийг presign дээр bind хийхгүй (чи зөв бичсэн)
     const cmd = new PutObjectCommand({
       Bucket: R2_BUCKET_IN,
       Key: key,
@@ -97,8 +105,7 @@ export async function POST(req: Request) {
       upload: { url: signedUrl },
     });
   } catch (e: any) {
-  console.error("[/api/jobs/create ERROR]", e);
-  return json(false, null, String(e?.message || e), 500);
+    console.error("[/api/jobs/create ERROR]", e);
+    return json(false, null, String(e?.message || e), 500);
   }
-
 }

@@ -34,33 +34,27 @@ export async function GET(req: Request) {
     if (!job) return res(false, null, "Job not found", 404);
 
     const status = String(job.status || "CREATED").toUpperCase();
+    const stage = String(job.stage || "").toUpperCase();
 
-    const outputZipPath =
-      job.output_zip_path || null;
+    const outputZipPath = job.output_zip_path || null;
 
+    // split-only progress
     const progress = clampPct(job.progress, 0);
-    const compressProgress =
-      String(job.quality || "").toUpperCase() === "ORIGINAL"
-        ? 100
-        : clampPct(job.compress_progress, status === "DONE" ? 100 : 0);
-
-    const splitProgress = clampPct(
-      job.split_progress,
-      progress
-    );
+    const splitProgress = clampPct(job.split_progress, progress);
 
     return res(true, {
-      // ✅ source of truth
       status,
+      stage,
       outputZipPath,
 
-      // progress
+      // progress (backward compat + canonical)
       progress,
-      compressProgress,
+      compressProgress: 100,
       splitProgress,
+      compress_progress: 100,
+      split_progress: splitProgress,
 
       // summary
-      compressedMb: job.compressed_mb ?? null,
       partsCount: job.parts_count ?? null,
       maxPartMb: job.max_part_mb ?? null,
       targetMb: job.target_mb ?? job.split_mb ?? null,
