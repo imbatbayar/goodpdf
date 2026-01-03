@@ -36,8 +36,10 @@ const SEVEN_Z_EXE = process.env.SEVEN_Z_EXE || "7z";
 const POLL_MS = Number(process.env.POLL_MS || 2000);
 const CONCURRENCY = Math.max(1, Number(process.env.CONCURRENCY || 1));
 
-// ✅ privacy TTL: default 10 minutes
+// ✅ privacy TTL: default 10 minutes (set at DONE)
 const OUTPUT_TTL_MINUTES = Number(process.env.OUTPUT_TTL_MINUTES || 10);
+
+// ✅ stale processing guard
 const STALE_PROCESSING_MINUTES = Number(
   process.env.STALE_PROCESSING_MINUTES || 15
 );
@@ -45,6 +47,11 @@ const STALE_PROCESSING_MINUTES = Number(
 // ✅ auto cleanup loop
 const CLEANUP_EVERY_MS = Number(process.env.CLEANUP_EVERY_MS || 30000);
 const DO_CLEANUP = String(process.env.DO_CLEANUP || "1") === "1";
+
+// ✅ hard timeouts
+const TIMEOUT_QPDF_MS = Number(process.env.TIMEOUT_QPDF_MS || 180_000);
+const TIMEOUT_GS_MS = Number(process.env.TIMEOUT_GS_MS || 240_000);
+const TIMEOUT_7Z_MS = Number(process.env.TIMEOUT_7Z_MS || 180_000);
 
 // Worker identity
 const WORKER_ID = `${os.hostname()}_${process.pid}`;
@@ -73,20 +80,68 @@ const r2 = new S3Client({
     accessKeyId: R2_ACCESS_KEY_ID,
     secretAccessKey: R2_SECRET_ACCESS_KEY,
   },
+  // ✅ Cloudflare R2-д canonical
+  forcePathStyle: true,
 });
 
 // ----------------------
-// Helpers
+// Helpers (NO-HANG run)
 // ----------------------
+function killProcessTree(pid) {
+  if (!pid) return;
+
+  if (process.platform === "win32") {
+    try {
+      spawn("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
+    } catch {}
+    return;
+  }
+
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {}
+  }
+}
+
 function run(cmd, args, opts = {}) {
+  const timeoutMs = Number(opts.timeoutMs || 0);
+
   return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { stdio: "pipe", ...opts });
+    const p = spawn(cmd, args, {
+      stdio: "pipe",
+      windowsHide: true,
+      detached: process.platform !== "win32",
+      ...opts,
+    });
+
     let out = "";
     let err = "";
+
+    let timer = null;
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        killProcessTree(p.pid);
+        reject(
+          new Error(
+            `Command timeout after ${timeoutMs}ms: ${cmd} ${args.join(" ")}`
+          )
+        );
+      }, timeoutMs);
+    }
+
     p.stdout.on("data", (d) => (out += d.toString()));
     p.stderr.on("data", (d) => (err += d.toString()));
-    p.on("error", reject);
+
+    p.on("error", (e) => {
+      if (timer) clearTimeout(timer);
+      reject(e);
+    });
+
     p.on("close", (code) => {
+      if (timer) clearTimeout(timer);
       if (code === 0) return resolve({ out, err });
       reject(
         new Error(`Command failed: ${cmd} ${args.join(" ")}\n${err || out}`)
@@ -109,12 +164,6 @@ function addMinutesIso(m) {
   return new Date(Date.now() + m * 60 * 1000).toISOString();
 }
 
-function clampInt(n, lo, hi) {
-  const x = Number(n);
-  if (!Number.isFinite(x)) return lo;
-  return Math.max(lo, Math.min(hi, Math.floor(x)));
-}
-
 function clampPct(n, fallback = 0) {
   const x = Number(n);
   if (!Number.isFinite(x)) return fallback;
@@ -123,7 +172,7 @@ function clampPct(n, fallback = 0) {
 
 function bytesToMb1(bytes) {
   const mb = Number(bytes) / (1024 * 1024);
-  return Math.round(mb * 10) / 10; // 1 decimal
+  return Math.round(mb * 10) / 10;
 }
 
 function sanitizeBaseName(name) {
@@ -146,8 +195,6 @@ async function updateJob(jobId, patch) {
 }
 
 async function updateStage(jobId, patch) {
-  // patch: { status?, stage?, progress?, compress_progress?, split_progress?, ... }
-  // Keep values clean
   const p = { ...patch };
   if (p.progress != null) p.progress = clampPct(p.progress);
   if (p.compress_progress != null)
@@ -208,10 +255,7 @@ async function r2DeleteMany(bucket, keys) {
   await r2.send(
     new DeleteObjectsCommand({
       Bucket: bucket,
-      Delete: {
-        Objects: unique.map((Key) => ({ Key })),
-        Quiet: true,
-      },
+      Delete: { Objects: unique.map((Key) => ({ Key })), Quiet: true },
     })
   );
 }
@@ -225,7 +269,9 @@ async function getFileSizeBytes(p) {
 }
 
 async function getTotalPages(pdfPath) {
-  const { out } = await run(QPDF_EXE, ["--show-npages", pdfPath]);
+  const { out } = await run(QPDF_EXE, ["--show-npages", pdfPath], {
+    timeoutMs: TIMEOUT_QPDF_MS,
+  });
   const n = Number(String(out).trim());
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
@@ -264,7 +310,9 @@ async function fetchQueue(limit = 1) {
     .select(
       "id,user_id,input_path,quality,split_mb,status,progress,created_at,file_name,file_size_bytes,claimed_by,processing_started_at,done_at"
     )
-    .in("status", ["QUEUED"])
+    // ✅ canonical: QUEUED is the worker entry point
+    // UPLOADED is kept for safety (legacy)
+    .in("status", ["QUEUED", "UPLOADED"])
     .is("claimed_by", null)
     .order("created_at", { ascending: false })
     .limit(limit);
@@ -274,7 +322,6 @@ async function fetchQueue(limit = 1) {
 }
 
 async function claimJob(jobId) {
-  // atomic-ish claim: status QUEUED хэвээр үед л claim
   const patch = {
     status: "PROCESSING",
     stage: "QUEUE",
@@ -291,7 +338,7 @@ async function claimJob(jobId) {
     .from("jobs")
     .update(patch)
     .eq("id", jobId)
-    .eq("status", "QUEUED")
+    .in("status", ["QUEUED", "UPLOADED"])
     .select("id")
     .maybeSingle();
 
@@ -301,10 +348,11 @@ async function claimJob(jobId) {
 
 async function requeueStaleProcessing(minutes) {
   const cutoff = new Date(Date.now() - minutes * 60 * 1000).toISOString();
+
   const { error } = await supabase
     .from("jobs")
     .update({
-      status: "UPLOADED",
+      status: "QUEUED",
       stage: null,
       progress: 0,
       compress_progress: 0,
@@ -329,7 +377,6 @@ async function markCleaned(jobId, extra = {}) {
     cleaned_at: nowIso(),
     input_path: null,
     output_zip_path: null,
-    zip_path: null,
     stage: "CLEANUP",
     ...extra,
   });
@@ -337,11 +384,17 @@ async function markCleaned(jobId, extra = {}) {
 
 async function cleanupExpiredJobs(limit = 25) {
   const now = nowIso();
+
   const { data: jobs, error } = await supabase
     .from("jobs")
-    .select("id,input_path,output_zip_path,zip_path,expires_at,status")
-    .eq("status", "DONE")
+    .select(
+      "id,input_path,output_zip_path,expires_at,status,cleaned_at"
+    )
+    .is("cleaned_at", null)
+    .not("expires_at", "is", null)
     .lt("expires_at", now)
+    // ✅ canonical: DONE jobs only get TTL cleanup
+    .eq("status", "DONE")
     .order("expires_at", { ascending: true })
     .limit(limit);
 
@@ -351,7 +404,7 @@ async function cleanupExpiredJobs(limit = 25) {
   for (const j of jobs) {
     try {
       const inputKey = j.input_path || null;
-      const outKey = j.output_zip_path || j.zip_path || null;
+      const outKey = j.output_zip_path || null;
 
       if (inputKey) await r2DeleteMany(R2_BUCKET_IN, [inputKey]);
       if (outKey) await r2DeleteMany(R2_BUCKET_OUT, [outKey]);
@@ -370,43 +423,37 @@ async function cleanupExpiredJobs(limit = 25) {
 // Core pipeline
 // ----------------------
 function mapQualityToGsPreset(q) {
-  // Canonical quality:
-  // ORIGINAL -> no compression
-  // GOOD -> balanced (ebook preset)
-  if (!q || q === "GOOD") return "/ebook";
-  if (q === "ORIGINAL") return null;
-
-  // legacy fallback (keep)
-  if (q === "MAX") return "/printer";
-  if (q === "low") return "/screen";
-  if (q === "high") return "/printer";
-  return "/ebook";
+  const Q = String(q || "GOOD").toUpperCase();
+  if (Q === "ORIGINAL") return null;
+  return "/ebook"; // GOOD default
 }
 
 async function compressPdfWithGhostscript(inputPdf, outputPdf, qualityMode) {
-  const preset = mapQualityToGsPreset(
-    String(qualityMode || "GOOD").toUpperCase()
-  );
+  const preset = mapQualityToGsPreset(qualityMode);
   if (!preset) {
     await fsp.copyFile(inputPdf, outputPdf);
     return;
   }
 
-  await run(GS_EXE, [
-    "-sDEVICE=pdfwrite",
-    "-dCompatibilityLevel=1.4",
-    "-dPDFSETTINGS=" + preset,
-    "-dNOPAUSE",
-    "-dQUIET",
-    "-dBATCH",
-    `-sOutputFile=${outputPdf}`,
-    inputPdf,
-  ]);
+  await run(
+    GS_EXE,
+    [
+      "-sDEVICE=pdfwrite",
+      "-dCompatibilityLevel=1.4",
+      "-dPDFSETTINGS=" + preset,
+      "-dNOPAUSE",
+      "-dQUIET",
+      "-dBATCH",
+      `-sOutputFile=${outputPdf}`,
+      inputPdf,
+    ],
+    { timeoutMs: TIMEOUT_GS_MS }
+  );
 }
 
 /**
  * Split by target MB.
- * We report split progress using "end page / total pages".
+ * split progress = end page / total pages
  */
 async function splitPdfByMbTarget(inputPdf, splitMb, outDir, onProgress) {
   if (!splitMb || splitMb <= 0) {
@@ -428,6 +475,7 @@ async function splitPdfByMbTarget(inputPdf, splitMb, outDir, onProgress) {
     256 * 1024,
     Math.floor(splitMb * 1024 * 1024 * 0.97)
   );
+
   const totalBytes = await getFileSizeBytes(inputPdf);
   const bytesPerPage = Math.max(1024, Math.floor(totalBytes / totalPages));
   let estPages = Math.max(1, Math.floor(targetBytes / bytesPerPage));
@@ -437,14 +485,14 @@ async function splitPdfByMbTarget(inputPdf, splitMb, outDir, onProgress) {
     const name = `part_${String(partIndex).padStart(3, "0")}.pdf`;
     const outPath = path.join(outDir, name);
 
-    await run(QPDF_EXE, [
-      inputPdf,
-      "--pages",
-      ".",
-      `${start}-${end}`,
-      "--",
-      outPath,
-    ]);
+    await run(
+      QPDF_EXE,
+      [inputPdf, "--pages", ".", `${start}-${end}`, "--", outPath],
+      {
+        timeoutMs: TIMEOUT_QPDF_MS,
+      }
+    );
+
     const sz = await getFileSizeBytes(outPath);
     return { outPath, size: sz, endPage: end };
   }
@@ -492,7 +540,7 @@ async function splitPdfByMbTarget(inputPdf, splitMb, outDir, onProgress) {
 
     if (onProgress) {
       const pct = clampPct((best.endPage / totalPages) * 100, 0);
-      await onProgress(Math.min(99, pct)); // done үед 100 болгоно
+      await onProgress(Math.min(99, pct));
     }
   }
 
@@ -501,20 +549,16 @@ async function splitPdfByMbTarget(inputPdf, splitMb, outDir, onProgress) {
 }
 
 async function zipOutputs(files, zipPath) {
-  await run(SEVEN_Z_EXE, ["a", "-tzip", zipPath, ...files]);
+  await run(SEVEN_Z_EXE, ["a", "-tzip", zipPath, ...files], {
+    timeoutMs: TIMEOUT_7Z_MS,
+  });
 }
 
 // ----------------------
 // Job processing (R2 in/out)
 // ----------------------
-function resolveR2InputKey(job) {
-  return job.input_path || `${job.id}/input.pdf`.replace(/^\/+/, "");
-}
-
 function normalizeInputKey(job) {
-  const k = resolveR2InputKey(job);
-  if (k.includes("/")) return k;
-  return `${job.id}/input.pdf`;
+  return `${job.id}/input.pdf`.replace(/^\/+/, "");
 }
 
 function outputZipKeyFor(job) {
@@ -543,7 +587,6 @@ async function processOneJob(job) {
       progress: 5,
       compress_progress: 0,
       split_progress: 0,
-      // reset summary fields for safety
       compressed_mb: null,
       parts_count: null,
       max_part_mb: null,
@@ -588,10 +631,7 @@ async function processOneJob(job) {
       compressed_mb: compressedMb,
     });
 
-    await updateStage(jobId, {
-      progress: 55,
-      compress_progress: 100,
-    });
+    await updateStage(jobId, { progress: 55, compress_progress: 100 });
 
     // ---- SPLIT ----
     const splitMb = Number(job.split_mb || 0);
@@ -607,7 +647,6 @@ async function processOneJob(job) {
       splitMb,
       partsDir,
       async (pct) => {
-        // overall progress ~ 60..90
         const overall = 60 + clampPct(pct, 0) * 0.3; // 60..90
         await updateStage(jobId, { split_progress: pct, progress: overall });
       }
@@ -657,11 +696,9 @@ async function processOneJob(job) {
       stage: "DONE",
       progress: 100,
       output_zip_path: outZipKey,
-      zip_path: outZipKey,
       done_at: nowIso(),
-      expires_at: addMinutesIso(OUTPUT_TTL_MINUTES),
+      expires_at: addMinutesIso(OUTPUT_TTL_MINUTES), // ✅ TTL is set HERE
       error_text: null,
-      // Ensure stage-progress finalized
       compress_progress: 100,
       split_progress: 100,
     });
@@ -710,6 +747,9 @@ async function main() {
     STALE_PROCESSING_MINUTES,
     DO_CLEANUP,
     CLEANUP_EVERY_MS,
+    TIMEOUT_QPDF_MS,
+    TIMEOUT_GS_MS,
+    TIMEOUT_7Z_MS,
   });
 
   let lastCleanupAt = 0;
