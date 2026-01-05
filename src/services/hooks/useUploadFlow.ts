@@ -27,6 +27,7 @@ function stageToLabel(stage?: string | null) {
   if (!s) return "Working";
   if (s === "QUEUE") return "Queued";
   if (s === "DOWNLOAD") return "Downloading";
+  if (s === "PREPROCESS") return "Optimizing PDF";
   if (s === "SPLIT") return "Splitting";
   if (s === "ZIP") return "Creating ZIP";
   if (s === "UPLOAD_OUT") return "Uploading ZIP";

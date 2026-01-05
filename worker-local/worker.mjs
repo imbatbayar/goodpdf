@@ -63,6 +63,23 @@ const TIMEOUT_7Z_MS = Math.max(
   Number(process.env.TIMEOUT_7Z_MS || 240_000)
 );
 
+// Binaries (Dockerfile sets defaults; keep runtime flexible)
+const GS_EXE = process.env.GS_EXE || "gs";
+const QPDF_EXE = process.env.QPDF_EXE || "qpdf";
+const SEVEN_Z_EXE = process.env.SEVEN_Z_EXE || process.env.SEVENZ_EXE || "7z";
+
+// Preprocess behavior (Adobe-like): stabilize PDF structure + optionally recompress images.
+// (Not rasterizing pages; keeps PDF pages as PDF.)
+// - PREPROCESS_MODE: "AUTO" | "ALWAYS" | "OFF"  (default: AUTO)
+// - PREPROCESS_DPI: default 160
+// - PREPROCESS_JPEG_QUALITY: default 75
+const PREPROCESS_MODE = String(process.env.PREPROCESS_MODE || "AUTO").toUpperCase();
+const PREPROCESS_DPI = Math.max(72, Number(process.env.PREPROCESS_DPI || 160));
+const PREPROCESS_JPEG_QUALITY = Math.max(
+  30,
+  Math.min(95, Number(process.env.PREPROCESS_JPEG_QUALITY || 75))
+);
+
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
   process.exit(1);
@@ -98,6 +115,16 @@ function tmpDir(jobId) {
   const d = path.join(os.tmpdir(), `goodpdf_${jobId}`);
   fs.mkdirSync(d, { recursive: true });
   return d;
+}
+function emptyDir(dirPath) {
+  try {
+    if (!safeExists(dirPath)) return;
+    for (const f of fs.readdirSync(dirPath)) {
+      safeUnlink(path.join(dirPath, f));
+    }
+  } catch {
+    // best effort
+  }
 }
 function safeExists(p) {
   try {
@@ -313,11 +340,80 @@ async function cleanupExpiredOutputs() {
 // ----------------------
 // SPLIT: Adaptive range packing (never-crash)
 // ----------------------
+
+// ----------------------
+// PREPROCESS (Adobe-like)
+// - Goal: Stabilize PDF internal structure (xref/object streams) and optionally recompress images
+//   to avoid "1 page per part" explosions when splitting by size.
+// - NOT rasterizing pages. Text remains text; pages remain PDF pages.
+//
+// Modes:
+// - OFF: skip preprocessing
+// - AUTO: preprocess only when input is larger than split limit (most real cases)
+// - ALWAYS: always preprocess
+async function preprocessPdfFast({ inPdf, outPdf, limitBytes }) {
+  const mode = PREPROCESS_MODE;
+  if (mode === "OFF") return { used: false, reason: "MODE_OFF" };
+
+  const inBytes = safeStatSize(inPdf) ?? null;
+  if (mode === "AUTO") {
+    // If the whole PDF is already within the requested split size, no need to touch it.
+    if (typeof inBytes === "number" && inBytes > 0 && inBytes <= limitBytes) {
+      return { used: false, reason: "ALREADY_WITHIN_LIMIT" };
+    }
+  }
+
+  // Ghostscript pdfwrite preset tuned for speed + stability.
+  // Downsampling makes huge-image PDFs predictable; quality is intentionally pragmatic.
+  const dpi = PREPROCESS_DPI;
+  const jpegQ = PREPROCESS_JPEG_QUALITY;
+
+  const args = [
+    "-q",
+    "-dSAFER",
+    "-dBATCH",
+    "-dNOPAUSE",
+    "-sDEVICE=pdfwrite",
+    "-dCompatibilityLevel=1.4",
+    "-dDetectDuplicateImages=true",
+    "-dCompressFonts=true",
+    "-dSubsetFonts=true",
+    "-dEmbedAllFonts=true",
+    "-dAutoRotatePages=/None",
+
+    "-dDownsampleColorImages=true",
+    "-dColorImageDownsampleType=/Bicubic",
+    `-dColorImageResolution=${dpi}`,
+
+    "-dDownsampleGrayImages=true",
+    "-dGrayImageDownsampleType=/Bicubic",
+    `-dGrayImageResolution=${dpi}`,
+
+    "-dDownsampleMonoImages=true",
+    "-dMonoImageDownsampleType=/Subsample",
+    `-dMonoImageResolution=${Math.max(300, dpi * 2)}`,
+
+    `-dJPEGQ=${jpegQ}`,
+    `-sOutputFile=${outPdf}`,
+    inPdf,
+  ];
+
+  await runCmd(GS_EXE, args, TIMEOUT_QPDF_MS);
+
+  const outBytes = safeStatSize(outPdf) ?? null;
+  if (outBytes == null || outBytes <= 0) {
+    safeUnlink(outPdf);
+    return { used: false, reason: "GS_NO_OUTPUT" };
+  }
+
+  return { used: true, reason: "OK", inBytes, outBytes };
+}
+
 async function splitPdfGreedy({ inPdf, partsDir, limitMb }) {
   const limitBytes = mbToBytes(limitMb);
 
   const { out: npagesOut } = await runCmd(
-    "qpdf",
+    QPDF_EXE,
     ["--show-npages", inPdf],
     TIMEOUT_QPDF_MS
   );
@@ -342,7 +438,7 @@ async function splitPdfGreedy({ inPdf, partsDir, limitMb }) {
   async function tryBuildRange(startPage, endPage, outPath) {
     try {
       await runCmd(
-        "qpdf",
+        QPDF_EXE,
         ["--empty", "--pages", inPdf, `${startPage}-${endPage}`, "--", outPath],
         TIMEOUT_QPDF_MS
       );
@@ -355,7 +451,7 @@ async function splitPdfGreedy({ inPdf, partsDir, limitMb }) {
   const tempParts = []; // {tmpPath, bytes, startPage, endPage}
   let start = 1;
   let partNo = 1;
-  let prevSpan = 12;
+  let prevSpan = 1;
 
   while (start <= totalPages) {
     // build single page (must be monotonic baseline)
@@ -420,7 +516,7 @@ async function splitPdfGreedy({ inPdf, partsDir, limitMb }) {
 
         if (probeEnd >= totalPages) break;
         step *= 2;
-        probeEnd = Math.min(totalPages, goodEnd + step);
+        probeEnd = Math.min(totalPages, start + step - 1);
         continue;
       }
 
@@ -586,7 +682,7 @@ async function zipParts(partsDir, outZipPath) {
   }
 
   // outZipPath абсолют байж болно; cwd=partsDir үед файлуудыг нэрээр нь нэмнэ
-  await runCmd("7z", ["a", "-tzip", outZipPath, ...pdfs], TIMEOUT_7Z_MS, {
+  await runCmd(SEVEN_Z_EXE, ["a", "-tzip", outZipPath, ...pdfs], TIMEOUT_7Z_MS, {
     cwd: partsDir,
   });
 }
@@ -603,6 +699,8 @@ async function processOneJob(job) {
 
   const wd = tmpDir(jobId);
   const inPdf = path.join(wd, "input.pdf");
+  const normPdf = path.join(wd, "input_norm.pdf");
+  const normPdf2 = path.join(wd, "input_norm2.pdf");
   const partsDir = path.join(wd, "parts");
   fs.mkdirSync(partsDir, { recursive: true });
 
@@ -625,6 +723,21 @@ async function processOneJob(job) {
       });
     }
 
+    const limitBytes = mbToBytes(splitMb);
+    let workPdf = inPdf;
+
+    // Stage: PREPROCESS (Adobe-like). This makes PDF structure stable so size-based split works.
+    await updateJob(jobId, {
+      stage: "PREPROCESS",
+      progress: 15,
+      split_progress: 5,
+      updated_at: nowIso(),
+    });
+
+    // Pass 1: moderate fast preprocess
+    const pre1 = await preprocessPdfFast({ inPdf, outPdf: normPdf, limitBytes });
+    if (pre1?.used) workPdf = normPdf;
+
     await updateJob(jobId, {
       stage: "SPLIT",
       progress: 20,
@@ -632,11 +745,89 @@ async function processOneJob(job) {
       updated_at: nowIso(),
     });
 
-    const { partFiles, partMeta } = await splitPdfGreedy({
-      inPdf,
+    const expectedParts = (() => {
+      const b = safeStatSize(inPdf);
+      if (typeof b === "number" && b > 0) return Math.max(1, Math.ceil(b / limitBytes));
+      return null;
+    })();
+
+    let { partFiles, partMeta } = await splitPdfGreedy({
+      inPdf: workPdf,
       partsDir,
       limitMb: splitMb,
     });
+
+    // If the result is wildly more parts than expected, the PDF is still "size-unstable".
+    // Do one more (stronger) preprocess pass and split again.
+    if (
+      expectedParts &&
+      partFiles.length > Math.ceil(expectedParts * 1.6) &&
+      PREPROCESS_MODE !== "OFF"
+    ) {
+      // Stronger preset (still NOT rasterizing pages)
+      await updateJob(jobId, {
+        stage: "PREPROCESS",
+        progress: 25,
+        split_progress: 12,
+        updated_at: nowIso(),
+      });
+
+      // Temporarily override quality for this pass (more aggressive downsample/recompress)
+      const prevDpi = PREPROCESS_DPI;
+      const prevJ = PREPROCESS_JPEG_QUALITY;
+      // NOTE: we can't mutate consts; instead run GS directly here.
+      try {
+        const dpi2 = Math.max(96, Math.min(150, Math.round(prevDpi * 0.8)));
+        const jpegQ2 = Math.max(55, Math.min(80, Math.round(prevJ * 0.85)));
+        const args2 = [
+          "-q",
+          "-dSAFER",
+          "-dBATCH",
+          "-dNOPAUSE",
+          "-sDEVICE=pdfwrite",
+          "-dCompatibilityLevel=1.4",
+          "-dDetectDuplicateImages=true",
+          "-dCompressFonts=true",
+          "-dSubsetFonts=true",
+          "-dEmbedAllFonts=true",
+          "-dAutoRotatePages=/None",
+          "-dDownsampleColorImages=true",
+          "-dColorImageDownsampleType=/Bicubic",
+          `-dColorImageResolution=${dpi2}`,
+          "-dDownsampleGrayImages=true",
+          "-dGrayImageDownsampleType=/Bicubic",
+          `-dGrayImageResolution=${dpi2}`,
+          "-dDownsampleMonoImages=true",
+          "-dMonoImageDownsampleType=/Subsample",
+          `-dMonoImageResolution=${Math.max(300, dpi2 * 2)}`,
+          `-dJPEGQ=${jpegQ2}`,
+          `-sOutputFile=${normPdf2}`,
+          workPdf,
+        ];
+        await runCmd(GS_EXE, args2, TIMEOUT_QPDF_MS);
+
+        if ((safeStatSize(normPdf2) ?? 0) > 0) {
+          workPdf = normPdf2;
+        }
+      } catch {
+        // best effort: keep previous output
+      }
+
+      // re-split from scratch
+      emptyDir(partsDir);
+      await updateJob(jobId, {
+        stage: "SPLIT",
+        progress: 30,
+        split_progress: 15,
+        updated_at: nowIso(),
+      });
+
+      ({ partFiles, partMeta } = await splitPdfGreedy({
+        inPdf: workPdf,
+        partsDir,
+        limitMb: splitMb,
+      }));
+    }
 
     await updateJob(jobId, {
       stage: "ZIP",
