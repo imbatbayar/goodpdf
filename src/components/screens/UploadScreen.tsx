@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ScreenShell } from "@/components/screens/_ScreenShell";
 import { FileDropzone } from "@/components/blocks/FileDropzone";
 import { SplitSizeInput } from "@/components/blocks/SplitSizeInput";
@@ -9,18 +9,22 @@ import { Progress } from "@/components/ui/Progress";
 import { DEFAULT_SPLIT_MB } from "@/config/constants";
 import { useUploadFlow } from "@/services/hooks/useUploadFlow";
 import { Card } from "@/components/blocks/Card";
-import { DoneConfirmModal } from "@/components/modals/DoneConfirmModal";
 
+type DownloadUX = "IDLE" | "PREPARE" | "CONFIRM" | "SUCCESS";
 type Step = "PICK" | "SETTINGS" | "RUN";
 
 export function UploadScreen() {
   const [step, setStep] = useState<Step>("PICK");
-
   const [file, setFile] = useState<File | null>(null);
 
   // ✅ Default-ууд (Split-only)
   const [splitMb, setSplitMb] = useState<number>(DEFAULT_SPLIT_MB);
-  const [doneOpen, setDoneOpen] = useState(false);
+
+  // ✅ Download UX (no popups)
+  const [dlUx, setDlUx] = useState<DownloadUX>("IDLE");
+  const [fakePct, setFakePct] = useState(0);
+  const fakeTimerRef = useRef<number | null>(null);
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
 
   const flow = useUploadFlow();
 
@@ -41,7 +45,7 @@ export function UploadScreen() {
       return;
     }
 
-    // PROCESSING / READY / ERROR -> RUN дээр харуулах (download, progress, error бүгд энд байгаа)
+    // PROCESSING / READY / ERROR -> RUN дээр харуулах
     if (flow.phase === "PROCESSING" || flow.phase === "READY" || flow.phase === "ERROR") {
       if (step !== "RUN") setStep("RUN");
       return;
@@ -62,14 +66,104 @@ export function UploadScreen() {
     setFile(null);
     setSplitMb(DEFAULT_SPLIT_MB);
     setStep("PICK");
+
+    // reset download UX
+    setDlUx("IDLE");
+    setFakePct(0);
+    if (fakeTimerRef.current) {
+      window.clearInterval(fakeTimerRef.current);
+      fakeTimerRef.current = null;
+    }
+    if (iframeRef.current) {
+      iframeRef.current.remove();
+      iframeRef.current = null;
+    }
+
     flow.resetAll();
+  };
+
+  // ✅ Fake progress cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (fakeTimerRef.current) {
+        window.clearInterval(fakeTimerRef.current);
+        fakeTimerRef.current = null;
+      }
+      if (iframeRef.current) {
+        iframeRef.current.remove();
+        iframeRef.current = null;
+      }
+    };
+  }, []);
+
+  const startDownloadAndPrepare = () => {
+    if (!flow.downloadUrl) return;
+
+    // 1) Trigger browser download WITHOUT navigation or popups
+    // Hidden iframe follows redirects and initiates download while staying on the page.
+    try {
+      if (iframeRef.current) {
+        iframeRef.current.remove();
+        iframeRef.current = null;
+      }
+      const ifr = document.createElement("iframe");
+      ifr.style.display = "none";
+      ifr.src = flow.downloadUrl;
+      document.body.appendChild(ifr);
+      iframeRef.current = ifr;
+
+      // Remove iframe later (avoid DOM leak)
+      window.setTimeout(() => {
+        try {
+          ifr.remove();
+        } catch {}
+        if (iframeRef.current === ifr) iframeRef.current = null;
+      }, 30000);
+    } catch {
+      // Fallback: same-tab navigation (last resort)
+      window.location.href = flow.downloadUrl;
+    }
+
+    // 2) 5s fake progress 0→100
+    setDlUx("PREPARE");
+    setFakePct(0);
+
+    if (fakeTimerRef.current) {
+      window.clearInterval(fakeTimerRef.current);
+      fakeTimerRef.current = null;
+    }
+
+    const startedAt = Date.now();
+    fakeTimerRef.current = window.setInterval(() => {
+      const elapsed = Date.now() - startedAt;
+      const pct = Math.min(100, Math.round((elapsed / 5000) * 100));
+      setFakePct(pct);
+      if (pct >= 100) {
+        if (fakeTimerRef.current) {
+          window.clearInterval(fakeTimerRef.current);
+          fakeTimerRef.current = null;
+        }
+        setDlUx("CONFIRM");
+      }
+    }, 50);
+  };
+
+  const confirmCleanupAndReset = async () => {
+    setDlUx("SUCCESS");
+    try {
+      await flow.confirmDone(); // best effort (server confirm)
+    } catch {
+      // best effort
+    }
+    window.setTimeout(() => {
+      resetToPick();
+    }, 1000);
   };
 
   const doUpload = async () => {
     if (!file) return;
     try {
       await flow.uploadOnly(file, splitMb);
-      // upload дуусмагц settings дээр үлдээнэ (user өөрчилж болно)
       setStep("SETTINGS");
     } catch {
       // error нь flow.error дээр
@@ -80,7 +174,7 @@ export function UploadScreen() {
     if (!file) return;
     setStep("RUN");
     try {
-      await flow.startProcessing({ splitMb });
+      await flow.startProcessing();
     } catch {
       // error нь flow.error дээр
     }
@@ -88,16 +182,6 @@ export function UploadScreen() {
 
   return (
     <ScreenShell title="Split PDF" subtitle="Upload → Size → Start → Download ZIP">
-      <DoneConfirmModal
-        open={doneOpen}
-        onClose={() => setDoneOpen(false)}
-        onDone={async () => {
-          await flow.confirmDone();
-          setDoneOpen(false);
-          resetToPick();
-        }}
-      />
-
       <div style={{ display: "grid", gap: 12, maxWidth: 760 }}>
         <StepHeader step={step} />
 
@@ -113,7 +197,14 @@ export function UploadScreen() {
             {fileMeta ? (
               <Card>
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-                  <div style={{ fontWeight: 800, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  <div
+                    style={{
+                      fontWeight: 800,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
                     {fileMeta.name}
                   </div>
                   <div style={{ color: "var(--muted)" }}>{fileMeta.mb}MB</div>
@@ -158,7 +249,14 @@ export function UploadScreen() {
             {fileMeta ? (
               <Card>
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-                  <div style={{ fontWeight: 800, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  <div
+                    style={{
+                      fontWeight: 800,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
                     {fileMeta.name}
                   </div>
                   <div style={{ color: "var(--muted)" }}>{fileMeta.mb}MB</div>
@@ -228,7 +326,7 @@ export function UploadScreen() {
               </Card>
             ) : null}
 
-            {/* ✅ READY summary + Download */}
+            {/* ✅ READY summary + Download (no popups) */}
             {flow.phase === "READY" ? (
               <Card>
                 <div style={{ display: "grid", gap: 10 }}>
@@ -248,32 +346,37 @@ export function UploadScreen() {
                     <div style={{ fontSize: 12, color: "var(--muted)" }}>Each part will be up to {splitMb}MB.</div>
                   </div>
 
-                  <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                    <Button
-                      disabled={!canDownload || !flow.downloadUrl}
-                      onClick={() => {
-                        // Download endpoint will stream/redirect to signed ZIP
-                        window.open(flow.downloadUrl!, "_blank", "noopener,noreferrer");
-                        setDoneOpen(true);
-                      }}
-                    >
-                      Download
-                    </Button>
+                  <div style={{ display: "grid", gap: 10 }}>
+                    {/* 1 button at a time: Download -> Confirm */}
+                    {dlUx === "IDLE" ? (
+                      <Button disabled={!canDownload || !flow.downloadUrl} onClick={startDownloadAndPrepare}>
+                        Download
+                      </Button>
+                    ) : null}
 
-                    <Button
-                      variant="secondary"
-                      disabled={flow.busy}
-                      onClick={async () => {
-                        await flow.confirmDone();
-                        resetToPick();
-                      }}
-                    >
-                      Done
-                    </Button>
+                    {dlUx === "PREPARE" ? (
+                      <>
+                        <Button disabled>Download</Button>
+                        <div style={{ display: "grid", gap: 6 }}>
+                          <Progress value={fakePct} />
+                          <div style={{ fontSize: 12, color: "var(--muted)" }}>
+                            Download started. Getting ready to delete your files from the server.
+                          </div>
+                          <div style={{ fontSize: 12, color: "var(--muted)" }}>{fakePct}%</div>
+                        </div>
+                      </>
+                    ) : null}
 
-                    <Button variant="ghost" disabled={flow.busy} onClick={resetToPick}>
-                      New file
-                    </Button>
+                    {dlUx === "CONFIRM" ? (
+                      <>
+                        <Button onClick={confirmCleanupAndReset}>Confirm</Button>
+                        <div style={{ fontSize: 12, color: "var(--muted)" }}>
+                          Download started. Getting ready to delete your files from the server.
+                        </div>
+                      </>
+                    ) : null}
+
+                    {dlUx === "SUCCESS" ? <div style={{ fontWeight: 900, fontSize: 14 }}>Good Job 🤩</div> : null}
                   </div>
                 </div>
               </Card>
