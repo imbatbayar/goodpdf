@@ -1,173 +1,209 @@
 import type { QualityMode } from "@/domain/jobs/quality";
 
+/**
+ * JobService
+ * - goodPDF нь одоогоор "split-only" (compress хийхгүй).
+ * - API contract:
+ *   POST /api/jobs/create   -> { ok, data:{ jobId, uploadUrl } }
+ *   GET  /api/jobs/status?jobId=...
+ *   POST /api/jobs/start    -> { jobId, splitMb }
+ *   GET  /api/jobs/download?jobId=...
+ *   POST /api/jobs/done     -> { jobId }
+ *   POST /api/jobs/cancel   -> { jobId }
+ */
+
+type JsonResp<T> = { ok: boolean; data?: T; error?: string };
+
+type CreateJobResp = {
+  jobId: string;
+  uploadUrl: string; // presigned PUT URL
+};
+
+type StartJobResp = {
+  job: {
+    id: string;
+    status: string;
+    split_mb?: number | null;
+    progress?: number | null;
+    stage?: string | null;
+  };
+};
+
+export type StatusResp = {
+  status: string;
+  progress: number;
+  stage?: string | null;
+  downloadUrl?: string | null;
+
+  partsCount?: number | null;
+  maxPartMb?: number | null;
+  targetMb?: number | null;
+
+  errorText?: string | null;
+  errorCode?: string | null;
+};
+
 type CreateArgs = {
   file: File;
 
   // MVP: auth холбогдоогүй тул түр userId дамжуулж байна
   userId: string;
 
-  // Upload хийсний дараа user Good/Original, splitMb-аа өөрчилж болно.
-  // Гэхдээ одоогийн create API чинь quality/splitMb-г хадгалдаг тул түр дамжуулна.
-  // (Дараагийн алхам дээр upload дараа нь start хийх API гаргаад бүр гоё болгоно.)
-  quality: QualityMode; // "GOOD" | "ORIGINAL"
-  splitMb: number;
+  // Legacy field (UI дээр харагдахгүй). Compress хийхгүй ч schema/хуучин кодтой нийцүүлэхэд үлдээв.
+  quality?: QualityMode; // "GOOD" | "ORIGINAL" (ignored)
+
+  // ✅ DB constraint-ийн төлөө create үед fallback утга өгч болно (Start дээр жинхэнэ утга хадгална)
+  splitMbFallback?: number;
 };
 
-type Callbacks = {
-  onStep?: (s: string) => void;
+function assertOk<T>(res: JsonResp<T>, fallbackMsg: string) {
+  if (!res?.ok) throw new Error(res?.error || fallbackMsg);
+  return res.data as T;
+}
 
-  // 0..100
-  onProgress?: (p: number) => void;
-
-  onJobId?: (id: string) => void;
-};
-
-type CreateJobResponse = {
-  jobId: string;
-  upload: { url: string };
-};
+async function readJson<T>(r: Response): Promise<JsonResp<T>> {
+  let j: any = null;
+  try {
+    j = await r.json();
+  } catch {
+    // ignore
+  }
+  if (!r.ok) {
+    return { ok: false, error: j?.error || j?.message || `HTTP ${r.status}` };
+  }
+  return j as JsonResp<T>;
+}
 
 export class JobService {
   /**
-   * 1) Job үүсгэнэ + presigned PUT URL авна
+   * 1) Create job (server DB + presigned uploadUrl)
+   *    - split-only: splitMbFallback нь зөвхөн schema constraint-т зориулагдсан.
    */
-  async createJob(args: CreateArgs, cb?: Pick<Callbacks, "onStep" | "onProgress" | "onJobId">) {
-    cb?.onStep?.("Creating job…");
-    cb?.onProgress?.(0);
-
+  static async createJob(args: CreateArgs): Promise<CreateJobResp> {
     const res = await fetch("/api/jobs/create", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         userId: args.userId,
-        quality: args.quality,
-        splitMb: args.splitMb,
         fileName: args.file.name,
-        fileSize: args.file.size,
+        fileSizeBytes: args.file.size,
+        quality: args.quality || "ORIGINAL",
+        splitMb: args.splitMbFallback,
       }),
-    }).then((r) => r.json());
+    }).then((r) => readJson<any>(r));
 
-    if (!res?.ok) throw new Error(res?.error || "Create job failed");
+    const data = assertOk(res, "Create failed") as any;
 
-    const data = res.data as CreateJobResponse;
-    cb?.onJobId?.(data.jobId);
+    const jobId = String(data?.jobId || "").trim();
+    const uploadUrl = String(data?.uploadUrl || data?.upload?.url || "").trim();
 
-    return data;
+    if (!jobId) throw new Error("Create failed: missing jobId");
+    if (!uploadUrl) throw new Error("Create failed: missing uploadUrl");
+
+    return { jobId, uploadUrl };
   }
 
-  /**
-   * 2) UI -> R2 direct PUT (signed URL) + жинхэнэ upload progress (XHR)
-   */
-  async uploadToR2SignedUrl(uploadUrl: string, file: File, cb?: Pick<Callbacks, "onStep" | "onProgress">) {
-    cb?.onStep?.("Uploading…");
-    cb?.onProgress?.(0);
 
+  /**
+   * 2) Upload file to R2 with presigned PUT
+   *    - XHR ашиглавал progress авах боломжтой
+   */
+  static async uploadToR2(
+    uploadUrl: string,
+    file: File,
+    onPct?: (pct: number) => void
+  ) {
     await new Promise<void>((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open("PUT", uploadUrl, true);
-
-      // ⚠️ create/route.ts дээр ContentType-ийг presign дээр bind хийгээгүй (зөв).
-      // Тиймээс энд content-type тавихгүй байж болно.
-      // Хэрвээ тавимаар бол: xhr.setRequestHeader("content-type", "application/pdf");
-      // Гэхдээ CORS + signed headers зөрөх эрсдэлтэй тул одоохондоо битгий.
+      xhr.setRequestHeader("content-type", "application/pdf");
 
       xhr.upload.onprogress = (evt) => {
         if (!evt.lengthComputable) return;
-        const pct = Math.max(0, Math.min(100, (evt.loaded / evt.total) * 100));
-        cb?.onProgress?.(pct);
+        const pct = Math.round((evt.loaded / evt.total) * 100);
+        onPct?.(Math.max(0, Math.min(100, pct)));
       };
 
+      xhr.onerror = () => reject(new Error("Upload failed"));
       xhr.onload = () => {
-        if (xhr.status >= 200 && xhr.status < 300) {
-          cb?.onProgress?.(100);
-          resolve();
-        } else {
-          reject(new Error(`Upload failed (status ${xhr.status})`));
-        }
+        if (xhr.status >= 200 && xhr.status < 300) resolve();
+        else reject(new Error(`Upload failed (HTTP ${xhr.status})`));
       };
 
-      xhr.onerror = () => reject(new Error("Upload failed (network)"));
       xhr.send(file);
     });
   }
 
   /**
-   * 3) Upload дууссаныг серверт мэдэгдэж job -> UPLOADED болгоно
+   * 3) Start processing (✅ splitMb энд жинхэнээрээ ирнэ)
    */
-  async markUploaded(jobId: string) {
-    const res = await fetch(`/api/jobs/upload?jobId=${encodeURIComponent(jobId)}`, {
+  static async start(jobId: string, splitMb: number): Promise<StartJobResp> {
+    const res = await fetch("/api/jobs/start", {
       method: "POST",
-      headers: { "cache-control": "no-store" },
-      cache: "no-store",
-    }).then((r) => r.json());
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jobId, splitMb }),
+    }).then((r) => readJson<StartJobResp>(r));
 
-    if (!res?.ok) throw new Error(res?.error || "Mark uploaded failed");
-    return res;
+    return assertOk(res, "Start failed");
   }
 
   /**
-   * 4) DONE хүртэл polling
-   * default interval = 1000ms (dev log spam багасгана)
+   * 4) Poll status
    */
-  async pollDone(
-    jobId: string,
-    onPct: (pct: number) => void,
-    opts?: { maxSeconds?: number; intervalMs?: number }
-  ) {
-    const maxSeconds = opts?.maxSeconds ?? 10 * 60; // 10 минут
-    const intervalMs = opts?.intervalMs ?? 1000;
-
-    const maxTries = Math.ceil((maxSeconds * 1000) / intervalMs);
-
-    for (let i = 0; i < maxTries; i++) {
-      const res = await fetch(`/api/jobs/status?jobId=${encodeURIComponent(jobId)}`, {
-        cache: "no-store",
+  static async status(jobId: string): Promise<StatusResp> {
+    const res = await fetch(
+      `/api/jobs/status?jobId=${encodeURIComponent(jobId)}`,
+      {
+        method: "GET",
         headers: { "cache-control": "no-store" },
-      }).then((r) => r.json());
+      }
+    ).then((r) => readJson<StatusResp>(r));
 
-      if (!res?.ok) throw new Error(res?.error || "Status failed");
-
-      const data = res.data as { status: string; progress?: number; stage?: string; stage_progress?: number };
-
-      // Одоогийн системд progress л байгаа (ерөнхий).
-      // Дараагийн алхам дээр stage + stage_progress-г worker бичдэг болгоно.
-      const pct = typeof data.progress === "number" ? data.progress : Math.min(99, (i / maxTries) * 100);
-      onPct(Math.max(0, Math.min(100, pct)));
-
-      if (data.status === "DONE" || data.status === "DONE_CONFIRMED") return;
-      if (data.status === "FAILED") throw new Error("Processing failed");
-
-      await new Promise((x) => setTimeout(x, intervalMs));
-    }
-
-    throw new Error("Timed out");
+    return assertOk(res, "Status failed");
   }
 
   /**
-   * ✅ Download endpoint (энэ нь 307 redirect хийдэг)
+   * 5) Confirm done (start cleanup timer)
    */
-  getDownloadUrl(jobId: string) {
-    return `/api/jobs/download?jobId=${encodeURIComponent(jobId)}`;
-  }
-
-  /**
-   * ✅ User click дээр таталт эхлүүлэх
-   */
-  triggerDownload(url: string) {
-    window.location.href = url;
-  }
-
-  /**
-   * ✅ User Done дарсны дараа
-   */
-  async confirmDone(jobId: string) {
+  static async done(jobId: string) {
     const res = await fetch("/api/jobs/done", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ jobId }),
-    }).then((r) => r.json());
+    }).then((r) => readJson<{}>(r));
 
-    if (!res?.ok) throw new Error(res?.error || "Confirm failed");
-    return res;
+    assertOk(res, "Confirm failed");
   }
+
+  /**
+   * 6) Cancel job (best effort)
+   */
+  static async cancel(jobId: string) {
+    const res = await fetch("/api/jobs/cancel", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jobId }),
+    }).then((r) => readJson<{}>(r));
+
+    // cancel нь best effort — ok биш байсан ч throw хийхгүй
+    if (!res?.ok) return;
+  }
+
+  /**
+   * 7) Download URL (frontend convenience)
+   */
+  static downloadUrl(jobId: string) {
+    return `/api/jobs/download?jobId=${encodeURIComponent(jobId)}`;
+  }
+
+    static async markUploaded(jobId: string) {
+    const res = await fetch("/api/jobs/upload", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jobId }),
+    }).then((r) => readJson<{ jobId: string; inputKey: string }>(r));
+
+    assertOk(res, "Mark uploaded failed");
+  }
+
 }

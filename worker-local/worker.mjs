@@ -1,70 +1,80 @@
-// worker-local/worker.mjs  (GOODPDF v2 — SPLIT ONLY, NO schema read, safe update)
+// worker-local/worker.mjs — GOODPDF (Split-only) Production Worker
+// Supabase schema (from jobs_rows.csv):
+// - output_zip_path, zip_path, ttl_minutes, delete_at, cleaned_at
+// - parts_json, parts_count, total_parts_bytes, output_zip_bytes
+// - stage, progress, split_progress, error_text, error_code, claimed_by, claimed_at
+
 import "dotenv/config";
-import fs from "node:fs";
-import fsp from "node:fs/promises";
-import path from "node:path";
-import os from "node:os";
-import { spawn } from "node:child_process";
+import fs from "fs";
+import path from "path";
+import os from "os";
+import { spawn } from "child_process";
+import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
 import {
   S3Client,
   GetObjectCommand,
   PutObjectCommand,
-  DeleteObjectsCommand,
-  HeadObjectCommand,
+  DeleteObjectCommand,
 } from "@aws-sdk/client-s3";
 
 // ----------------------
 // ENV
 // ----------------------
+const WORKER_ID =
+  process.env.WORKER_ID || `worker_${crypto.randomBytes(3).toString("hex")}`;
+
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-// R2 (S3-compatible)
 const R2_ENDPOINT = process.env.R2_ENDPOINT;
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
-const R2_BUCKET_IN = process.env.R2_BUCKET_IN || "goodpdf-in";
-const R2_BUCKET_OUT = process.env.R2_BUCKET_OUT || "goodpdf-out";
 
-// tools
-const QPDF_EXE = process.env.QPDF_EXE || "qpdf";
-const SEVEN_Z_EXE = process.env.SEVEN_Z_EXE || "7z";
+const R2_BUCKET_IN =
+  process.env.R2_BUCKET_IN || process.env.R2_BUCKET || "goodpdf-in";
+const R2_BUCKET_OUT =
+  process.env.R2_BUCKET_OUT || process.env.R2_BUCKET || "goodpdf-out";
 
-// worker runtime
 const POLL_MS = Number(process.env.POLL_MS || 2000);
 const CONCURRENCY = Math.max(1, Number(process.env.CONCURRENCY || 1));
 
-// privacy TTL (DONE → expires_at)
-const OUTPUT_TTL_MINUTES = Number(process.env.OUTPUT_TTL_MINUTES || 10);
+// TTL fallback (minutes) if job.ttl_minutes is null
+const DEFAULT_TTL_MINUTES = Math.max(
+  1,
+  Number(
+    process.env.DEFAULT_TTL_MINUTES || process.env.OUTPUT_TTL_MINUTES || 30
+  )
+);
 
-// cleanup loop
-const CLEANUP_EVERY_MS = Number(process.env.CLEANUP_EVERY_MS || 30000);
-const DO_CLEANUP = String(process.env.DO_CLEANUP || "1") === "1";
+const DO_CLEANUP =
+  String(process.env.DO_CLEANUP || "true").toLowerCase() !== "false";
+const CLEANUP_EVERY_MS = Math.max(
+  10_000,
+  Number(process.env.CLEANUP_EVERY_MS || 30_000)
+);
 
-// hard timeouts
-const TIMEOUT_QPDF_MS = Number(process.env.TIMEOUT_QPDF_MS || 180_000);
-const TIMEOUT_7Z_MS = Number(process.env.TIMEOUT_7Z_MS || 180_000);
-
-// Worker identity
-const WORKER_ID = `${os.hostname()}_${process.pid}`;
+const TIMEOUT_QPDF_MS = Math.max(
+  10_000,
+  Number(process.env.TIMEOUT_QPDF_MS || 240_000)
+);
+const TIMEOUT_7Z_MS = Math.max(
+  10_000,
+  Number(process.env.TIMEOUT_7Z_MS || 240_000)
+);
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error(
-    "Missing SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY in worker-local/.env"
-  );
+  console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
   process.exit(1);
 }
 if (!R2_ENDPOINT || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY) {
   console.error(
-    "Missing R2_ENDPOINT / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY in worker-local/.env"
+    "Missing R2 env vars (R2_ENDPOINT/R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY)"
   );
   process.exit(1);
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-  auth: { persistSession: false },
-});
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 const r2 = new S3Client({
   region: "auto",
@@ -73,357 +83,112 @@ const r2 = new S3Client({
     accessKeyId: R2_ACCESS_KEY_ID,
     secretAccessKey: R2_SECRET_ACCESS_KEY,
   },
-  forcePathStyle: true,
 });
 
 // ----------------------
-// Helpers
+// Utils
 // ----------------------
-function killProcessTree(pid) {
-  if (!pid) return;
-  if (process.platform === "win32") {
-    try {
-      spawn("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
-    } catch {}
-    return;
-  }
-  try {
-    process.kill(-pid, "SIGKILL");
-  } catch {
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {}
-  }
-}
-
-function run(cmd, args, opts = {}) {
-  const timeoutMs = Number(opts.timeoutMs || 0);
-
-  return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, {
-      stdio: "pipe",
-      windowsHide: true,
-      detached: process.platform !== "win32",
-      ...opts,
-    });
-
-    let out = "";
-    let err = "";
-
-    let timer = null;
-    if (timeoutMs > 0) {
-      timer = setTimeout(() => {
-        killProcessTree(p.pid);
-        reject(
-          new Error(
-            `Command timeout after ${timeoutMs}ms: ${cmd} ${args.join(" ")}`
-          )
-        );
-      }, timeoutMs);
-    }
-
-    p.stdout.on("data", (d) => (out += d.toString()));
-    p.stderr.on("data", (d) => (err += d.toString()));
-
-    p.on("error", (e) => {
-      if (timer) clearTimeout(timer);
-      reject(e);
-    });
-
-    p.on("close", (code) => {
-      if (timer) clearTimeout(timer);
-      if (code === 0) return resolve({ out, err });
-      reject(
-        new Error(`Command failed: ${cmd} ${args.join(" ")}\n${err || out}`)
-      );
-    });
-  });
-}
-
-function tmpDir(jobId) {
-  const d = path.join(os.tmpdir(), "goodpdf", jobId);
-  fs.mkdirSync(d, { recursive: true });
-  return d;
-}
-
 function nowIso() {
   return new Date().toISOString();
 }
-
-function addMinutesIso(m) {
-  return new Date(Date.now() + m * 60 * 1000).toISOString();
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
-
-function clampPct(n, fallback = 0) {
-  const x = Number(n);
-  if (!Number.isFinite(x)) return fallback;
-  return Math.max(0, Math.min(100, Math.round(x)));
+function tmpDir(jobId) {
+  const d = path.join(os.tmpdir(), `goodpdf_${jobId}`);
+  fs.mkdirSync(d, { recursive: true });
+  return d;
 }
-
-function bytesToMb1(bytes) {
-  const mb = Number(bytes) / (1024 * 1024);
-  return Math.round(mb * 10) / 10;
-}
-
-function sanitizeBaseName(name) {
-  const base = String(name || "file")
-    .replace(/\.[^/.]+$/, "")
-    .trim()
-    .slice(0, 80);
-  const clean = base
-    .replace(/[<>:"/\\|?*\x00-\x1F]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return clean || "file";
-}
-
-// ----------------------
-// ✅ Safe update: багана байхгүй бол автоматаар хасаад үргэлжлүүлнэ
-// ----------------------
-function pickMissingColumnName(msg) {
-  // Postgres: column "xxx" of relation "jobs" does not exist
-  const m = String(msg || "").match(
-    /column \"([a-zA-Z0-9_]+)\" .* does not exist/i
-  );
-  return m?.[1] || null;
-}
-
-async function updateJobSafe(jobId, patch) {
-  // patch empty бол update хийхгүй
-  if (!patch || Object.keys(patch).length === 0) return;
-
-  let p = { ...patch };
-  for (let i = 0; i < 6; i++) {
-    const { error } = await supabase.from("jobs").update(p).eq("id", jobId);
-    if (!error) return;
-
-    const col = pickMissingColumnName(error.message);
-    if (col && Object.prototype.hasOwnProperty.call(p, col)) {
-      // тухайн багана DB дээр байхгүй тул patch-ээс хасаад дахин оролдоно
-      delete p[col];
-      continue;
-    }
-    throw error;
+function safeExists(p) {
+  try {
+    return fs.existsSync(p);
+  } catch {
+    return false;
   }
 }
-
-async function updateStage(jobId, patch) {
-  const p = { ...(patch || {}) };
-  if (p.progress != null) p.progress = clampPct(p.progress);
-  if (p.split_progress != null) p.split_progress = clampPct(p.split_progress);
-  if (p.compress_progress != null)
-    p.compress_progress = clampPct(p.compress_progress);
-  await updateJobSafe(jobId, p);
+function safeUnlink(p) {
+  try {
+    if (safeExists(p)) fs.unlinkSync(p);
+  } catch {}
+}
+function safeStatSize(p) {
+  try {
+    if (!safeExists(p)) return null;
+    const st = fs.statSync(p);
+    if (!st || !Number.isFinite(st.size)) return null;
+    return st.size;
+  } catch {
+    return null;
+  }
+}
+function bytesToMb(n) {
+  return n / (1024 * 1024);
+}
+function mbToBytes(mb) {
+  return mb * 1024 * 1024;
+}
+function rand6() {
+  return crypto.randomBytes(3).toString("hex");
 }
 
-// ----------------------
-// R2 helpers
-// ----------------------
-async function streamToFile(readable, outPath) {
-  await fsp.mkdir(path.dirname(outPath), { recursive: true });
-  const w = fs.createWriteStream(outPath);
-  await new Promise((resolve, reject) => {
-    readable.pipe(w);
-    readable.on("error", reject);
+function streamToFile(stream, outPath) {
+  return new Promise((resolve, reject) => {
+    const w = fs.createWriteStream(outPath);
+    stream.pipe(w);
+    stream.on("error", reject);
     w.on("error", reject);
     w.on("finish", resolve);
   });
 }
 
-async function r2DownloadToFile(bucket, key, localPath) {
-  const res = await r2.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
-  if (!res?.Body) throw new Error(`R2 GetObject empty body: ${bucket}/${key}`);
-  await streamToFile(res.Body, localPath);
-}
+function runCmd(cmd, args, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let killed = false;
 
-async function r2UploadFile(
-  bucket,
-  key,
-  localPath,
-  contentType = "application/octet-stream"
-) {
-  const body = fs.createReadStream(localPath);
-  await r2.send(
-    new PutObjectCommand({
-      Bucket: bucket,
-      Key: key,
-      Body: body,
-      ContentType: contentType,
-    })
-  );
-}
+    const to = setTimeout(() => {
+      killed = true;
+      try {
+        p.kill("SIGKILL");
+      } catch {}
+    }, timeoutMs);
 
-async function r2Exists(bucket, key) {
-  try {
-    await r2.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
-    return true;
-  } catch {
-    return false;
-  }
-}
+    let out = "";
+    let err = "";
+    p.stdout.on("data", (d) => (out += d.toString()));
+    p.stderr.on("data", (d) => (err += d.toString()));
 
-async function r2DeleteMany(bucket, keys) {
-  const unique = [...new Set((keys || []).filter(Boolean))];
-  if (unique.length === 0) return;
-  await r2.send(
-    new DeleteObjectsCommand({
-      Bucket: bucket,
-      Delete: { Objects: unique.map((Key) => ({ Key })), Quiet: true },
-    })
-  );
-}
-
-// ----------------------
-// PDF helpers (split-only)
-// ----------------------
-async function getFileSizeBytes(p) {
-  const st = await fsp.stat(p);
-  return st.size;
-}
-
-async function getTotalPages(pdfPath) {
-  const { out } = await run(QPDF_EXE, ["--show-npages", pdfPath], {
-    timeoutMs: TIMEOUT_QPDF_MS,
-  });
-  const n = Number(String(out).trim());
-  return Number.isFinite(n) && n > 0 ? n : 0;
-}
-
-async function renamePartsToStandard(rawParts, partsDir) {
-  const meta = [];
-  const renamedPaths = [];
-
-  for (let i = 0; i < rawParts.length; i++) {
-    const idx = i + 1;
-    const stdName = `goodpdf-${String(idx).padStart(2, "0")}.pdf`;
-    const stdPath = path.join(partsDir, stdName);
-
-    try {
-      await fsp.unlink(stdPath);
-    } catch {}
-    await fsp.rename(rawParts[i], stdPath);
-
-    const bytes = await getFileSizeBytes(stdPath);
-    const sizeMb = bytesToMb1(bytes);
-
-    meta.push({ name: stdName, bytes, sizeMb });
-    renamedPaths.push(stdPath);
-  }
-
-  return { renamedPaths, meta };
-}
-
-async function splitPdfByMbTarget(inputPdf, splitMb, outDir, onProgress) {
-  if (!splitMb || splitMb <= 0) {
-    const out = path.join(outDir, "part_001.pdf");
-    await fsp.copyFile(inputPdf, out);
-    if (onProgress) await onProgress(100);
-    return [out];
-  }
-
-  const totalPages = await getTotalPages(inputPdf);
-  if (!totalPages) {
-    const out = path.join(outDir, "part_001.pdf");
-    await fsp.copyFile(inputPdf, out);
-    if (onProgress) await onProgress(100);
-    return [out];
-  }
-
-  const targetBytes = Math.max(
-    256 * 1024,
-    Math.floor(splitMb * 1024 * 1024 * 0.97)
-  );
-
-  const totalBytes = await getFileSizeBytes(inputPdf);
-  const bytesPerPage = Math.max(1024, Math.floor(totalBytes / totalPages));
-  let estPages = Math.max(1, Math.floor(targetBytes / bytesPerPage));
-  estPages = Math.min(estPages, totalPages);
-
-  async function makePart(start, end, partIndex) {
-    const name = `part_${String(partIndex).padStart(3, "0")}.pdf`;
-    const outPath = path.join(outDir, name);
-
-    await run(
-      QPDF_EXE,
-      [inputPdf, "--pages", ".", `${start}-${end}`, "--", outPath],
-      {
-        timeoutMs: TIMEOUT_QPDF_MS,
-      }
-    );
-
-    const sz = await getFileSizeBytes(outPath);
-    return { outPath, size: sz, endPage: end };
-  }
-
-  const parts = [];
-  let partIndex = 1;
-  let start = 1;
-
-  while (start <= totalPages) {
-    let end = Math.min(totalPages, start + estPages - 1);
-    let best = await makePart(start, end, partIndex);
-
-    if (best.size > targetBytes && end > start) {
-      let lo = start;
-      let hi = end;
-
-      while (lo < hi) {
-        const mid = Math.floor((lo + hi) / 2);
-        const trialEnd = Math.max(start, mid);
-        const trial = await makePart(start, trialEnd, partIndex);
-
-        if (trial.size > targetBytes && trialEnd > start) hi = trialEnd - 1;
-        else {
-          best = trial;
-          lo = trialEnd + 1;
-        }
-      }
-    } else {
-      while (end < totalPages) {
-        const trialEnd = Math.min(
-          totalPages,
-          end + Math.max(1, Math.floor(estPages / 3))
-        );
-        const trial = await makePart(start, trialEnd, partIndex);
-        if (trial.size <= targetBytes) {
-          end = trialEnd;
-          best = trial;
-        } else break;
-      }
-    }
-
-    parts.push(best.outPath);
-    partIndex++;
-    start = end + 1;
-
-    if (onProgress) {
-      const pct = clampPct((best.endPage / totalPages) * 100, 0);
-      await onProgress(Math.min(99, pct));
-    }
-  }
-
-  if (onProgress) await onProgress(100);
-  return parts;
-}
-
-async function zipOutputs(files, zipPath) {
-  await run(SEVEN_Z_EXE, ["a", "-tzip", zipPath, ...files], {
-    timeoutMs: TIMEOUT_7Z_MS,
+    p.on("close", (code) => {
+      clearTimeout(to);
+      if (killed)
+        return reject(new Error(`${cmd} timeout after ${timeoutMs}ms`));
+      if (code !== 0)
+        return reject(new Error(`${cmd} failed code=${code}\n${err || out}`));
+      resolve({ out, err });
+    });
   });
 }
 
 // ----------------------
-// Queue (DB) — select MINIMAL fields only
+// Supabase helpers
 // ----------------------
+async function updateJob(jobId, patch) {
+  const { error } = await supabase.from("jobs").update(patch).eq("id", jobId);
+  if (error) throw error;
+}
+
+/**
+ * Worker processes only QUEUED jobs (user pressed Start).
+ */
 async function fetchQueue(limit = 1) {
   const { data, error } = await supabase
     .from("jobs")
     .select(
-      "id,input_path,split_mb,status,created_at,file_name,file_size_bytes,claimed_by"
+      "id,input_path,split_mb,status,created_at,file_name,file_size_bytes,claimed_by,ttl_minutes"
     )
-    .in("status", ["QUEUED", "UPLOADED"])
+    .in("status", ["QUEUED"])
     .is("claimed_by", null)
-    .order("created_at", { ascending: false })
+    .order("created_at", { ascending: true })
     .limit(limit);
 
   if (error) throw error;
@@ -431,17 +196,18 @@ async function fetchQueue(limit = 1) {
 }
 
 async function claimJob(jobId) {
-  // claim-ийг хамгийн жижиг patch-аар хийе (schema зөрчил багасна)
   const patch = {
     status: "PROCESSING",
     stage: "QUEUE",
     progress: 1,
+    split_progress: 0,
     claimed_by: WORKER_ID,
     claimed_at: nowIso(),
     error_text: null,
+    error_code: null,
+    updated_at: nowIso(),
   };
 
-  // зөвхөн QUEUED дээр claim хийж lock үүсгэнэ
   const { data, error } = await supabase
     .from("jobs")
     .update(patch)
@@ -455,69 +221,355 @@ async function claimJob(jobId) {
 }
 
 // ----------------------
-// Cleanup — schema байхгүй багана байвал автоматаар алгасна
-// ----------------------
-let CLEANUP_DISABLED = false;
-
-async function cleanupExpiredJobs(limit = 25) {
-  if (CLEANUP_DISABLED) return 0;
-  const now = nowIso();
-
-  // expires_at / cleaned_at / output_zip_path байхгүй байж болно → алдахад cleanup-г унтраана
-  const { data: jobs, error } = await supabase
-    .from("jobs")
-    .select("id,input_path,output_zip_path,expires_at,status,cleaned_at")
-    .is("cleaned_at", null)
-    .not("expires_at", "is", null)
-    .lt("expires_at", now)
-    .eq("status", "DONE")
-    .order("expires_at", { ascending: true })
-    .limit(limit);
-
-  if (error) {
-    console.warn("[cleanup] disabled:", error.message);
-    CLEANUP_DISABLED = true;
-    return 0;
-  }
-
-  if (!jobs || jobs.length === 0) return 0;
-
-  for (const j of jobs) {
-    try {
-      const inputKey = j.input_path || null;
-      const outKey = j.output_zip_path || null;
-
-      if (inputKey) await r2DeleteMany(R2_BUCKET_IN, [inputKey]);
-      if (outKey) await r2DeleteMany(R2_BUCKET_OUT, [outKey]);
-
-      await updateJobSafe(j.id, {
-        status: "CLEANED",
-        stage: "CLEANUP",
-        cleaned_at: nowIso(),
-        input_path: null,
-        output_zip_path: null,
-      });
-
-      console.log(`[cleanup] cleaned job=${j.id}`);
-    } catch (e) {
-      console.error("[cleanup] failed job=", j?.id, e?.message || e);
-    }
-  }
-
-  return jobs.length;
-}
-
-// ----------------------
-// Job processing (R2 in/out) — SPLIT ONLY
+// R2 helpers
 // ----------------------
 function normalizeInputKey(job) {
-  // canonical: {jobId}/input.pdf
+  if (job.input_path) return String(job.input_path).replace(/^\/+/, "");
   return `${job.id}/input.pdf`.replace(/^\/+/, "");
 }
 function outputZipKeyFor(job) {
   return `${job.id}/goodpdf.zip`;
 }
 
+async function downloadFromR2(key, outPath) {
+  const res = await r2.send(
+    new GetObjectCommand({ Bucket: R2_BUCKET_IN, Key: key })
+  );
+  if (!res?.Body) throw new Error("R2 GetObject missing Body");
+  await streamToFile(res.Body, outPath);
+}
+
+async function uploadToR2(key, filePath, contentType) {
+  const body = fs.createReadStream(filePath);
+  await r2.send(
+    new PutObjectCommand({
+      Bucket: R2_BUCKET_OUT,
+      Key: key,
+      Body: body,
+      ContentType: contentType,
+    })
+  );
+}
+
+// ----------------------
+// Cleanup (delete_at + output_zip_path)
+// ----------------------
+async function cleanupExpiredOutputs() {
+  if (!DO_CLEANUP) return 0;
+
+  const { data, error } = await supabase
+    .from("jobs")
+    .select("id,output_zip_path,zip_path,delete_at,cleaned_at,status")
+    .is("cleaned_at", null)
+    .not("delete_at", "is", null)
+    .lt("delete_at", nowIso())
+    .limit(50);
+
+  if (error) throw error;
+
+  const rows = data || [];
+  let cleaned = 0;
+
+  for (const r of rows) {
+    const key =
+      (r.output_zip_path && String(r.output_zip_path)) ||
+      (r.zip_path && String(r.zip_path)) ||
+      null;
+
+    if (key) {
+      try {
+        await r2.send(
+          new DeleteObjectCommand({ Bucket: R2_BUCKET_OUT, Key: key })
+        );
+      } catch {
+        // best effort
+      }
+    }
+
+    try {
+      await supabase
+        .from("jobs")
+        .update({
+          status: "CLEANED",
+          stage: "CLEANUP",
+          cleaned_at: nowIso(),
+          updated_at: nowIso(),
+        })
+        .eq("id", r.id);
+      cleaned++;
+    } catch {
+      // best effort
+    }
+  }
+
+  return cleaned;
+}
+
+// ----------------------
+// SPLIT: Adaptive range packing (never-crash)
+// ----------------------
+async function splitPdfGreedy({ inPdf, partsDir, limitMb }) {
+  const limitBytes = mbToBytes(limitMb);
+
+  const { out: npagesOut } = await runCmd(
+    "qpdf",
+    ["--show-npages", inPdf],
+    TIMEOUT_QPDF_MS
+  );
+  const totalPages = Number(String(npagesOut).trim());
+  if (!Number.isFinite(totalPages) || totalPages <= 0) {
+    throw new Error("Could not read page count");
+  }
+
+  function partTmpName(partNo) {
+    return path.join(
+      partsDir,
+      `.__part_${String(partNo).padStart(3, "0")}_${rand6()}.pdf`
+    );
+  }
+  function candTmpName(startPage, endPage) {
+    return path.join(
+      partsDir,
+      `.__cand_${startPage}_${endPage}_${rand6()}.pdf`
+    );
+  }
+
+  async function tryBuildRange(startPage, endPage, outPath) {
+    try {
+      await runCmd(
+        "qpdf",
+        ["--empty", "--pages", inPdf, `${startPage}-${endPage}`, "--", outPath],
+        TIMEOUT_QPDF_MS
+      );
+    } catch {
+      return null;
+    }
+    return safeStatSize(outPath);
+  }
+
+  const tempParts = []; // {tmpPath, bytes, startPage, endPage}
+  let start = 1;
+  let partNo = 1;
+  let prevSpan = 12;
+
+  while (start <= totalPages) {
+    // build single page (must be monotonic baseline)
+    const oneTmp = partTmpName(partNo);
+    let oneBytes = await tryBuildRange(start, start, oneTmp);
+
+    // hard fail: even single page cannot be built after retry
+    if (oneBytes == null) {
+      safeUnlink(oneTmp);
+      const oneTmp2 = partTmpName(partNo);
+      oneBytes = await tryBuildRange(start, start, oneTmp2);
+      if (oneBytes == null) {
+        safeUnlink(oneTmp2);
+        throw Object.assign(new Error("QPDF_RANGE_BUILD_FAILED"), {
+          code: "QPDF_RANGE_BUILD_FAILED",
+          startPage: start,
+          endPage: start,
+        });
+      }
+      tempParts.push({
+        tmpPath: oneTmp2,
+        bytes: oneBytes,
+        startPage: start,
+        endPage: start,
+      });
+      partNo++;
+      start++;
+      prevSpan = 1;
+      continue;
+    }
+
+    // single page exceeds target => still output it (page-aligned rule)
+    if (oneBytes > limitBytes) {
+      tempParts.push({
+        tmpPath: oneTmp,
+        bytes: oneBytes,
+        startPage: start,
+        endPage: start,
+      });
+      partNo++;
+      start++;
+      prevSpan = 1;
+      continue;
+    }
+
+    // exponential expand
+    let goodEnd = start;
+    let goodBytes = oneBytes;
+
+    let step = Math.max(1, prevSpan);
+    let probeEnd = Math.min(totalPages, start + step - 1);
+    let foundTooBig = false;
+
+    while (true) {
+      const cand = candTmpName(start, probeEnd);
+      const candBytes = await tryBuildRange(start, probeEnd, cand);
+
+      if (candBytes != null && candBytes <= limitBytes) {
+        goodEnd = probeEnd;
+        goodBytes = candBytes;
+        safeUnlink(cand);
+
+        if (probeEnd >= totalPages) break;
+        step *= 2;
+        probeEnd = Math.min(totalPages, goodEnd + step);
+        continue;
+      }
+
+      safeUnlink(cand);
+      foundTooBig = true;
+      break;
+    }
+
+    if (goodEnd === start) {
+      // keep single page
+      tempParts.push({
+        tmpPath: oneTmp,
+        bytes: oneBytes,
+        startPage: start,
+        endPage: start,
+      });
+      partNo++;
+      start++;
+      prevSpan = 1;
+      continue;
+    }
+
+    // we extended; remove single tmp
+    safeUnlink(oneTmp);
+
+    // binary refine if we hit tooBig
+    if (foundTooBig) {
+      const tooBigEnd = probeEnd;
+      if (tooBigEnd > goodEnd + 1) {
+        let lo = goodEnd + 1;
+        let hi = tooBigEnd - 1;
+        while (lo <= hi) {
+          const mid = Math.floor((lo + hi) / 2);
+          const cand = candTmpName(start, mid);
+          const candBytes = await tryBuildRange(start, mid, cand);
+
+          if (candBytes != null && candBytes <= limitBytes) {
+            goodEnd = mid;
+            goodBytes = candBytes;
+            safeUnlink(cand);
+            lo = mid + 1;
+          } else {
+            safeUnlink(cand);
+            hi = mid - 1;
+          }
+        }
+      }
+    }
+
+    // build final [start..goodEnd] with backoff safety
+    let finalStart = start;
+    let finalEnd = goodEnd;
+    let finalTmp = partTmpName(partNo);
+    let finalBytes = await tryBuildRange(finalStart, finalEnd, finalTmp);
+
+    // backoff if build failed or oversize
+    let guard = 0;
+    while (
+      (finalBytes == null || finalBytes > limitBytes) &&
+      finalEnd > finalStart
+    ) {
+      safeUnlink(finalTmp);
+      finalEnd--;
+      finalTmp = partTmpName(partNo);
+      finalBytes = await tryBuildRange(finalStart, finalEnd, finalTmp);
+      guard++;
+      if (guard > 200) break;
+    }
+
+    if (finalBytes == null) {
+      safeUnlink(finalTmp);
+      throw Object.assign(new Error("QPDF_FINAL_BUILD_FAILED"), {
+        code: "QPDF_FINAL_BUILD_FAILED",
+        startPage: finalStart,
+        endPage: finalEnd,
+      });
+    }
+
+    // last resort: if still oversize (should be rare), fallback to single page
+    if (finalBytes > limitBytes && finalEnd > finalStart) {
+      safeUnlink(finalTmp);
+      finalEnd = finalStart;
+      finalTmp = partTmpName(partNo);
+      const b = await tryBuildRange(finalStart, finalEnd, finalTmp);
+      if (b == null) {
+        safeUnlink(finalTmp);
+        throw Object.assign(new Error("QPDF_SINGLE_REBUILD_FAILED"), {
+          code: "QPDF_SINGLE_REBUILD_FAILED",
+          startPage: finalStart,
+          endPage: finalEnd,
+        });
+      }
+      finalBytes = b;
+    }
+
+    tempParts.push({
+      tmpPath: finalTmp,
+      bytes: finalBytes,
+      startPage: finalStart,
+      endPage: finalEnd,
+    });
+
+    prevSpan = Math.max(1, finalEnd - finalStart + 1);
+    partNo++;
+    start = finalEnd + 1;
+  }
+
+  // rename to canonical goodPDF-<TOTAL>(<i>).pdf
+  const totalParts = tempParts.length;
+  const partFiles = [];
+  const partMeta = [];
+
+  for (let idx = 0; idx < tempParts.length; idx++) {
+    const p = tempParts[idx];
+    const outName = `goodPDF-${totalParts}(${idx + 1}).pdf`;
+    const outPath = path.join(partsDir, outName);
+
+    try {
+      fs.renameSync(p.tmpPath, outPath);
+    } catch {
+      fs.copyFileSync(p.tmpPath, outPath);
+      safeUnlink(p.tmpPath);
+    }
+
+    partFiles.push(outPath);
+    partMeta.push({
+      name: path.basename(outPath),
+      bytes: p.bytes,
+      sizeMb: Math.round(bytesToMb(p.bytes) * 10) / 10,
+      startPageIndex: p.startPage,
+      endPageIndex: p.endPage,
+    });
+  }
+
+  // cleanup leftovers
+  try {
+    for (const f of fs.readdirSync(partsDir)) {
+      if (f.startsWith(".__cand_") || f.startsWith(".__part_")) {
+        safeUnlink(path.join(partsDir, f));
+      }
+    }
+  } catch {}
+
+  return { partFiles, partMeta };
+}
+
+async function zipParts(partsDir, outZipPath) {
+  // 7z a -tzip out.zip *.pdf
+  await runCmd("7z", ["a", "-tzip", outZipPath, "*.pdf"], TIMEOUT_7Z_MS);
+}
+
+// ----------------------
+// Process one job
+// ----------------------
 async function processOneJob(job) {
   const jobId = job.id;
 
@@ -533,109 +585,113 @@ async function processOneJob(job) {
   const outZipKey = outputZipKeyFor(job);
 
   try {
-    await updateStage(jobId, { stage: "DOWNLOAD", progress: 5 });
-
-    const exists = await r2Exists(R2_BUCKET_IN, inputKey);
-    if (!exists)
-      throw new Error(`Input not found in R2: ${R2_BUCKET_IN}/${inputKey}`);
-
-    await r2DownloadToFile(R2_BUCKET_IN, inputKey, inPdf);
-
-    const originalBytes = await getFileSizeBytes(inPdf);
-    await updateJobSafe(jobId, {
-      file_size_bytes: originalBytes,
-      input_path: inputKey,
+    await updateJob(jobId, {
+      stage: "DOWNLOAD",
+      progress: 5,
+      split_progress: 0,
+      updated_at: nowIso(),
     });
+    await downloadFromR2(inputKey, inPdf);
 
-    await updateStage(jobId, { progress: 15 });
-
-    // ---- SPLIT ----
     const splitMb = Number(job.split_mb || 0);
-    await updateStage(jobId, {
+    if (!Number.isFinite(splitMb) || splitMb <= 0) {
+      throw Object.assign(new Error("split_mb missing/invalid"), {
+        code: "SPLIT_MB_INVALID",
+      });
+    }
+
+    await updateJob(jobId, {
       stage: "SPLIT",
       progress: 20,
-      split_progress: 0,
+      split_progress: 10,
+      updated_at: nowIso(),
     });
 
-    const rawParts = await splitPdfByMbTarget(
+    const { partFiles, partMeta } = await splitPdfGreedy({
       inPdf,
-      splitMb,
       partsDir,
-      async (pct) => {
-        const overall = 20 + clampPct(pct, 0) * 0.65; // 20..85
-        await updateStage(jobId, { split_progress: pct, progress: overall });
-      }
-    );
-
-    const { renamedPaths: parts, meta: partsMeta } =
-      await renamePartsToStandard(rawParts, partsDir);
-
-    const partsCount = partsMeta.length;
-    const totalPartsBytes = partsMeta.reduce(
-      (s, x) => s + Number(x.bytes || 0),
-      0
-    );
-    const maxPartMb =
-      partsMeta.length > 0
-        ? Math.max(...partsMeta.map((x) => Number(x.sizeMb || 0)))
-        : null;
-
-    // optional metadata — байхгүй багана бол автоматаар хасагдана
-    await updateJobSafe(jobId, {
-      parts_count: partsCount,
-      parts_json: partsMeta,
-      total_parts_bytes: totalPartsBytes,
-      max_part_mb: maxPartMb,
+      limitMb: splitMb,
     });
 
-    await updateStage(jobId, { progress: 85, split_progress: 100 });
+    await updateJob(jobId, {
+      stage: "ZIP",
+      progress: 70,
+      split_progress: 90,
+      updated_at: nowIso(),
+    });
 
-    // ---- ZIP ----
-    await updateStage(jobId, { stage: "ZIP", progress: 88 });
+    const outZip = path.join(wd, "goodpdf.zip");
+    await zipParts(partsDir, outZip);
 
-    const baseName = sanitizeBaseName(job.file_name || "file");
-    const zipLocal = path.join(wd, `goodPDF - ${baseName}.zip`);
+    await updateJob(jobId, {
+      stage: "UPLOAD_OUT",
+      progress: 85,
+      split_progress: 95,
+      updated_at: nowIso(),
+    });
 
-    await zipOutputs(parts, zipLocal);
+    await uploadToR2(outZipKey, outZip, "application/zip");
 
-    const zipBytes = await getFileSizeBytes(zipLocal);
-    await updateJobSafe(jobId, { output_zip_bytes: zipBytes });
+    // compute stats
+    const outZipBytes = safeStatSize(outZip) ?? null;
+    const partBytes = partMeta
+      .map((p) => p.bytes)
+      .filter((x) => typeof x === "number" && Number.isFinite(x));
+    const totalPartsBytes = partBytes.length
+      ? partBytes.reduce((a, b) => a + b, 0)
+      : null;
+    const maxPartBytes = partBytes.length ? Math.max(...partBytes) : null;
 
-    await updateStage(jobId, { stage: "UPLOAD_OUT", progress: 94 });
+    const ttl = Number(job.ttl_minutes || 0);
+    const ttlMinutes =
+      Number.isFinite(ttl) && ttl > 0 ? ttl : DEFAULT_TTL_MINUTES;
+    const deleteAtIso = new Date(
+      Date.now() + ttlMinutes * 60_000
+    ).toISOString();
 
-    await r2UploadFile(R2_BUCKET_OUT, outZipKey, zipLocal, "application/zip");
-
-    // ---- DONE ----
-    await updateJobSafe(jobId, {
+    // ✅ THIS is the key fix for "Ready but not downloading":
+    // output_zip_path (and zip_path for compatibility) must be filled.
+    const donePatch = {
       status: "DONE",
       stage: "DONE",
       progress: 100,
-      output_zip_path: outZipKey,
-      done_at: nowIso(),
-      expires_at: addMinutesIso(OUTPUT_TTL_MINUTES),
-      error_text: null,
       split_progress: 100,
-    });
 
-    console.log("[DONE]", jobId, {
-      input: `${R2_BUCKET_IN}/${inputKey}`,
-      out: `${R2_BUCKET_OUT}/${outZipKey}`,
-      splitMb,
-      parts: partsCount,
-      maxPartMb,
-      zipBytes,
-      ttlMin: OUTPUT_TTL_MINUTES,
-    });
+      output_zip_path: outZipKey,
+      zip_path: outZipKey, // legacy compatibility
+
+      ttl_minutes: ttlMinutes,
+      delete_at: deleteAtIso,
+
+      parts_count: partFiles.length,
+      parts_json: partMeta,
+      total_parts_bytes: totalPartsBytes,
+      output_zip_bytes: outZipBytes,
+
+      target_mb: splitMb,
+      max_part_mb:
+        typeof maxPartBytes === "number"
+          ? Math.round(bytesToMb(maxPartBytes) * 100) / 100
+          : null,
+
+      error_text: null,
+      error_code: null,
+      updated_at: nowIso(),
+    };
+
+    await updateJob(jobId, donePatch);
   } catch (e) {
-    const msg = e?.stack || e?.message || String(e);
-    console.error("FAILED job", jobId, msg);
+    const msg = String(e?.message || e);
+    const stack = e?.stack ? String(e.stack) : msg;
 
-    await updateJobSafe(jobId, {
+    await updateJob(jobId, {
       status: "FAILED",
       stage: "FAILED",
-      progress: 0,
-      error_text: String(msg).slice(0, 1800),
-      done_at: nowIso(),
+      progress: 100,
+      split_progress: 100,
+      error_code: e?.code ? String(e.code) : "WORKER_ERROR",
+      error_text: stack.slice(0, 1800),
+      updated_at: nowIso(),
     });
   } finally {
     try {
@@ -648,52 +704,44 @@ async function processOneJob(job) {
 // Main loop
 // ----------------------
 async function main() {
-  console.log("goodpdf local worker started (SPLIT ONLY)", {
+  console.log("goodpdf worker started", {
     WORKER_ID,
     POLL_MS,
     CONCURRENCY,
     R2_BUCKET_IN,
     R2_BUCKET_OUT,
-    OUTPUT_TTL_MINUTES,
+    DEFAULT_TTL_MINUTES,
     DO_CLEANUP,
     CLEANUP_EVERY_MS,
-    TIMEOUT_QPDF_MS,
-    TIMEOUT_7Z_MS,
   });
 
   let lastCleanupAt = 0;
 
   while (true) {
     try {
-      const nowMs = Date.now();
-      if (DO_CLEANUP && nowMs - lastCleanupAt > CLEANUP_EVERY_MS) {
-        lastCleanupAt = nowMs;
-        await cleanupExpiredJobs(25);
+      const now = Date.now();
+      if (DO_CLEANUP && now - lastCleanupAt >= CLEANUP_EVERY_MS) {
+        lastCleanupAt = now;
+        try {
+          const cleaned = await cleanupExpiredOutputs();
+          if (cleaned > 0)
+            console.log("Cleanup removed", cleaned, "expired outputs");
+        } catch (e) {
+          console.log("Cleanup error (ignored):", e?.message || e);
+        }
       }
 
       const jobs = await fetchQueue(CONCURRENCY);
 
-      if (jobs.length === 0) {
-        await new Promise((r) => setTimeout(r, POLL_MS));
+      if (!jobs.length) {
+        await sleep(POLL_MS);
         continue;
       }
 
-      await Promise.all(
-        jobs.map(async (j) => {
-          console.log(
-            "Picked job",
-            j.id,
-            "status=",
-            j.status,
-            "splitMb=",
-            j.split_mb
-          );
-          await processOneJob(j);
-        })
-      );
+      await Promise.all(jobs.map(processOneJob));
     } catch (e) {
       console.error("Loop error:", e?.message || e);
-      await new Promise((r) => setTimeout(r, POLL_MS));
+      await sleep(POLL_MS);
     }
   }
 }

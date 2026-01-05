@@ -3,49 +3,58 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ScreenShell } from "@/components/screens/_ScreenShell";
 import { FileDropzone } from "@/components/blocks/FileDropzone";
-import { SplitSizeInput } from "@/components/blocks/SplitSizeInput";
 import { Button } from "@/components/ui/Button";
 import { Progress } from "@/components/ui/Progress";
-import { DEFAULT_SPLIT_MB } from "@/config/constants";
 import { useUploadFlow } from "@/services/hooks/useUploadFlow";
 import { Card } from "@/components/blocks/Card";
 
 type DownloadUX = "IDLE" | "PREPARE" | "CONFIRM" | "SUCCESS";
 type Step = "PICK" | "SETTINGS" | "RUN";
 
+function parseMbInt(s: string) {
+  const t = String(s || "").trim();
+  if (!t) return null;
+  const n = Number(t);
+  if (!Number.isFinite(n)) return null;
+  // require whole number MB
+  if (!Number.isInteger(n)) return null;
+  return n;
+}
+
+function validateMb(mb: number | null) {
+  if (mb == null) return { ok: false, msg: "Enter a number (MB)" };
+  if (mb <= 0) return { ok: false, msg: "Must be greater than 0" };
+  if (mb > 500) return { ok: false, msg: "Max is 500MB" };
+  return { ok: true, msg: "" };
+}
+
 export function UploadScreen() {
   const [step, setStep] = useState<Step>("PICK");
   const [file, setFile] = useState<File | null>(null);
 
-  // ✅ Default-ууд (Split-only)
-  const [splitMb, setSplitMb] = useState<number>(DEFAULT_SPLIT_MB);
+  // ✅ Size input is ONLY for Start tab
+  const [splitMbText, setSplitMbText] = useState<string>("");
 
-  // ✅ Download UX (no popups)
+  // ✅ Download UX
   const [dlUx, setDlUx] = useState<DownloadUX>("IDLE");
   const [fakePct, setFakePct] = useState(0);
   const fakeTimerRef = useRef<number | null>(null);
-  const iframeRef = useRef<HTMLIFrameElement | null>(null);
 
   const flow = useUploadFlow();
 
-  // ✅ Phase-оос хамаараад UI step автоматаар зөв болох
+  const splitMb = useMemo(() => parseMbInt(splitMbText), [splitMbText]);
+  const splitValid = useMemo(() => validateMb(splitMb), [splitMb]);
+
+  // ✅ Step auto-sync from backend phase
   useEffect(() => {
-    if (flow.phase === "IDLE") {
+    if (flow.phase === "IDLE" || flow.phase === "UPLOADING") {
       if (step !== "PICK") setStep("PICK");
       return;
     }
-
-    if (flow.phase === "UPLOADING") {
-      if (step !== "PICK") setStep("PICK");
-      return;
-    }
-
     if (flow.phase === "UPLOADED") {
       if (step !== "SETTINGS") setStep("SETTINGS");
       return;
     }
-
-    // PROCESSING / READY / ERROR -> RUN дээр харуулах
     if (flow.phase === "PROCESSING" || flow.phase === "READY" || flow.phase === "ERROR") {
       if (step !== "RUN") setStep("RUN");
       return;
@@ -58,13 +67,17 @@ export function UploadScreen() {
     return { name: file.name, mb: Math.round(mb * 100) / 100 };
   }, [file]);
 
+  // ✅ Upload tab: only depends on file + not busy
   const canUpload = !!file && !flow.busy && (flow.phase === "IDLE" || flow.phase === "ERROR");
-  const canStart = !!file && !flow.busy && flow.phase === "UPLOADED";
+
+  // ✅ Start tab: needs valid splitMb
+  const canStart = !!file && !flow.busy && flow.phase === "UPLOADED" && splitValid.ok;
+
   const canDownload = !flow.busy && flow.phase === "READY";
 
-  const resetToPick = () => {
+  const hardReset = () => {
     setFile(null);
-    setSplitMb(DEFAULT_SPLIT_MB);
+    setSplitMbText("");
     setStep("PICK");
 
     // reset download UX
@@ -74,57 +87,58 @@ export function UploadScreen() {
       window.clearInterval(fakeTimerRef.current);
       fakeTimerRef.current = null;
     }
-    if (iframeRef.current) {
-      iframeRef.current.remove();
-      iframeRef.current = null;
-    }
 
     flow.resetAll();
   };
 
-  // ✅ Fake progress cleanup on unmount
+  // cleanup on unmount
   useEffect(() => {
     return () => {
       if (fakeTimerRef.current) {
         window.clearInterval(fakeTimerRef.current);
         fakeTimerRef.current = null;
       }
-      if (iframeRef.current) {
-        iframeRef.current.remove();
-        iframeRef.current = null;
-      }
     };
   }, []);
 
+  const doUpload = async () => {
+    if (!file) return;
+    try {
+      // ✅ Upload stage does NOT include splitMb anymore
+      await flow.uploadOnly(file);
+      setStep("SETTINGS");
+    } catch {
+      // flow.error handles
+    }
+  };
+
+  const doStart = async () => {
+    if (!file) return;
+    if (!splitValid.ok || splitMb == null) return;
+
+    setStep("RUN");
+    try {
+      // ✅ Start stage MUST include splitMb
+      await flow.startProcessing(splitMb);
+    } catch {
+      // flow.error handles
+    }
+  };
+
+  /**
+   * ✅ The ONLY reliable way across all devices (mobile + desktop):
+   * user click → browser navigation (NO iframe, NO popup, NO background fetch)
+   */
   const startDownloadAndPrepare = () => {
     if (!flow.downloadUrl) return;
 
-    // 1) Trigger browser download WITHOUT navigation or popups
-    // Hidden iframe follows redirects and initiates download while staying on the page.
-    try {
-      if (iframeRef.current) {
-        iframeRef.current.remove();
-        iframeRef.current = null;
-      }
-      const ifr = document.createElement("iframe");
-      ifr.style.display = "none";
-      ifr.src = flow.downloadUrl;
-      document.body.appendChild(ifr);
-      iframeRef.current = ifr;
+    // ✅ cache-buster to avoid stale/cached responses
+    const url = `${flow.downloadUrl}${flow.downloadUrl.includes("?") ? "&" : "?"}cb=${Date.now()}`;
 
-      // Remove iframe later (avoid DOM leak)
-      window.setTimeout(() => {
-        try {
-          ifr.remove();
-        } catch {}
-        if (iframeRef.current === ifr) iframeRef.current = null;
-      }, 30000);
-    } catch {
-      // Fallback: same-tab navigation (last resort)
-      window.location.href = flow.downloadUrl;
-    }
+    // ✅ This is the download trigger (works on iOS/Android/desktop)
+    window.location.assign(url);
 
-    // 2) 5s fake progress 0→100
+    // 2) 5s fake progress (UI only)
     setDlUx("PREPARE");
     setFakePct(0);
 
@@ -151,41 +165,17 @@ export function UploadScreen() {
   const confirmCleanupAndReset = async () => {
     setDlUx("SUCCESS");
     try {
-      await flow.confirmDone(); // best effort (server confirm)
-    } catch {
-      // best effort
-    }
-    window.setTimeout(() => {
-      resetToPick();
-    }, 1000);
-  };
-
-  const doUpload = async () => {
-    if (!file) return;
-    try {
-      await flow.uploadOnly(file, splitMb);
-      setStep("SETTINGS");
-    } catch {
-      // error нь flow.error дээр
-    }
-  };
-
-  const doStart = async () => {
-    if (!file) return;
-    setStep("RUN");
-    try {
-      await flow.startProcessing();
-    } catch {
-      // error нь flow.error дээр
-    }
+      await flow.confirmDone();
+    } catch {}
+    window.setTimeout(() => hardReset(), 1000);
   };
 
   return (
-    <ScreenShell title="Split PDF" subtitle="Upload → Size → Start → Download ZIP">
+    <ScreenShell title="Split PDF" subtitle="Upload → Start → Download ZIP">
       <div style={{ display: "grid", gap: 12, maxWidth: 760 }}>
         <StepHeader step={step} />
 
-        {/* STEP 1: PICK */}
+        {/* STEP 1: UPLOAD (PICK) — only dropzone + Upload/Clear */}
         {step === "PICK" && (
           <>
             <FileDropzone
@@ -212,7 +202,6 @@ export function UploadScreen() {
               </Card>
             ) : null}
 
-            {/* Upload progress card */}
             {flow.phase === "UPLOADING" ? (
               <Card>
                 <div style={{ display: "grid", gap: 10 }}>
@@ -227,7 +216,7 @@ export function UploadScreen() {
               <Card>
                 <div style={{ display: "grid", gap: 8 }}>
                   <div style={{ fontWeight: 900 }}>Error</div>
-                  <div style={{ fontSize: 12, color: "var(--muted)" }}>{flow.error}</div>
+                  <div style={{ fontSize: 12, color: "var(--muted)", whiteSpace: "pre-wrap" }}>{flow.error}</div>
                 </div>
               </Card>
             ) : null}
@@ -236,14 +225,14 @@ export function UploadScreen() {
               <Button disabled={!canUpload} onClick={doUpload}>
                 Upload
               </Button>
-              <Button variant="secondary" disabled={!file || flow.busy} onClick={() => setStep("SETTINGS")}>
-                Next
+              <Button variant="secondary" disabled={!file || flow.busy} onClick={hardReset}>
+                Clear
               </Button>
             </div>
           </>
         )}
 
-        {/* STEP 2: SETTINGS */}
+        {/* STEP 2: START (SETTINGS) — file card + Max size + Start/Clear */}
         {step === "SETTINGS" && (
           <>
             {fileMeta ? (
@@ -268,33 +257,90 @@ export function UploadScreen() {
               </Card>
             )}
 
-            <SplitSizeInput valueMb={splitMb} onChangeMb={setSplitMb} />
+            {/* ✅ Max size per file is HERE (Start tab) */}
+            <Card>
+              <div style={{ display: "grid", gap: 8 }}>
+                <div style={{ fontWeight: 900 }}>Max size per file</div>
+
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    border: "1px solid var(--border)",
+                    borderRadius: 14,
+                    padding: "10px 12px",
+                    background: "rgba(255,255,255,.75)",
+                  }}
+                >
+                  <input
+                    type="number"
+                    inputMode="numeric"
+                    min={1}
+                    max={500}
+                    step={1}
+                    value={splitMbText}
+                    onChange={(e) => setSplitMbText(e.target.value)}
+                    placeholder="e.g. 9"
+                    style={{
+                      flex: 1,
+                      border: "none",
+                      outline: "none",
+                      fontSize: 16,
+                      fontWeight: 800,
+                      background: "transparent",
+                    }}
+                  />
+
+                  <span
+                    style={{
+                      fontSize: 12,
+                      fontWeight: 900,
+                      padding: "6px 10px",
+                      borderRadius: 999,
+                      border: "1px solid var(--border)",
+                      background: "rgba(15,23,42,.06)",
+                    }}
+                  >
+                    MB
+                  </span>
+                </div>
+
+                <div style={{ fontSize: 12, color: "var(--muted)" }}>Enter a number (MB)</div>
+
+                {splitMbText.trim().length === 0 ? (
+                  <div style={{ fontSize: 12, color: "var(--muted)" }}>
+                    <i>e.g. 9</i>
+                  </div>
+                ) : null}
+
+                {!splitValid.ok && splitMbText.trim().length > 0 ? (
+                  <div style={{ fontSize: 12, color: "crimson", fontWeight: 800 }}>{splitValid.msg}</div>
+                ) : null}
+
+                {splitValid.ok ? (
+                  <div style={{ fontSize: 12, color: "var(--muted)" }}>
+                    Each part will be up to <b>{splitMb}</b>MB.
+                  </div>
+                ) : null}
+              </div>
+            </Card>
 
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-              <Button variant="secondary" disabled={flow.busy} onClick={() => setStep("PICK")}>
-                Back
-              </Button>
-
-              {/* ✅ Upload хийгдээгүй бол Start идэвхгүй */}
               <Button disabled={!canStart} onClick={doStart}>
                 Start
               </Button>
 
-              <Button variant="ghost" disabled={flow.busy} onClick={resetToPick}>
-                New file
+              <Button variant="secondary" disabled={flow.busy} onClick={hardReset}>
+                Clear
               </Button>
             </div>
-
-            {flow.phase !== "UPLOADED" ? (
-              <div style={{ fontSize: 12, color: "var(--muted)" }}>Upload хийсний дараа Start идэвхжинэ.</div>
-            ) : null}
           </>
         )}
 
         {/* STEP 3: RUN + READY */}
         {step === "RUN" && (
           <>
-            {/* Processing progress card */}
             {flow.phase === "PROCESSING" ? (
               <Card>
                 <div style={{ display: "grid", gap: 10 }}>
@@ -313,20 +359,20 @@ export function UploadScreen() {
               <Card>
                 <div style={{ display: "grid", gap: 8 }}>
                   <div style={{ fontWeight: 900 }}>Error</div>
-                  <div style={{ fontSize: 12, color: "var(--muted)" }}>{flow.error}</div>
+                  <div style={{ fontSize: 12, color: "var(--muted)", whiteSpace: "pre-wrap" }}>{flow.error}</div>
+
                   <div style={{ display: "flex", gap: 10 }}>
-                    <Button variant="secondary" onClick={() => setStep("SETTINGS")}>
-                      Back to settings
+                    <Button variant="secondary" onClick={() => setStep("PICK")}>
+                      Back
                     </Button>
-                    <Button variant="ghost" onClick={resetToPick}>
-                      New file
+                    <Button variant="ghost" onClick={hardReset}>
+                      Clear
                     </Button>
                   </div>
                 </div>
               </Card>
             ) : null}
 
-            {/* ✅ READY summary + Download (no popups) */}
             {flow.phase === "READY" ? (
               <Card>
                 <div style={{ display: "grid", gap: 10 }}>
@@ -343,11 +389,12 @@ export function UploadScreen() {
                       {flow.result?.maxPartMb != null ? `${flow.result.maxPartMb}MB` : "—"}
                     </div>
 
-                    <div style={{ fontSize: 12, color: "var(--muted)" }}>Each part will be up to {splitMb}MB.</div>
+                    <div style={{ fontSize: 12, color: "var(--muted)" }}>
+                      Target size: <b>{splitMbText || "—"}MB</b>
+                    </div>
                   </div>
 
                   <div style={{ display: "grid", gap: 10 }}>
-                    {/* 1 button at a time: Download -> Confirm */}
                     {dlUx === "IDLE" ? (
                       <Button disabled={!canDownload || !flow.downloadUrl} onClick={startDownloadAndPrepare}>
                         Download
@@ -425,7 +472,7 @@ function StepHeader({ step }: { step: "PICK" | "SETTINGS" | "RUN" }) {
   return (
     <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
       {item(1, "Upload", step === "PICK")}
-      {item(2, "Size", step === "SETTINGS")}
+      {item(2, "Start", step === "SETTINGS")}
       {item(3, "Download", step === "RUN")}
     </div>
   );
