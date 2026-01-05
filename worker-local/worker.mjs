@@ -141,9 +141,13 @@ function streamToFile(stream, outPath) {
   });
 }
 
-function runCmd(cmd, args, timeoutMs) {
+function runCmd(cmd, args, timeoutMs, spawnOpts = {}) {
   return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const p = spawn(cmd, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      ...spawnOpts,
+    });
+
     let killed = false;
 
     const to = setTimeout(() => {
@@ -168,6 +172,7 @@ function runCmd(cmd, args, timeoutMs) {
     });
   });
 }
+
 
 // ----------------------
 // Supabase helpers
@@ -563,9 +568,29 @@ async function splitPdfGreedy({ inPdf, partsDir, limitMb }) {
 }
 
 async function zipParts(partsDir, outZipPath) {
-  // 7z a -tzip out.zip *.pdf
-  await runCmd("7z", ["a", "-tzip", outZipPath, "*.pdf"], TIMEOUT_7Z_MS);
+  // ✅ Wildcard ашиглахгүй — бодит PDF жагсаалтыг 7z-д өгнө (хоосон ZIP асуудлыг бүр мөсөн хаана)
+  const pdfs = fs
+    .readdirSync(partsDir)
+    .filter((f) => f.toLowerCase().endsWith(".pdf"))
+    .sort();
+
+  console.log("[ZIP] partsDir =", partsDir);
+  console.log("[ZIP] pdf count =", pdfs.length);
+  if (pdfs.length) console.log("[ZIP] sample =", pdfs.slice(0, 5));
+
+  if (pdfs.length === 0) {
+    throw Object.assign(new Error("NO_PART_PDFS_TO_ZIP"), {
+      code: "NO_PART_PDFS_TO_ZIP",
+      partsDir,
+    });
+  }
+
+  // outZipPath абсолют байж болно; cwd=partsDir үед файлуудыг нэрээр нь нэмнэ
+  await runCmd("7z", ["a", "-tzip", outZipPath, ...pdfs], TIMEOUT_7Z_MS, {
+    cwd: partsDir,
+  });
 }
+
 
 // ----------------------
 // Process one job

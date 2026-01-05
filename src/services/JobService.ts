@@ -5,11 +5,12 @@ import type { QualityMode } from "@/domain/jobs/quality";
  * - goodPDF нь одоогоор "split-only" (compress хийхгүй).
  * - API contract:
  *   POST /api/jobs/create   -> { ok, data:{ jobId, uploadUrl } }
+ *   POST /api/jobs/upload   -> { ok, data:{ jobId, inputKey } }
  *   GET  /api/jobs/status?jobId=...
- *   POST /api/jobs/start    -> { jobId, splitMb }
+ *   POST /api/jobs/start    -> { ok, data:{ job:{...} } }
  *   GET  /api/jobs/download?jobId=...
- *   POST /api/jobs/done     -> { jobId }
- *   POST /api/jobs/cancel   -> { jobId }
+ *   POST /api/jobs/done     -> { ok:true }
+ *   POST /api/jobs/cancel   -> { ok:true } (best-effort)
  */
 
 type JsonResp<T> = { ok: boolean; data?: T; error?: string };
@@ -66,12 +67,12 @@ async function readJson<T>(r: Response): Promise<JsonResp<T>> {
   try {
     j = await r.json();
   } catch {
-    // ignore
+    // ignore (non-json)
   }
   if (!r.ok) {
     return { ok: false, error: j?.error || j?.message || `HTTP ${r.status}` };
   }
-  return j as JsonResp<T>;
+  return (j ?? { ok: true }) as JsonResp<T>;
 }
 
 export class JobService {
@@ -103,7 +104,6 @@ export class JobService {
     return { jobId, uploadUrl };
   }
 
-
   /**
    * 2) Upload file to R2 with presigned PUT
    *    - XHR ашиглавал progress авах боломжтой
@@ -132,6 +132,19 @@ export class JobService {
 
       xhr.send(file);
     });
+  }
+
+  /**
+   * 2.5) Mark uploaded (server knows inputKey & can move job stage)
+   */
+  static async markUploaded(jobId: string) {
+    const res = await fetch("/api/jobs/upload", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jobId }),
+    }).then((r) => readJson<{ jobId: string; inputKey: string }>(r));
+
+    assertOk(res, "Mark uploaded failed");
   }
 
   /**
@@ -195,15 +208,4 @@ export class JobService {
   static downloadUrl(jobId: string) {
     return `/api/jobs/download?jobId=${encodeURIComponent(jobId)}`;
   }
-
-    static async markUploaded(jobId: string) {
-    const res = await fetch("/api/jobs/upload", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ jobId }),
-    }).then((r) => readJson<{ jobId: string; inputKey: string }>(r));
-
-    assertOk(res, "Mark uploaded failed");
-  }
-
 }

@@ -19,7 +19,8 @@ const R2_ENDPOINT = process.env.R2_ENDPOINT!;
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID!;
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY!;
 const R2_BUCKET_IN = process.env.R2_BUCKET_IN || "goodpdf-in";
-const R2_BUCKET_OUT = process.env.R2_BUCKET_OUT || "goodpdf-out";
+const R2_BUCKET_OUT = process.env.R2_BUCKET_OUT || process.env.R2_BUCKET || "goodpdf-out";
+
 
 if (!R2_ENDPOINT || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY) {
   throw new Error("Missing R2_ENDPOINT / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY");
