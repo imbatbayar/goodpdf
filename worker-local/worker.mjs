@@ -73,7 +73,9 @@ const SEVEN_Z_EXE = process.env.SEVEN_Z_EXE || process.env.SEVENZ_EXE || "7z";
 // - PREPROCESS_MODE: "AUTO" | "ALWAYS" | "OFF"  (default: AUTO)
 // - PREPROCESS_DPI: default 160
 // - PREPROCESS_JPEG_QUALITY: default 75
-const PREPROCESS_MODE = String(process.env.PREPROCESS_MODE || "AUTO").toUpperCase();
+const PREPROCESS_MODE = String(
+  process.env.PREPROCESS_MODE || "AUTO"
+).toUpperCase();
 const PREPROCESS_DPI = Math.max(72, Number(process.env.PREPROCESS_DPI || 160));
 const PREPROCESS_JPEG_QUALITY = Math.max(
   30,
@@ -199,7 +201,6 @@ function runCmd(cmd, args, timeoutMs, spawnOpts = {}) {
     });
   });
 }
-
 
 // ----------------------
 // Supabase helpers
@@ -409,8 +410,37 @@ async function preprocessPdfFast({ inPdf, outPdf, limitBytes }) {
   return { used: true, reason: "OK", inBytes, outBytes };
 }
 
-async function splitPdfGreedy({ inPdf, partsDir, limitMb }) {
+/**
+ * Greedy split that targets limitMb, page-aligned.
+ * UX Guard: ONLY when preprocess shrank the PDF below limit AND greedy returns 1 part,
+ * we force 2 parts with part1 as close as possible to limit (binary search k pages).
+ *
+ * @param {object} opts
+ * @param {string} opts.inPdf - work PDF path (could be preprocessed)
+ * @param {string} opts.partsDir
+ * @param {number} opts.limitMb
+ * @param {number|null} opts.originalBytes - original input.pdf bytes (before preprocess)
+ */
+async function splitPdfGreedy({
+  inPdf,
+  partsDir,
+  limitMb,
+  originalBytes = null,
+}) {
   const limitBytes = mbToBytes(limitMb);
+
+  // --- MIN PARTS GUARD (UX trigger baseline):
+  // Only "consider" forcing 2 parts if original was clearly a split-candidate.
+  const origBytes =
+    typeof originalBytes === "number" &&
+    Number.isFinite(originalBytes) &&
+    originalBytes > 0
+      ? originalBytes
+      : safeStatSize(inPdf) ?? null;
+
+  // original is much bigger than limit? => split-candidate
+  const wantAtLeastTwo =
+    typeof origBytes === "number" && origBytes >= limitBytes * 1.8;
 
   const { out: npagesOut } = await runCmd(
     QPDF_EXE,
@@ -624,6 +654,95 @@ async function splitPdfGreedy({ inPdf, partsDir, limitMb }) {
     start = finalEnd + 1;
   }
 
+  // ----------------------
+  // UX GUARD (the exact behavior you described):
+  // If preprocess shrank the whole PDF to <= limit and greedy returns 1 file,
+  // don't return 1 "compressed-looking" result; instead:
+  // - make part1 as close as possible to limit (page-aligned),
+  // - part2 is the remainder.
+  // ----------------------
+  const workBytes = safeStatSize(inPdf) ?? 0; // inPdf here is the workPdf passed in
+  const shouldForceTwo =
+    wantAtLeastTwo && // original clearly needed splitting (e.g., 60MB vs 5MB)
+    workBytes > 0 &&
+    workBytes <= limitBytes && // preprocess made it look "already small"
+    tempParts.length === 1 && // greedy ended up returning 1
+    totalPages >= 2; // can split by pages
+
+  if (shouldForceTwo) {
+    // wipe existing single part
+    for (const p of tempParts) {
+      try {
+        safeUnlink(p.tmpPath);
+      } catch {}
+    }
+    tempParts.length = 0;
+
+    // Find the largest k such that pages [1..k] size <= limitBytes (ensure k < totalPages)
+    let lo = 1;
+    let hi = totalPages - 1;
+    let bestK = 1;
+
+    while (lo <= hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      const cand = candTmpName(1, mid);
+      const candBytes = await tryBuildRange(1, mid, cand);
+
+      if (candBytes != null && candBytes <= limitBytes) {
+        bestK = mid;
+        safeUnlink(cand);
+        lo = mid + 1;
+      } else {
+        safeUnlink(cand);
+        hi = mid - 1;
+      }
+    }
+
+    // clamp safety
+    if (bestK >= totalPages) bestK = totalPages - 1;
+    if (bestK < 1) bestK = 1;
+
+    const tmp1 = partTmpName(1);
+    const tmp2 = partTmpName(2);
+
+    const b1 = await tryBuildRange(1, bestK, tmp1);
+    const b2 = await tryBuildRange(bestK + 1, totalPages, tmp2);
+
+    if (b1 == null || b2 == null) {
+      // best effort: if force-split fails, rebuild whole as single (avoid empty output)
+      safeUnlink(tmp1);
+      safeUnlink(tmp2);
+
+      const tmpWhole = partTmpName(1);
+      const bw = await tryBuildRange(1, totalPages, tmpWhole);
+      if (bw == null) {
+        safeUnlink(tmpWhole);
+        throw Object.assign(new Error("QPDF_FORCE_SPLIT_FAILED"), {
+          code: "QPDF_FORCE_SPLIT_FAILED",
+        });
+      }
+      tempParts.push({
+        tmpPath: tmpWhole,
+        bytes: bw,
+        startPage: 1,
+        endPage: totalPages,
+      });
+    } else {
+      tempParts.push({
+        tmpPath: tmp1,
+        bytes: b1,
+        startPage: 1,
+        endPage: bestK,
+      });
+      tempParts.push({
+        tmpPath: tmp2,
+        bytes: b2,
+        startPage: bestK + 1,
+        endPage: totalPages,
+      });
+    }
+  }
+
   // rename to canonical goodPDF-<TOTAL>(<i>).pdf
   const totalParts = tempParts.length;
   const partFiles = [];
@@ -682,11 +801,15 @@ async function zipParts(partsDir, outZipPath) {
   }
 
   // outZipPath абсолют байж болно; cwd=partsDir үед файлуудыг нэрээр нь нэмнэ
-  await runCmd(SEVEN_Z_EXE, ["a", "-tzip", outZipPath, ...pdfs], TIMEOUT_7Z_MS, {
-    cwd: partsDir,
-  });
+  await runCmd(
+    SEVEN_Z_EXE,
+    ["a", "-tzip", outZipPath, ...pdfs],
+    TIMEOUT_7Z_MS,
+    {
+      cwd: partsDir,
+    }
+  );
 }
-
 
 // ----------------------
 // Process one job
@@ -716,6 +839,9 @@ async function processOneJob(job) {
     });
     await downloadFromR2(inputKey, inPdf);
 
+    // ✅ originalBytes: preprocess-оос өмнөх бодит хэмжээ (UX guard-ийн суурь)
+    const originalBytes = safeStatSize(inPdf) ?? null;
+
     const splitMb = Number(job.split_mb || 0);
     if (!Number.isFinite(splitMb) || splitMb <= 0) {
       throw Object.assign(new Error("split_mb missing/invalid"), {
@@ -735,7 +861,11 @@ async function processOneJob(job) {
     });
 
     // Pass 1: moderate fast preprocess
-    const pre1 = await preprocessPdfFast({ inPdf, outPdf: normPdf, limitBytes });
+    const pre1 = await preprocessPdfFast({
+      inPdf,
+      outPdf: normPdf,
+      limitBytes,
+    });
     if (pre1?.used) workPdf = normPdf;
 
     await updateJob(jobId, {
@@ -747,7 +877,8 @@ async function processOneJob(job) {
 
     const expectedParts = (() => {
       const b = safeStatSize(inPdf);
-      if (typeof b === "number" && b > 0) return Math.max(1, Math.ceil(b / limitBytes));
+      if (typeof b === "number" && b > 0)
+        return Math.max(1, Math.ceil(b / limitBytes));
       return null;
     })();
 
@@ -755,6 +886,7 @@ async function processOneJob(job) {
       inPdf: workPdf,
       partsDir,
       limitMb: splitMb,
+      originalBytes, // ✅ pass original size into split for UX guard
     });
 
     // If the result is wildly more parts than expected, the PDF is still "size-unstable".
@@ -826,6 +958,7 @@ async function processOneJob(job) {
         inPdf: workPdf,
         partsDir,
         limitMb: splitMb,
+        originalBytes, // ✅ keep original bytes baseline
       }));
     }
 
