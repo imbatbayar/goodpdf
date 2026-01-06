@@ -410,17 +410,6 @@ async function preprocessPdfFast({ inPdf, outPdf, limitBytes }) {
   return { used: true, reason: "OK", inBytes, outBytes };
 }
 
-/**
- * Greedy split that targets limitMb, page-aligned.
- * UX Guard: ONLY when preprocess shrank the PDF below limit AND greedy returns 1 part,
- * we force 2 parts with part1 as close as possible to limit (binary search k pages).
- *
- * @param {object} opts
- * @param {string} opts.inPdf - work PDF path (could be preprocessed)
- * @param {string} opts.partsDir
- * @param {number} opts.limitMb
- * @param {number|null} opts.originalBytes - original input.pdf bytes (before preprocess)
- */
 async function splitPdfGreedy({
   inPdf,
   partsDir,
@@ -429,8 +418,8 @@ async function splitPdfGreedy({
 }) {
   const limitBytes = mbToBytes(limitMb);
 
-  // --- MIN PARTS GUARD (UX trigger baseline):
-  // Only "consider" forcing 2 parts if original was clearly a split-candidate.
+  // --- MIN PARTS GUARD (UX baseline): only consider forcing 2 parts if the ORIGINAL file
+  // was clearly a split candidate. (Avoid "it just compressed" perception.)
   const origBytes =
     typeof originalBytes === "number" &&
     Number.isFinite(originalBytes) &&
@@ -438,7 +427,6 @@ async function splitPdfGreedy({
       ? originalBytes
       : safeStatSize(inPdf) ?? null;
 
-  // original is much bigger than limit? => split-candidate
   const wantAtLeastTwo =
     typeof origBytes === "number" && origBytes >= limitBytes * 1.8;
 
@@ -447,6 +435,7 @@ async function splitPdfGreedy({
     ["--show-npages", inPdf],
     TIMEOUT_QPDF_MS
   );
+
   const totalPages = Number(String(npagesOut).trim());
   if (!Number.isFinite(totalPages) || totalPages <= 0) {
     throw new Error("Could not read page count");
@@ -458,6 +447,7 @@ async function splitPdfGreedy({
       `.__part_${String(partNo).padStart(3, "0")}_${rand6()}.pdf`
     );
   }
+
   function candTmpName(startPage, endPage) {
     return path.join(
       partsDir,
@@ -478,66 +468,66 @@ async function splitPdfGreedy({
     return safeStatSize(outPath);
   }
 
+  // Greedy packing: build page-aligned parts close to limitBytes.
   const tempParts = []; // {tmpPath, bytes, startPage, endPage}
-  let start = 1;
+  let startPage = 1;
   let partNo = 1;
   let prevSpan = 1;
 
-  while (start <= totalPages) {
-    // build single page (must be monotonic baseline)
+  while (startPage <= totalPages) {
+    // Always ensure we can build at least one page
     const oneTmp = partTmpName(partNo);
-    let oneBytes = await tryBuildRange(start, start, oneTmp);
+    let oneBytes = await tryBuildRange(startPage, startPage, oneTmp);
 
-    // hard fail: even single page cannot be built after retry
     if (oneBytes == null) {
       safeUnlink(oneTmp);
       const oneTmp2 = partTmpName(partNo);
-      oneBytes = await tryBuildRange(start, start, oneTmp2);
+      oneBytes = await tryBuildRange(startPage, startPage, oneTmp2);
       if (oneBytes == null) {
         safeUnlink(oneTmp2);
         throw Object.assign(new Error("QPDF_RANGE_BUILD_FAILED"), {
           code: "QPDF_RANGE_BUILD_FAILED",
-          startPage: start,
-          endPage: start,
+          startPage,
+          endPage: startPage,
         });
       }
       tempParts.push({
         tmpPath: oneTmp2,
         bytes: oneBytes,
-        startPage: start,
-        endPage: start,
+        startPage,
+        endPage: startPage,
       });
       partNo++;
-      start++;
+      startPage++;
       prevSpan = 1;
       continue;
     }
 
-    // single page exceeds target => still output it (page-aligned rule)
+    // Single page exceeds limit => output it as-is (page-aligned law)
     if (oneBytes > limitBytes) {
       tempParts.push({
         tmpPath: oneTmp,
         bytes: oneBytes,
-        startPage: start,
-        endPage: start,
+        startPage,
+        endPage: startPage,
       });
       partNo++;
-      start++;
+      startPage++;
       prevSpan = 1;
       continue;
     }
 
-    // exponential expand
-    let goodEnd = start;
+    // Exponential expansion from previous good span
+    let goodEnd = startPage;
     let goodBytes = oneBytes;
 
     let step = Math.max(1, prevSpan);
-    let probeEnd = Math.min(totalPages, start + step - 1);
+    let probeEnd = Math.min(totalPages, startPage + step - 1);
     let foundTooBig = false;
 
     while (true) {
-      const cand = candTmpName(start, probeEnd);
-      const candBytes = await tryBuildRange(start, probeEnd, cand);
+      const cand = candTmpName(startPage, probeEnd);
+      const candBytes = await tryBuildRange(startPage, probeEnd, cand);
 
       if (candBytes != null && candBytes <= limitBytes) {
         goodEnd = probeEnd;
@@ -546,7 +536,7 @@ async function splitPdfGreedy({
 
         if (probeEnd >= totalPages) break;
         step *= 2;
-        probeEnd = Math.min(totalPages, start + step - 1);
+        probeEnd = Math.min(totalPages, startPage + step - 1);
         continue;
       }
 
@@ -555,24 +545,24 @@ async function splitPdfGreedy({
       break;
     }
 
-    if (goodEnd === start) {
+    if (goodEnd === startPage) {
       // keep single page
       tempParts.push({
         tmpPath: oneTmp,
         bytes: oneBytes,
-        startPage: start,
-        endPage: start,
+        startPage,
+        endPage: startPage,
       });
       partNo++;
-      start++;
+      startPage++;
       prevSpan = 1;
       continue;
     }
 
-    // we extended; remove single tmp
+    // We extended; remove single tmp (we'll rebuild final)
     safeUnlink(oneTmp);
 
-    // binary refine if we hit tooBig
+    // Binary refinement between (goodEnd+1 .. probeEnd-1) if we foundTooBig
     if (foundTooBig) {
       const tooBigEnd = probeEnd;
       if (tooBigEnd > goodEnd + 1) {
@@ -580,8 +570,8 @@ async function splitPdfGreedy({
         let hi = tooBigEnd - 1;
         while (lo <= hi) {
           const mid = Math.floor((lo + hi) / 2);
-          const cand = candTmpName(start, mid);
-          const candBytes = await tryBuildRange(start, mid, cand);
+          const cand = candTmpName(startPage, mid);
+          const candBytes = await tryBuildRange(startPage, mid, cand);
 
           if (candBytes != null && candBytes <= limitBytes) {
             goodEnd = mid;
@@ -596,22 +586,20 @@ async function splitPdfGreedy({
       }
     }
 
-    // build final [start..goodEnd] with backoff safety
-    let finalStart = start;
+    // Build final [startPage..goodEnd] with backoff safety if needed
     let finalEnd = goodEnd;
     let finalTmp = partTmpName(partNo);
-    let finalBytes = await tryBuildRange(finalStart, finalEnd, finalTmp);
+    let finalBytes = await tryBuildRange(startPage, finalEnd, finalTmp);
 
-    // backoff if build failed or oversize
     let guard = 0;
     while (
       (finalBytes == null || finalBytes > limitBytes) &&
-      finalEnd > finalStart
+      finalEnd > startPage
     ) {
       safeUnlink(finalTmp);
       finalEnd--;
       finalTmp = partTmpName(partNo);
-      finalBytes = await tryBuildRange(finalStart, finalEnd, finalTmp);
+      finalBytes = await tryBuildRange(startPage, finalEnd, finalTmp);
       guard++;
       if (guard > 200) break;
     }
@@ -620,22 +608,22 @@ async function splitPdfGreedy({
       safeUnlink(finalTmp);
       throw Object.assign(new Error("QPDF_FINAL_BUILD_FAILED"), {
         code: "QPDF_FINAL_BUILD_FAILED",
-        startPage: finalStart,
+        startPage,
         endPage: finalEnd,
       });
     }
 
-    // last resort: if still oversize (should be rare), fallback to single page
-    if (finalBytes > limitBytes && finalEnd > finalStart) {
+    // Last resort: if still oversize (rare), fallback to single page
+    if (finalBytes > limitBytes && finalEnd > startPage) {
       safeUnlink(finalTmp);
-      finalEnd = finalStart;
+      finalEnd = startPage;
       finalTmp = partTmpName(partNo);
-      const b = await tryBuildRange(finalStart, finalEnd, finalTmp);
+      const b = await tryBuildRange(startPage, finalEnd, finalTmp);
       if (b == null) {
         safeUnlink(finalTmp);
         throw Object.assign(new Error("QPDF_SINGLE_REBUILD_FAILED"), {
           code: "QPDF_SINGLE_REBUILD_FAILED",
-          startPage: finalStart,
+          startPage,
           endPage: finalEnd,
         });
       }
@@ -645,32 +633,34 @@ async function splitPdfGreedy({
     tempParts.push({
       tmpPath: finalTmp,
       bytes: finalBytes,
-      startPage: finalStart,
+      startPage,
       endPage: finalEnd,
     });
 
-    prevSpan = Math.max(1, finalEnd - finalStart + 1);
+    prevSpan = Math.max(1, finalEnd - startPage + 1);
     partNo++;
-    start = finalEnd + 1;
+    startPage = finalEnd + 1;
   }
 
   // ----------------------
-  // UX GUARD (the exact behavior you described):
-  // If preprocess shrank the whole PDF to <= limit and greedy returns 1 file,
-  // don't return 1 "compressed-looking" result; instead:
-  // - make part1 as close as possible to limit (page-aligned),
-  // - part2 is the remainder.
+  // UX FORCE-2 (ONLY when preprocess shrank the whole PDF below limit):
+  // If original was clearly big (wantAtLeastTwo), but the WORK pdf is now <= limit
+  // and greedy produced only 1 part, force 2 parts where part1 is as close as possible
+  // to limit (page-aligned), and part2 is the remainder.
   // ----------------------
-  const workBytes = safeStatSize(inPdf) ?? 0; // inPdf here is the workPdf passed in
+  const singlePartBytes =
+    tempParts.length === 1 && typeof tempParts[0]?.bytes === "number"
+      ? tempParts[0].bytes
+      : 0;
+
   const shouldForceTwo =
-    wantAtLeastTwo && // original clearly needed splitting (e.g., 60MB vs 5MB)
-    workBytes > 0 &&
-    workBytes <= limitBytes && // preprocess made it look "already small"
-    tempParts.length === 1 && // greedy ended up returning 1
-    totalPages >= 2; // can split by pages
+    wantAtLeastTwo &&
+    tempParts.length === 1 &&
+    singlePartBytes > 0 &&
+    singlePartBytes <= limitBytes &&
+    totalPages >= 2;
 
   if (shouldForceTwo) {
-    // wipe existing single part
     for (const p of tempParts) {
       try {
         safeUnlink(p.tmpPath);
@@ -678,27 +668,36 @@ async function splitPdfGreedy({
     }
     tempParts.length = 0;
 
-    // Find the largest k such that pages [1..k] size <= limitBytes (ensure k < totalPages)
+    // Find bestK: largest k where [1..k] <= limitBytes (ensure k < totalPages)
     let lo = 1;
     let hi = totalPages - 1;
     let bestK = 1;
 
+    // cache to reduce qpdf calls during this fallback
+    const cache = new Map();
+    async function rbytes(s, e) {
+      const key = `${s}-${e}`;
+      if (cache.has(key)) return cache.get(key);
+      const tmp = candTmpName(s, e);
+      const b = await tryBuildRange(s, e, tmp);
+      try {
+        safeUnlink(tmp);
+      } catch {}
+      cache.set(key, b);
+      return b;
+    }
+
     while (lo <= hi) {
       const mid = Math.floor((lo + hi) / 2);
-      const cand = candTmpName(1, mid);
-      const candBytes = await tryBuildRange(1, mid, cand);
-
-      if (candBytes != null && candBytes <= limitBytes) {
+      const bLeft = await rbytes(1, mid);
+      if (bLeft != null && bLeft <= limitBytes) {
         bestK = mid;
-        safeUnlink(cand);
         lo = mid + 1;
       } else {
-        safeUnlink(cand);
         hi = mid - 1;
       }
     }
 
-    // clamp safety
     if (bestK >= totalPages) bestK = totalPages - 1;
     if (bestK < 1) bestK = 1;
 
@@ -709,10 +708,9 @@ async function splitPdfGreedy({
     const b2 = await tryBuildRange(bestK + 1, totalPages, tmp2);
 
     if (b1 == null || b2 == null) {
-      // best effort: if force-split fails, rebuild whole as single (avoid empty output)
       safeUnlink(tmp1);
       safeUnlink(tmp2);
-
+      // best effort: rebuild whole as single
       const tmpWhole = partTmpName(1);
       const bw = await tryBuildRange(1, totalPages, tmpWhole);
       if (bw == null) {
@@ -743,7 +741,231 @@ async function splitPdfGreedy({
     }
   }
 
-  // rename to canonical goodPDF-<TOTAL>(<i>).pdf
+  // ----------------------
+  // POST-BALANCE v2:
+  // Push tiny middle parts toward the end, and maximize the second-last part.
+  // Goal: parts[0..n-2] are as full as possible; ONLY the last may be small.
+  // Performance-safe: adaptive caps.
+  // ----------------------
+  const partsCount = tempParts.length;
+
+  if (partsCount >= 2) {
+    const TINY_RATIO = 0.55;
+    const MAX_PASSES = Math.min(10, 2 + Math.ceil(partsCount / 10));
+    const MAX_OPS_PER_PASS = Math.min(40, 6 + Math.ceil(partsCount / 4));
+    const MIN_RIGHT_RATIO = 0.3; // non-last pairs only
+
+    const rangeCache = new Map(); // key "s-e" -> bytes|null
+
+    async function rangeBytes(s, e) {
+      const key = `${s}-${e}`;
+      if (rangeCache.has(key)) return rangeCache.get(key);
+      const tmp = candTmpName(s, e);
+      const b = await tryBuildRange(s, e, tmp);
+      try {
+        safeUnlink(tmp);
+      } catch {}
+      rangeCache.set(key, b);
+      return b;
+    }
+
+    async function rebuildRangeAsPart(s, e, tmpIndexForName) {
+      const tmp = partTmpName(tmpIndexForName);
+      const b = await tryBuildRange(s, e, tmp);
+      if (b == null) {
+        try {
+          safeUnlink(tmp);
+        } catch {}
+        return null;
+      }
+      return { tmpPath: tmp, bytes: b, startPage: s, endPage: e };
+    }
+
+    async function rebalancePair(i, isLastPair) {
+      const A = tempParts[i];
+      const B = tempParts[i + 1];
+      const s = A.startPage;
+      const e = B.endPage;
+      if (!(s >= 1 && e > s)) return false;
+
+      // If the first page alone already exceeds limit, nothing we can do (page-aligned law)
+      const bSingle = await rangeBytes(s, s);
+      if (bSingle == null) return false;
+      if (bSingle > limitBytes) return false;
+
+      // Find kMax = largest k where [s..k] <= limitBytes (ensure k < e)
+      let lo = s;
+      let hi = e - 1;
+      let kMax = s;
+
+      while (lo <= hi) {
+        const mid = Math.floor((lo + hi) / 2);
+        const bLeft = await rangeBytes(s, mid);
+        if (bLeft != null && bLeft <= limitBytes) {
+          kMax = mid;
+          lo = mid + 1;
+        } else {
+          hi = mid - 1;
+        }
+      }
+
+      let k = kMax;
+
+      if (!isLastPair) {
+        // Keep right from becoming "ridiculously tiny" if possible
+        const minRight = Math.floor(limitBytes * MIN_RIGHT_RATIO);
+        const bRightAtKMax = await rangeBytes(kMax + 1, e);
+        if (bRightAtKMax == null) return false;
+
+        if (bRightAtKMax < minRight) {
+          // Move k left to give more pages to right, but keep k as large as possible
+          let lo2 = s;
+          let hi2 = kMax;
+          let bestK = s;
+
+          while (lo2 <= hi2) {
+            const mid = Math.floor((lo2 + hi2) / 2);
+            const br = await rangeBytes(mid + 1, e);
+            if (br != null && br >= minRight) {
+              bestK = mid;
+              lo2 = mid + 1;
+            } else {
+              hi2 = mid - 1;
+            }
+          }
+          k = bestK;
+        }
+      }
+
+      const bLeftFinal = await rangeBytes(s, k);
+      const bRightFinal = await rangeBytes(k + 1, e);
+      if (bLeftFinal == null || bRightFinal == null) return false;
+
+      // Avoid creating a new tiny part (non-last pairs)
+      if (!isLastPair && bLeftFinal < Math.floor(limitBytes * 0.4))
+        return false;
+
+      const newA = await rebuildRangeAsPart(s, k, i + 1);
+      const newB = await rebuildRangeAsPart(k + 1, e, i + 2);
+      if (!newA || !newB) return false;
+
+      // Never allow left to exceed limit (single-page > limit already handled above)
+      if (newA.bytes > limitBytes) {
+        try {
+          safeUnlink(newA.tmpPath);
+        } catch {}
+        try {
+          safeUnlink(newB.tmpPath);
+        } catch {}
+        return false;
+      }
+
+      try {
+        safeUnlink(A.tmpPath);
+      } catch {}
+      try {
+        safeUnlink(B.tmpPath);
+      } catch {}
+
+      tempParts[i] = newA;
+      tempParts[i + 1] = newB;
+      return true;
+    }
+
+    for (let pass = 0; pass < MAX_PASSES; pass++) {
+      let changed = false;
+      let ops = 0;
+
+      rangeCache.clear();
+
+      for (let i = 0; i < tempParts.length - 1; i++) {
+        if (ops >= MAX_OPS_PER_PASS) break;
+
+        const isLastPair = i === tempParts.length - 2;
+
+        // For last pair, ALWAYS maximize left (so second-last becomes near limit).
+        // For others, only fix if current part is tiny.
+        const shouldTry =
+          isLastPair ||
+          (typeof tempParts[i].bytes === "number" &&
+            tempParts[i].bytes < Math.floor(limitBytes * TINY_RATIO));
+
+        if (!shouldTry) continue;
+
+        const ok = await rebalancePair(i, isLastPair);
+        if (ok) {
+          changed = true;
+          ops++;
+        }
+      }
+
+      if (!changed) break;
+    }
+  }
+
+  // ----------------------
+  // TAIL-MERGE (Smart UX):
+  // If the last two parts together can fit within the requested limit,
+  // merge them to reduce unnecessary extra files.
+  // - Only touches the tail (end of the document)
+  // - Rebuilds a single combined range to confirm size (qpdf output size can vary)
+  // ----------------------
+  async function mergeTailIfFits() {
+    const MAX_TAIL_MERGES = 25; // safety guard
+    let merges = 0;
+
+    while (tempParts.length >= 2 && merges < MAX_TAIL_MERGES) {
+      // ✅ MIN PARTS GUARD:
+      // If the ORIGINAL file was clearly a split candidate (wantAtLeastTwo),
+      // never merge the tail down to a single output file. This preserves the
+      // UX promise: "split" should not look like "just compress".
+      if (wantAtLeastTwo && tempParts.length === 2) break;
+
+      const n = tempParts.length;
+      const A = tempParts[n - 2];
+      const B = tempParts[n - 1];
+
+      if (!A || !B) break;
+      if (typeof A.bytes !== "number" || typeof B.bytes !== "number") break;
+
+      // Fast filter: if sum already exceeds limit, can't merge
+      if (A.bytes + B.bytes > limitBytes) break;
+
+      const s = A.startPage;
+      const e = B.endPage;
+
+      // Build merged candidate and verify it truly fits (qpdf may add overhead)
+      const tmpMerged = partTmpName(n - 1);
+      const mergedBytes = await tryBuildRange(s, e, tmpMerged);
+
+      if (mergedBytes == null) {
+        safeUnlink(tmpMerged);
+        break;
+      }
+
+      if (mergedBytes > limitBytes) {
+        safeUnlink(tmpMerged);
+        break;
+      }
+
+      // Replace tail A+B with merged
+      safeUnlink(A.tmpPath);
+      safeUnlink(B.tmpPath);
+
+      tempParts.splice(n - 2, 2, {
+        tmpPath: tmpMerged,
+        bytes: mergedBytes,
+        startPage: s,
+        endPage: e,
+      });
+
+      merges++;
+    }
+  }
+
+  await mergeTailIfFits();
+
+  // Rename to canonical goodPDF-<TOTAL>(<i>).pdf
   const totalParts = tempParts.length;
   const partFiles = [];
   const partMeta = [];
@@ -839,7 +1061,6 @@ async function processOneJob(job) {
     });
     await downloadFromR2(inputKey, inPdf);
 
-    // ✅ originalBytes: preprocess-оос өмнөх бодит хэмжээ (UX guard-ийн суурь)
     const originalBytes = safeStatSize(inPdf) ?? null;
 
     const splitMb = Number(job.split_mb || 0);
@@ -886,7 +1107,7 @@ async function processOneJob(job) {
       inPdf: workPdf,
       partsDir,
       limitMb: splitMb,
-      originalBytes, // ✅ pass original size into split for UX guard
+      originalBytes,
     });
 
     // If the result is wildly more parts than expected, the PDF is still "size-unstable".
@@ -958,7 +1179,7 @@ async function processOneJob(job) {
         inPdf: workPdf,
         partsDir,
         limitMb: splitMb,
-        originalBytes, // ✅ keep original bytes baseline
+        originalBytes,
       }));
     }
 
