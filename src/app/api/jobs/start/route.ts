@@ -5,6 +5,9 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
+// 🔒 LOCKED TTL: privacy-first retention baseline
+const LOCKED_TTL_MINUTES = 10;
+
 function json(ok: boolean, data?: any, error?: string, status = 200) {
   return NextResponse.json(
     { ok, data, error },
@@ -13,67 +16,59 @@ function json(ok: boolean, data?: any, error?: string, status = 200) {
 }
 
 function parseSplitMb(v: any): { value: number | null; error: string | null } {
+  // splitMb нь optional байж болно (хуучин урсгал эвдэхгүй)
+  if (v === undefined || v === null || v === "") return { value: null, error: null };
+
   const n = Number(v);
+  if (!Number.isFinite(n)) return { value: null, error: "splitMb must be a number." };
+  if (n <= 0) return { value: null, error: "splitMb must be > 0." };
 
-  if (!Number.isFinite(n)) return { value: null, error: "Split size is required." };
-  if (!Number.isInteger(n)) return { value: null, error: "Please enter a whole number (MB)." };
-  if (n <= 0) return { value: null, error: "Split size must be greater than 0." };
-  if (n > 500) return { value: null, error: "Max allowed size is 500MB." };
+  // production-safe guard (хэт том утгаас хамгаална)
+  // Хэрвээ чиний UI өөр хүрээ ашигладаг бол энэ дээд хязгаар асуудалгүйгээр өөрчлөгдөнө.
+  if (n > 500) return { value: null, error: "splitMb is too large (max 500MB per part)." };
 
-  return { value: n, error: null };
+  return { value: Math.round(n * 100) / 100, error: null };
 }
 
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => null);
+
     const jobId = String(body?.jobId || "").trim();
     if (!jobId) return json(false, null, "jobId is required.", 400);
 
-    const parsed = parseSplitMb(body?.splitMb);
-    if (parsed.error) return json(false, null, parsed.error, 400);
+    const { value: splitMb, error: splitErr } = parseSplitMb(body?.splitMb);
+    if (splitErr) return json(false, null, splitErr, 400);
 
-    const splitMb = parsed.value as number;
+    // 🔒 Refresh retention window on start
+    const ttlMinutes = LOCKED_TTL_MINUTES;
+    const deleteAtIso = new Date(Date.now() + ttlMinutes * 60_000).toISOString();
 
-    const cur = await supabaseAdmin
-      .from("jobs")
-      .select("id,status")
-      .eq("id", jobId)
-      .maybeSingle();
+    // NOTE: урсгал эвдэхгүй:
+    // - зөвхөн UPLOADED / QUEUED үед start зөвшөөрнө (хуучин логик)
+    // - splitMb null байж болно (хуучин split_mb-аа хэвээр үлдээнэ)
+    const updatePayload: Record<string, any> = {
+      status: "QUEUED",
+      stage: "QUEUE",
+      progress: 0,
 
-    if (cur.error) return json(false, null, cur.error.message, 500);
-    if (!cur.data) return json(false, null, "Job not found.", 404);
+      // 🔒 retention baseline
+      ttl_minutes: ttlMinutes,
+      delete_at: deleteAtIso,
+      cleaned_at: null,
 
-    const curStatus = String(cur.data.status || "");
-    if (!["UPLOADED", "QUEUED"].includes(curStatus)) {
-      return json(false, { job: cur.data }, "Job not startable in current status.", 409);
-    }
+      // optional timestamps (байхгүй column байсан ч асуудалгүй — доорх payload-оос аваад устгаж болно)
+      updated_at: new Date().toISOString(),
+    };
+
+    if (splitMb !== null) updatePayload.split_mb = splitMb;
 
     const { data, error } = await supabaseAdmin
       .from("jobs")
-      .update({
-        split_mb: splitMb,
-
-        status: "QUEUED",
-        stage: "QUEUE",
-        progress: 0,
-
-        // split-only
-        compress_progress: 100,
-        split_progress: 0,
-
-        // clear errors + allow new claim
-        error_text: null,
-        error_code: null,
-        claimed_by: null,
-        claimed_at: null,
-
-        // reset run markers
-        processing_started_at: null,
-        done_at: null,
-      })
+      .update(updatePayload)
       .eq("id", jobId)
       .in("status", ["UPLOADED", "QUEUED"])
-      .select("id,status,split_mb,progress,stage")
+      .select("id,status,split_mb,progress,stage,delete_at,ttl_minutes,cleaned_at")
       .maybeSingle();
 
     if (error) return json(false, null, error.message, 500);

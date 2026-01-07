@@ -39,13 +39,8 @@ const R2_BUCKET_OUT =
 const POLL_MS = Number(process.env.POLL_MS || 2000);
 const CONCURRENCY = Math.max(1, Number(process.env.CONCURRENCY || 1));
 
-// TTL fallback (minutes) if job.ttl_minutes is null
-const DEFAULT_TTL_MINUTES = Math.max(
-  1,
-  Number(
-    process.env.DEFAULT_TTL_MINUTES || process.env.OUTPUT_TTL_MINUTES || 30
-  )
-);
+// 🔒 LOCKED TTL: 10 minutes (privacy-first)
+const DEFAULT_TTL_MINUTES = 10;
 
 const DO_CLEANUP =
   String(process.env.DO_CLEANUP || "true").toLowerCase() !== "false";
@@ -285,14 +280,16 @@ async function uploadToR2(key, filePath, contentType) {
 }
 
 // ----------------------
-// Cleanup (delete_at + output_zip_path)
+// Cleanup (delete_at + input_path + output_zip_path)
 // ----------------------
 async function cleanupExpiredOutputs() {
   if (!DO_CLEANUP) return 0;
 
   const { data, error } = await supabase
     .from("jobs")
-    .select("id,output_zip_path,zip_path,delete_at,cleaned_at,status")
+    .select(
+      "id,input_path,output_zip_path,zip_path,delete_at,cleaned_at,status"
+    )
     .is("cleaned_at", null)
     .not("delete_at", "is", null)
     .lt("delete_at", nowIso())
@@ -304,21 +301,40 @@ async function cleanupExpiredOutputs() {
   let cleaned = 0;
 
   for (const r of rows) {
-    const key =
-      (r.output_zip_path && String(r.output_zip_path)) ||
-      (r.zip_path && String(r.zip_path)) ||
+    // ✅ Input key: DB-д input_path байвал ашиглана; байхгүй бол стандарт fallback
+    const inputKey =
+      (r.input_path && String(r.input_path).replace(/^\/+/, "")) ||
+      `${r.id}/input.pdf`;
+
+    // ✅ Output key: output_zip_path эсвэл zip_path
+    const outKey =
+      (r.output_zip_path && String(r.output_zip_path).replace(/^\/+/, "")) ||
+      (r.zip_path && String(r.zip_path).replace(/^\/+/, "")) ||
       null;
 
-    if (key) {
+    // --- NEW: job-files cleanup (input + output) ---
+
+    // 1) Delete input from IN bucket (idempotent: missing object -> ignore)
+    try {
+      await r2.send(
+        new DeleteObjectCommand({ Bucket: R2_BUCKET_IN, Key: inputKey })
+      );
+    } catch {
+      // best effort
+    }
+
+    // 2) Delete output zip from OUT bucket (idempotent)
+    if (outKey) {
       try {
         await r2.send(
-          new DeleteObjectCommand({ Bucket: R2_BUCKET_OUT, Key: key })
+          new DeleteObjectCommand({ Bucket: R2_BUCKET_OUT, Key: outKey })
         );
       } catch {
         // best effort
       }
     }
 
+    // 3) Mark cleaned in DB (status regardless of DONE/FAILED/PROCESSING)
     try {
       await supabase
         .from("jobs")
@@ -337,6 +353,7 @@ async function cleanupExpiredOutputs() {
 
   return cleaned;
 }
+
 
 // ----------------------
 // SPLIT: Adaptive range packing (never-crash)

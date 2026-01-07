@@ -7,6 +7,9 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
+// 🔒 LOCKED TTL: privacy-first retention baseline
+const LOCKED_TTL_MINUTES = 10;
+
 function json(ok: boolean, data?: any, error?: string, status = 200) {
   return NextResponse.json({ ok, data, error }, { status });
 }
@@ -53,7 +56,13 @@ export async function POST(req: Request) {
       forcePathStyle: true,
     });
 
-    // 1) create job row (UPLOADING state)
+    // -----------------------------
+    // 1) create job row (UPLOADING)
+    // 🔒 Retention baseline: DONE болсон эсэхээс үл хамааран delete_at хүрмэгц цэвэрлэгдэнэ
+    // -----------------------------
+    const ttlMinutes = LOCKED_TTL_MINUTES;
+    const deleteAtIso = new Date(Date.now() + ttlMinutes * 60_000).toISOString();
+
     const { data: jobRow, error: jobErr } = await supabaseAdmin
       .from("jobs")
       .insert({
@@ -65,6 +74,12 @@ export async function POST(req: Request) {
         file_size_bytes: fileSizeBytes,
         // schema constraint-д зориулсан fallback (Start дээр жинхэнэ утга орно)
         split_mb: body?.splitMb ?? null,
+
+        // 🔒 retention baseline
+        ttl_minutes: ttlMinutes,
+        delete_at: deleteAtIso,
+        cleaned_at: null,
+
         error_text: null,
         error_code: null,
       })
@@ -78,16 +93,21 @@ export async function POST(req: Request) {
     // ✅ CANONICAL input key (worker/cleanup бүгдтэй таарна)
     const key = `${jobId}/input.pdf`;
 
-    // 2) presign PUT
+    // -----------------------------
+    // 2) presign PUT (upload PDF to IN bucket)
+    // -----------------------------
     const cmd = new PutObjectCommand({
       Bucket: R2_BUCKET_IN,
       Key: key,
       ContentType: "application/pdf",
     });
 
-    const signedUrl = await getSignedUrl(r2, cmd, { expiresIn: 60 * 10 });
+    // Upload URL TTL: 10 minutes (privacy-first)
+    const signedUrl = await getSignedUrl(r2, cmd, { expiresIn: 60 * LOCKED_TTL_MINUTES });
 
-    // 3) save input_path so worker knows where to read
+    // -----------------------------
+    // 3) store canonical input_path in DB
+    // -----------------------------
     const { error: updErr } = await supabaseAdmin
       .from("jobs")
       .update({
@@ -97,6 +117,9 @@ export async function POST(req: Request) {
 
     if (updErr) return json(false, null, updErr.message, 500);
 
+    // -----------------------------
+    // response
+    // -----------------------------
     return json(true, {
       jobId,
       inputKey: key,

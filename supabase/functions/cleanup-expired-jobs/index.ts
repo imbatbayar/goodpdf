@@ -1,131 +1,139 @@
 // deno-lint-ignore-file
 /// <reference lib="deno.ns" />
 
-
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
+// NOTE: Env-үүдийг эвдэхгүй (чи одоо ашиглаж байгаа нэршлээр нь үлдээлээ)
 const BUCKET_IN = Deno.env.get("BUCKET_IN") || "job-input";
 const BUCKET_OUT = Deno.env.get("BUCKET_OUT") || "jobs-output";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-function isIgnorable(msg = "") {
-  const m = msg.toLowerCase();
+function nowIso() {
+  return new Date().toISOString();
+}
+
+// Supabase Storage remove() дээр "байхгүй object" үед ирдэг алдаануудыг идемпотент байдлаар ignore хийх
+function isIgnorable(err: any): boolean {
+  const msg = String(err?.message || err || "").toLowerCase();
+  if (!msg) return false;
+
+  // common "not found" / "missing" patterns
   return (
-    m.includes("not found") ||
-    m.includes("does not exist") ||
-    m.includes("no such") ||
-    m.includes("404")
+    msg.includes("not found") ||
+    msg.includes("does not exist") ||
+    msg.includes("no such") ||
+    msg.includes("404") ||
+    msg.includes("object not found") ||
+    msg.includes("key not found")
   );
 }
 
-function dirname(p: string) {
-  const i = p.lastIndexOf("/");
-  return i >= 0 ? p.slice(0, i) : "";
-}
-
-async function removeByPrefix(bucket: string, prefix: string) {
-  if (!prefix) return { ok: true };
-  const { data, error } = await supabase.storage.from(bucket).list(prefix, {
-    limit: 1000,
-    offset: 0,
-  });
-  if (error) return { ok: false, error: error.message };
-
-  const files = (data || [])
-    .filter((x) => x?.name && x.name !== ".emptyFolderPlaceholder")
-    .map((x) => `${prefix}/${x.name}`);
-
-  if (files.length === 0) return { ok: true };
-
-  const { error: rmErr } = await supabase.storage.from(bucket).remove(files);
-  if (rmErr && !isIgnorable(rmErr.message))
-    return { ok: false, error: rmErr.message };
-
-  return { ok: true };
+function cleanKey(k: any): string | null {
+  if (!k) return null;
+  const s = String(k).trim();
+  if (!s) return null;
+  // safety: remove leading slashes
+  return s.replace(/^\/+/, "");
 }
 
 async function removeSingle(bucket: string, key: string) {
   const { error } = await supabase.storage.from(bucket).remove([key]);
-  if (error && !isIgnorable(error.message))
-    return { ok: false, error: error.message };
-  return { ok: true };
+  if (error && !isIgnorable(error)) throw error;
 }
 
-serve(async () => {
-  const now = new Date().toISOString();
+function json(body: any, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+      "access-control-allow-origin": "*",
+      "access-control-allow-headers": "authorization, x-client-info, apikey, content-type",
+      "access-control-allow-methods": "POST, OPTIONS",
+    },
+  });
+}
 
-  const { data: jobs, error } = await supabase
-    .from("jobs")
-    .select("id,user_id,status,input_path,zip_path,output_zip_path")
-    .in("status", ["DONE", "DONE_CONFIRMED"])
-    .lt("expires_at", now)
-    .limit(100);
+serve(async (req) => {
+  if (req.method === "OPTIONS") return json({ ok: true }, 200);
+  if (req.method !== "POST") return json({ ok: false, error: "Method not allowed" }, 405);
 
-  if (error) {
-    return new Response(
-      JSON.stringify({ ok: false, error: error.message }),
-      { status: 500 }
-    );
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    return json({ ok: false, error: "Missing SUPABASE env vars" }, 500);
   }
 
+  const now = nowIso();
+
+  // ✅ delete_at хүрмэгц (DONE эсэхээс үл хамааран) цэвэрлэнэ
+  const { data: jobs, error: qErr } = await supabase
+    .from("jobs")
+    .select("id,status,input_path,zip_path,output_zip_path,delete_at,cleaned_at")
+    .is("cleaned_at", null)
+    .not("delete_at", "is", null)
+    .lt("delete_at", now)
+    .limit(100);
+
+  if (qErr) return json({ ok: false, error: qErr.message }, 500);
+
+  const rows = jobs || [];
   let cleaned = 0;
-  const errors: any[] = [];
+  const errors: Array<{ jobId: string; error: string }> = [];
 
-  for (const job of jobs || []) {
-    const inputPath = job.input_path || null;
-    const outPath = job.zip_path || job.output_zip_path || null;
+  for (const job of rows) {
+    const jobId = String(job.id);
 
-    const inPrefix =
-      inputPath && inputPath.includes("/")
-        ? dirname(inputPath)
-        : `${job.user_id}/${job.id}`;
-    const outPrefix =
-      outPath && outPath.includes("/")
-        ? dirname(outPath)
-        : `${job.user_id}/${job.id}`;
+    // ✅ Input key canonical: DB-д input_path байвал тэрийг, үгүй бол fallback "<jobId>/input.pdf"
+    const inputKey =
+      cleanKey(job.input_path) || `${jobId}/input.pdf`;
 
-    let errs: string[] = [];
+    // ✅ Output key: output_zip_path || zip_path (байхгүй байж болно)
+    const outKey =
+      cleanKey(job.output_zip_path) || cleanKey(job.zip_path);
 
-    const rIn = await removeByPrefix(BUCKET_IN, inPrefix);
-    if (!rIn.ok) errs.push(`IN(prefix): ${rIn.error}`);
+    const stepErrors: string[] = [];
 
-    const rOut = await removeByPrefix(BUCKET_OUT, outPrefix);
-    if (!rOut.ok) errs.push(`OUT(prefix): ${rOut.error}`);
+    // 1) delete input
+    try {
+      await removeSingle(BUCKET_IN, inputKey);
+    } catch (e: any) {
+      stepErrors.push(`IN delete failed: ${String(e?.message || e)}`);
+    }
 
-    if (errs.length > 0) {
-      if (inputPath) {
-        const r = await removeSingle(BUCKET_IN, inputPath);
-        if (!r.ok) errs.push(`IN(single): ${r.error}`);
-      }
-      if (outPath) {
-        const r = await removeSingle(BUCKET_OUT, outPath);
-        if (!r.ok) errs.push(`OUT(single): ${r.error}`);
+    // 2) delete output
+    if (outKey) {
+      try {
+        await removeSingle(BUCKET_OUT, outKey);
+      } catch (e: any) {
+        stepErrors.push(`OUT delete failed: ${String(e?.message || e)}`);
       }
     }
 
-    if (errs.length === 0) {
-      const { error: u } = await supabase
+    // 3) mark cleaned (status үл хамаарна)
+    if (stepErrors.length === 0) {
+      const { error: uErr } = await supabase
         .from("jobs")
         .update({
           status: "CLEANED",
-          cleaned_at: new Date().toISOString(),
+          stage: "CLEANUP",
+          cleaned_at: now,
+          updated_at: now,
         })
-        .eq("id", job.id);
+        .eq("id", jobId);
 
-      if (!u) cleaned++;
-      else errors.push({ jobId: job.id, error: u.message });
+      if (uErr) {
+        errors.push({ jobId, error: `DB update failed: ${uErr.message}` });
+      } else {
+        cleaned++;
+      }
     } else {
-      errors.push({ jobId: job.id, error: errs.join(" | ") });
+      errors.push({ jobId, error: stepErrors.join(" | ") });
     }
   }
 
-  return new Response(
-    JSON.stringify({ ok: true, cleaned, errors }),
-    { headers: { "content-type": "application/json" } }
-  );
+  return json({ ok: true, cleaned, errors }, 200);
 });
