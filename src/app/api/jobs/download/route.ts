@@ -14,6 +14,9 @@ function json(ok: boolean, data?: any, error?: string, status = 200) {
   );
 }
 
+// 🔒 LOCKED TTL (privacy-first)
+const LOCKED_TTL_MINUTES = 10;
+
 // ---- R2 ----
 const R2_ENDPOINT = process.env.R2_ENDPOINT!;
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID!;
@@ -37,6 +40,12 @@ const r2 = new S3Client({
   forcePathStyle: true,
 });
 
+function parseIsoMs(v: any): number | null {
+  if (!v) return null;
+  const t = Date.parse(String(v));
+  return Number.isFinite(t) ? t : null;
+}
+
 export async function GET(req: Request) {
   try {
     const { searchParams } = new URL(req.url);
@@ -45,9 +54,10 @@ export async function GET(req: Request) {
 
     if (!jobId) return json(false, null, "Missing jobId", 400);
 
+    // ✅ canonical fields: delete_at + cleaned_at
     const { data: job, error } = await supabaseAdmin
       .from("jobs")
-      .select("status, output_zip_path, expires_at, cleaned_at")
+      .select("id,status,output_zip_path,zip_path,delete_at,cleaned_at")
       .eq("id", jobId)
       .maybeSingle();
 
@@ -62,26 +72,59 @@ export async function GET(req: Request) {
     if (job.cleaned_at) {
       return json(
         false,
-        debug
-          ? { reason: "cleaned_at", cleaned_at: job.cleaned_at }
-          : null,
+        debug ? { reason: "cleaned_at", cleaned_at: job.cleaned_at } : null,
         "Expired (cleaned)",
         410
       );
     }
 
-    if (job.expires_at && Date.now() > Date.parse(job.expires_at)) {
+    // ✅ Download дарсан мөчөөс countdown эхэлнэ:
+    // delete_at = now + 10min (set/refresh)
+    const newDeleteAtIso = new Date(
+      Date.now() + LOCKED_TTL_MINUTES * 60_000
+    ).toISOString();
+
+    const { data: upd, error: uErr } = await supabaseAdmin
+      .from("jobs")
+      .update({
+        ttl_minutes: LOCKED_TTL_MINUTES,
+        delete_at: newDeleteAtIso,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", jobId)
+      .select("delete_at")
+      .maybeSingle();
+
+    if (uErr) {
+      return json(
+        false,
+        debug ? { reason: "delete_at_update_failed", error: uErr.message } : null,
+        "Failed to schedule cleanup",
+        500
+      );
+    }
+
+    // Update хийсний дараах delete_at-г canonical гэж үзнэ
+    const effectiveDeleteAt = upd?.delete_at || newDeleteAtIso;
+
+    // Хэрвээ ямар нэг шалтгаанаар delete_at аль хэдийн өнгөрсөн бол блоклоно
+    const deleteAtMs = parseIsoMs(effectiveDeleteAt);
+    if (deleteAtMs && Date.now() > deleteAtMs) {
       return json(
         false,
         debug
-          ? { reason: "expires_at", expires_at: job.expires_at, now: new Date().toISOString() }
+          ? {
+              reason: "delete_at_passed",
+              delete_at: effectiveDeleteAt,
+              now: new Date().toISOString(),
+            }
           : null,
         "Expired",
         410
       );
     }
 
-    const outKey = (job.output_zip_path || "").trim();
+    const outKey = String(job.output_zip_path || job.zip_path || "").trim();
     if (!outKey) {
       return json(
         false,
@@ -97,13 +140,12 @@ export async function GET(req: Request) {
       new GetObjectCommand({
         Bucket: R2_BUCKET_OUT,
         Key: outKey,
-        // Энэ header-ийг R2 талаас өгч болно, гэхдээ бид доор өөрсдөө attachment header тавина
         ResponseContentDisposition: `attachment; filename="goodpdf-${jobId}.zip"`,
       }),
-      { expiresIn: 60 * 10 }
+      { expiresIn: 60 * LOCKED_TTL_MINUTES }
     );
 
-    // 2) Redirect хийхгүй — server-ээр дамжуулж stream хийнэ (хоосон ZIP асуудлыг шийднэ)
+    // 2) Redirect хийхгүй — server-ээр дамжуулж stream хийнэ
     const r = await fetch(signedUrl);
 
     if (!r.ok || !r.body) {
@@ -115,13 +157,14 @@ export async function GET(req: Request) {
       );
     }
 
-    // Content-Length байвал авч дамжуулна (зарим үед хэрэгтэй)
     const contentLength = r.headers.get("content-length");
 
     const headers: Record<string, string> = {
       "Content-Type": "application/zip",
       "Content-Disposition": `attachment; filename="goodpdf-${jobId}.zip"`,
       "Cache-Control": "no-store",
+      // debug/ops-д хэрэгтэй: хэрэглэгчийн талд харагдахгүй ч network дээр харагдана
+      "x-goodpdf-delete-at": String(effectiveDeleteAt),
     };
     if (contentLength) headers["Content-Length"] = contentLength;
 
