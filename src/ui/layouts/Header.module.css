@@ -1,0 +1,47 @@
+
+.header{
+  padding: 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--card);
+}
+.inner{
+  max-width: 980px;
+  margin: 0 auto;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap: 12px;
+}
+.left{
+  display:flex;
+  align-items:center;
+  gap: 14px;
+  min-width:0;
+}
+.logo{
+  font-weight: 900;
+  letter-spacing: .2px;
+  white-space: nowrap;
+}
+.logoDim{ opacity: .8; }
+.logoTld{ opacity: .55; font-weight: 800; }
+.right{
+  display:flex;
+  align-items:center;
+  gap: 10px;
+}
+.pill{
+  display:inline-flex;
+  align-items:center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  font-size: 12px;
+  font-weight: 800;
+}
+.muted{
+  opacity: .75;
+  font-weight: 650;
+}

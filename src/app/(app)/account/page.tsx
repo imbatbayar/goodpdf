@@ -1,2 +1,5 @@
-import { AccountScreen } from "@/components/screens/AccountScreen";
-export default function Page(){ return <AccountScreen/> }
+import { AccountPage } from "@/ui/pages/AccountPage";
+
+export default function Page() {
+  return <AccountPage />;
+}

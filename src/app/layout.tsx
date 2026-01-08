@@ -1,4 +1,7 @@
 import "@/app/globals.css";
+import "@/ui/styles/tailwind.css";
+
+import "@/app/globals.css";
 import { AppShell } from "@/components/layouts/AppShell";
 
 export const metadata = {
