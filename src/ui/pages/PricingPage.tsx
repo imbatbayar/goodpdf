@@ -3,41 +3,69 @@
 import Link from "next/link";
 import { useCountry } from "@/ui/state/country";
 
-function PlanCard({
-  title,
-  price,
-  note,
-  bullets,
-  cta,
-}: {
-  title: string;
+type Plan = {
+  key: "starter" | "plus" | "pro";
+  name: string;
   price: string;
-  note: string;
-  bullets: string[];
-  cta: string;
+  tagline: string;
+  credits: string;
+  features: string[];
+  popular?: boolean;
+};
+
+const MN_PLANS: Plan[] = [
+  {
+    key: "starter",
+    name: "Starter",
+    price: "₮9,900",
+    tagline: "For light usage",
+    credits: "10 credits",
+    features: ["Max 500MB per split (placeholder)", "Standard queue (later)"],
+  },
+  {
+    key: "plus",
+    name: "Plus",
+    price: "₮24,900",
+    tagline: "Best value for most users",
+    credits: "25 credits",
+    features: ["Higher limits (later)", "Faster processing (later)"],
+    popular: true,
+  },
+  {
+    key: "pro",
+    name: "Pro",
+    price: "₮79,900",
+    tagline: "For teams & power users",
+    credits: "100 credits",
+    features: ["Best limits (later)", "Support (later)"],
+  },
+];
+
+function CheckItem({ children }: { children: React.ReactNode }) {
+  return (
+    <li className="flex gap-2 text-sm text-zinc-700">
+      <span className="mt-[2px] inline-flex h-5 w-5 items-center justify-center rounded-full bg-emerald-50 text-emerald-700">
+        ✓
+      </span>
+      <span className="leading-6">{children}</span>
+    </li>
+  );
+}
+
+function OutlineButton({
+  children,
+  href,
+}: {
+  children: React.ReactNode;
+  href: string;
 }) {
   return (
-    <div className="rounded-2xl border bg-[var(--card)] p-5 space-y-4">
-      <div>
-        <div className="text-sm opacity-75 font-bold">{title}</div>
-        <div className="text-3xl font-extrabold leading-tight">{price}</div>
-        <div className="text-xs opacity-70 mt-1">{note}</div>
-      </div>
-      <ul className="text-sm space-y-2">
-        {bullets.map((b) => (
-          <li key={b} className="flex gap-2">
-            <span aria-hidden>✓</span>
-            <span className="opacity-90">{b}</span>
-          </li>
-        ))}
-      </ul>
-      <button
-        className="w-full rounded-xl border px-4 py-2 font-extrabold hover:opacity-90"
-        onClick={() => alert("Demo only — payment will be wired in PHASE E")}
-      >
-        {cta}
-      </button>
-    </div>
+    <Link
+      href={href}
+      className="inline-flex items-center justify-center rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm font-semibold text-zinc-900 shadow-sm hover:bg-zinc-50"
+    >
+      {children}
+    </Link>
   );
 }
 
@@ -45,66 +73,170 @@ export function PricingPage() {
   const country = useCountry();
   const isMN = country === "Mongolia";
 
+  const paymentTitle = isMN ? "QPay (TEST)" : "Card (TEST)";
+  const paymentDesc = isMN
+    ? "Монгол хэрэглэгчдэд зориулав."
+    : "International cards (placeholder).";
+
+  const privacyText = isMN
+    ? "Files are deleted automatically after Confirm + TTL."
+    : "Files are deleted automatically after Confirm + TTL.";
+
+  const plans = MN_PLANS;
+
   return (
-    <div className="space-y-6">
-      <div className="space-y-2">
-        <h1 className="text-2xl font-extrabold">Pricing</h1>
-        <p className="text-sm opacity-80">
-          UI-only (demo). Country: <b>{country}</b> — change in{" "}
-          <Link className="underline" href="/account">
-            Account
-          </Link>
-          .
-        </p>
-      </div>
-
-      <div className="rounded-2xl border bg-[var(--card)] p-5 space-y-3">
-        <div className="font-extrabold">Payment method</div>
-        {isMN ? (
-          <div className="text-sm leading-6 opacity-85">
-            <div>
-              <b>QPay (TEST)</b> — Монгол хэрэглэгчдэд.
-            </div>
-            <div>Privacy: файлууд Confirm хийснээс хойш TTL хугацаанд автоматаар устна.</div>
+    <div className="mx-auto w-full max-w-6xl px-4 py-10">
+      {/* Top header */}
+      <div className="mb-8 flex flex-col gap-3">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+          <div>
+            <h1 className="text-4xl font-semibold tracking-tight text-zinc-900">
+              Pricing
+            </h1>
+            <p className="mt-2 text-sm text-zinc-600">
+              UI-only demo. Billing will be enabled in Phase E.
+            </p>
           </div>
-        ) : (
-          <div className="text-sm leading-6 opacity-85">
-            <div>
-              <b>Card (TEST)</b> — International users.
+
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="inline-flex items-center rounded-full bg-zinc-100 px-3 py-1 text-sm text-zinc-800">
+              Country: <span className="ml-2 font-semibold">{country}</span>
+            </span>
+            <OutlineButton href="/account">View account</OutlineButton>
+          </div>
+        </div>
+      </div>
+
+      {/* Payment banner (trust style) */}
+      <div className="mb-8 overflow-hidden rounded-2xl border border-zinc-200 bg-white shadow-sm">
+        <div className="flex flex-col gap-4 p-6 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-start gap-3">
+            <div className="inline-flex h-11 w-11 items-center justify-center rounded-xl bg-zinc-900 text-white shadow-sm">
+              $
             </div>
             <div>
-              Privacy: files are auto-deleted after Confirm (TTL policy).
+              <div className="flex flex-wrap items-center gap-2">
+                <p className="text-sm font-semibold text-zinc-900">
+                  Payment method
+                </p>
+                <span className="inline-flex items-center rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700">
+                  {paymentTitle}
+                </span>
+              </div>
+              <p className="mt-1 text-sm text-zinc-600">{paymentDesc}</p>
+              <p className="mt-1 text-xs text-zinc-500">{privacyText}</p>
             </div>
           </div>
-        )}
+
+          <div className="rounded-xl border border-zinc-200 bg-zinc-50 px-4 py-3 text-xs text-zinc-600">
+            <div className="font-semibold text-zinc-900">Note</div>
+            webhook + credits grant нь Phase E дээр орно.
+          </div>
+        </div>
+
+        <div className="h-px bg-zinc-200" />
+
+        <div className="flex flex-col gap-2 px-6 py-4 text-xs text-zinc-500 sm:flex-row sm:items-center sm:justify-between">
+          <span>Free: 3 uses • max 100MB</span>
+          <span>Paid: credits • higher limits (soon)</span>
+        </div>
       </div>
 
-      <div className="grid gap-4 md:grid-cols-3">
-        <PlanCard
-          title="Starter"
-          price={isMN ? "₮9,900" : "$4.99"}
-          note="Demo price"
-          bullets={["10 credits", "Max 500MB per split (placeholder)", "Priority queue (later)"]}
-          cta={isMN ? "Pay with QPay" : "Pay with Card"}
-        />
-        <PlanCard
-          title="Plus"
-          price={isMN ? "₮24,900" : "$9.99"}
-          note="Demo price"
-          bullets={["25 credits", "Higher limits (later)", "Faster processing (later)"]}
-          cta={isMN ? "Pay with QPay" : "Pay with Card"}
-        />
-        <PlanCard
-          title="Pro"
-          price={isMN ? "₮79,900" : "$29.99"}
-          note="Demo price"
-          bullets={["100 credits", "Best limits (later)", "Support (later)"]}
-          cta={isMN ? "Pay with QPay" : "Pay with Card"}
-        />
+      {/* Plans */}
+      <div className="grid gap-5 md:grid-cols-3">
+        {plans.map((p) => {
+          const popular = !!p.popular;
+
+          return (
+            <div
+              key={p.key}
+              className={[
+                "relative rounded-2xl border bg-white p-6 shadow-sm",
+                popular
+                  ? "border-zinc-900 shadow-md ring-1 ring-zinc-900/10"
+                  : "border-zinc-200",
+              ].join(" ")}
+            >
+              {/* subtle gradient for popular */}
+              {popular ? (
+                <div className="pointer-events-none absolute inset-0 rounded-2xl bg-gradient-to-b from-zinc-50 to-white" />
+              ) : null}
+
+              <div className="relative">
+                <div className="mb-5 flex items-start justify-between gap-3">
+                  <div>
+                    <p className="text-lg font-semibold text-zinc-900">
+                      {p.name}
+                    </p>
+                    <p className="mt-1 text-sm text-zinc-600">{p.tagline}</p>
+                  </div>
+
+                  {popular ? (
+                    <span className="inline-flex items-center rounded-full bg-zinc-900 px-3 py-1 text-xs font-semibold text-white">
+                      Most popular
+                    </span>
+                  ) : null}
+                </div>
+
+                <div className="mb-5">
+                  <div className="flex items-end gap-2">
+                    <div className="text-4xl font-semibold tracking-tight text-zinc-900">
+                      {p.price}
+                    </div>
+                  </div>
+                  <div className="mt-1 text-sm text-zinc-600">
+                    <span className="font-semibold text-zinc-900">
+                      {p.credits}
+                    </span>{" "}
+                    per purchase
+                  </div>
+                </div>
+
+                <ul className="mb-6 space-y-2">
+                  <CheckItem>{p.credits}</CheckItem>
+                  {p.features.map((f) => (
+                    <CheckItem key={f}>{f}</CheckItem>
+                  ))}
+                </ul>
+
+                <button
+                  className={[
+                    "w-full rounded-xl px-4 py-3 text-sm font-semibold transition shadow-sm",
+                    popular
+                      ? "bg-zinc-900 text-white hover:bg-zinc-800"
+                      : "bg-zinc-100 text-zinc-900 hover:bg-zinc-200",
+                  ].join(" ")}
+                  onClick={() => alert(`Demo: ${p.name} → ${paymentTitle}`)}
+                >
+                  {isMN ? "Pay with QPay" : "Pay with Card"}
+                </button>
+
+                <div className="mt-3 flex items-center justify-between text-xs text-zinc-500">
+                  <span>
+                    {isMN
+                      ? "QPay key орж ирэхээр webhook холбоно."
+                      : "Card provider (later)."}
+                  </span>
+                  <Link
+                    href="/usage"
+                    className="font-semibold text-zinc-900 underline underline-offset-4 hover:text-zinc-700"
+                  >
+                    See usage
+                  </Link>
+                </div>
+              </div>
+            </div>
+          );
+        })}
       </div>
 
-      <div className="text-xs opacity-70 leading-5">
-        Note: Энэ бол зөвхөн UI. Төлбөр баталгаажуулалт (webhook) + credits grant нь PHASE E дээр орно.
+      {/* Footer note */}
+      <div className="mt-10 rounded-2xl border border-zinc-200 bg-white p-6 text-sm text-zinc-600 shadow-sm">
+        <div className="font-semibold text-zinc-900">What happens next?</div>
+        <div className="mt-2 leading-6">
+          Phase D дээр free uses бодитоор хасагдана. Phase E дээр payment webhook
+          + credits grant орж ирнэ.
+        </div>
       </div>
     </div>
   );

@@ -6,11 +6,13 @@ import { Button } from "@/components/ui/Button";
 import styles from "./Header.module.css";
 import { Tooltip } from "@/ui/primitives/Tooltip";
 import { Drawer } from "@/ui/layouts/Drawer";
-import { useCountry } from "@/ui/state/country";
+import { useCountry, isCountryLocked } from "@/ui/state/country";
 
 export function Header() {
   const [open, setOpen] = useState(false);
   const country = useCountry();
+
+  const locked = typeof window !== "undefined" ? isCountryLocked() : false;
 
   return (
     <header className={styles.header}>
@@ -48,14 +50,7 @@ export function Header() {
           <button
             onClick={() => setOpen(true)}
             aria-label="Menu"
-            style={{
-              border: "1px solid var(--border)",
-              background: "transparent",
-              borderRadius: 12,
-              padding: "8px 12px",
-              fontWeight: 900,
-              cursor: "pointer",
-            }}
+            className={styles.menuBtn}
           >
             ☰
           </button>
@@ -73,10 +68,16 @@ export function Header() {
               { label: "Logout", disabled: true },
             ]}
             footer={
-              <div style={{ fontSize: 12, opacity: 0.85, lineHeight: 1.35 }}>
+              <div className={styles.drawerFooter}>
                 Country: <b>{country}</b>
                 <br />
-                Change country in <b>Account</b>.
+                {locked ? (
+                  <span>Locked on this device.</span>
+                ) : (
+                  <span>
+                    Choose once in <b>Account</b>.
+                  </span>
+                )}
               </div>
             }
           />

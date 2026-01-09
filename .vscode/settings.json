@@ -1,7 +1,5 @@
 {
-  "deno.enablePaths": [
-    "supabase/functions"
-  ],
+  "deno.enablePaths": ["supabase/functions"],
   "deno.lint": true,
   "deno.unstable": [
     "bare-node-builtins",
@@ -18,7 +16,21 @@
     "http",
     "net"
   ],
+  "css.validate": false,
+  "scss.validate": false,
+  "less.validate": false,
+  "editor.quickSuggestions": {
+    "strings": true
+  },
+  "tailwindCSS.emmetCompletions": true,
+  "tailwindCSS.experimental.classRegex": [
+    ["className\\s*=\\s*\"([^\"]*)\"", "([a-zA-Z0-9:_\\-\\s\\[\\]\\/\\.]+)"],
+    ["className\\s*=\\s*\\{`([^`]*)`\\}", "([a-zA-Z0-9:_\\-\\s\\[\\]\\/\\.]+)"]
+  ],
   "[typescript]": {
+    "editor.defaultFormatter": "denoland.vscode-deno"
+  },
+  "[typescriptreact]": {
     "editor.defaultFormatter": "denoland.vscode-deno"
   }
 }
