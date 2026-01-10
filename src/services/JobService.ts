@@ -224,6 +224,12 @@ export class JobService {
    * Дараагийн алхамд download gating-ийг өөр аргаар шийднэ.
    */
   static downloadUrl(jobId: string) {
-    return `/api/jobs/download?jobId=${encodeURIComponent(jobId)}`;
-  }
+  let tok = "";
+  try {
+    tok = localStorage.getItem("goodpdf_last_owner_token") || "";
+  } catch {}
+  const base = `/api/jobs/download?jobId=${encodeURIComponent(jobId)}`;
+  return tok ? `${base}&ot=${encodeURIComponent(tok)}` : base;
+}
+
 }
