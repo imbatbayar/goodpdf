@@ -59,6 +59,10 @@ function json(body: any, status = 200) {
   });
 }
 
+function normStatus(s: any): string {
+  return String(s || "").trim().toUpperCase();
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") return json({ ok: true }, 200);
   if (req.method !== "POST") return json({ ok: false, error: "Method not allowed" }, 405);
@@ -70,6 +74,7 @@ serve(async (req) => {
   const now = nowIso();
 
   // ✅ delete_at хүрмэгц (DONE эсэхээс үл хамааран) цэвэрлэнэ
+  // ⚠️ cleaned_at=null, delete_at < now
   const { data: jobs, error: qErr } = await supabase
     .from("jobs")
     .select("id,status,input_path,zip_path,output_zip_path,delete_at,cleaned_at")
@@ -82,18 +87,56 @@ serve(async (req) => {
 
   const rows = jobs || [];
   let cleaned = 0;
+  let skippedActive = 0;
+  let lockedByOthers = 0;
+
   const errors: Array<{ jobId: string; error: string }> = [];
 
   for (const job of rows) {
     const jobId = String(job.id);
+    const st = normStatus(job.status);
+
+    // 🛡️ SAFETY #1: Ажиллаж байгаа job-уудыг ХЭЗЭЭ Ч устгахгүй
+    // (race condition: cleanup яг дунд нь таарвал job үхэж болно)
+    if (st === "PROCESSING" || st === "QUEUED" || st === "UPLOADING") {
+      skippedActive++;
+      continue;
+    }
 
     // ✅ Input key canonical: DB-д input_path байвал тэрийг, үгүй бол fallback "<jobId>/input.pdf"
-    const inputKey =
-      cleanKey(job.input_path) || `${jobId}/input.pdf`;
+    const inputKey = cleanKey(job.input_path) || `${jobId}/input.pdf`;
 
     // ✅ Output key: output_zip_path || zip_path (байхгүй байж болно)
-    const outKey =
-      cleanKey(job.output_zip_path) || cleanKey(job.zip_path);
+    const outKey = cleanKey(job.output_zip_path) || cleanKey(job.zip_path);
+
+    // 🛡️ SAFETY #2: Soft-lock (idempotency хамгаалалт)
+    // - Энэ function давхар trigger болоход нэг job-ийг 2 удаа устгах гэж зодолдохоос сэргийлнэ
+    // - Зөвхөн lock авсан процесс нь storage delete + cleaned_at update хийнэ
+    const { data: lockRow, error: lockErr } = await supabase
+      .from("jobs")
+      .update({
+        status: "CLEANING",
+        stage: "CLEANUP",
+        updated_at: now,
+      })
+      .eq("id", jobId)
+      .is("cleaned_at", null)
+      .not("delete_at", "is", null)
+      .lt("delete_at", now)
+      // processing/queued байвал lock хийхгүй (DB дээр хамгаалалт)
+      .not("status", "in", "(PROCESSING,QUEUED,UPLOADING)")
+      .select("id")
+      .maybeSingle();
+
+    if (lockErr) {
+      errors.push({ jobId, error: `DB lock failed: ${lockErr.message}` });
+      continue;
+    }
+    if (!lockRow?.id) {
+      // өөр процесс lock авсан эсвэл status/delete_at өөрчлөгдсөн
+      lockedByOthers++;
+      continue;
+    }
 
     const stepErrors: string[] = [];
 
@@ -113,7 +156,7 @@ serve(async (req) => {
       }
     }
 
-    // 3) mark cleaned (status үл хамаарна)
+    // 3) mark cleaned
     if (stepErrors.length === 0) {
       const { error: uErr } = await supabase
         .from("jobs")
@@ -131,9 +174,35 @@ serve(async (req) => {
         cleaned++;
       }
     } else {
-      errors.push({ jobId, error: stepErrors.join(" | ") });
+      // Хэрвээ storage delete дээр алдаа гарвал job дээр тэмдэглээд үлдээнэ.
+      // Дараагийн cleanup дээр дахин оролдох боломжтой.
+      const msg = stepErrors.join(" | ");
+      const { error: uErr } = await supabase
+        .from("jobs")
+        .update({
+          status: "FAILED",
+          stage: "CLEANUP",
+          error_text: msg,
+          updated_at: now,
+        })
+        .eq("id", jobId);
+
+      if (uErr) {
+        errors.push({ jobId, error: `Cleanup failed: ${msg} | DB mark failed: ${uErr.message}` });
+      } else {
+        errors.push({ jobId, error: `Cleanup failed: ${msg}` });
+      }
     }
   }
 
-  return json({ ok: true, cleaned, errors }, 200);
+  return json(
+    {
+      ok: true,
+      cleaned,
+      skippedActive,
+      lockedByOthers,
+      errors,
+    },
+    200
+  );
 });

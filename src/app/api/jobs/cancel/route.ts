@@ -13,7 +13,6 @@ function json(ok: boolean, data?: any, error?: string, status = 200) {
   );
 }
 
-// ---- Supabase (ADMIN) ----
 // ---- R2 ----
 const R2_ENDPOINT = process.env.R2_ENDPOINT!;
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID!;
@@ -35,8 +34,15 @@ const r2 = new S3Client({
   forcePathStyle: true,
 });
 
+function cleanKey(k: any): string | null {
+  if (!k) return null;
+  const s = String(k).trim();
+  if (!s) return null;
+  return s.replace(/^\/+/, "");
+}
+
 async function r2DeleteMany(bucket: string, keys: (string | null | undefined)[]) {
-  const unique = [...new Set(keys.filter(Boolean) as string[])];
+  const unique = [...new Set(keys.map(cleanKey).filter(Boolean) as string[])];
   if (unique.length === 0) return;
 
   await r2.send(
@@ -50,17 +56,24 @@ async function r2DeleteMany(bucket: string, keys: (string | null | undefined)[])
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({} as any));
-    const jobId = String(body.jobId || "");
+    const jobId = String(body.jobId || "").trim();
     if (!jobId) return json(false, null, "Missing jobId", 400);
+
+    // ✅ SECURITY GATE: require owner token
+    const ownerToken = (req.headers.get("x-owner-token") || "").trim();
+    if (!ownerToken) return json(false, null, "Forbidden", 403);
 
     const { data: job, error } = await supabaseAdmin
       .from("jobs")
       .select("status,input_path,output_zip_path,cleaned_at")
       .eq("id", jobId)
+      .eq("owner_token", ownerToken)
       .maybeSingle();
 
     if (error) return json(false, null, error.message, 500);
-    if (!job) return json(false, null, "Job not found", 404);
+
+    // ✅ Do NOT reveal existence if token mismatch
+    if (!job) return json(false, null, "Forbidden", 403);
 
     // idempotent
     if (job.cleaned_at || String(job.status).toUpperCase() === "CLEANED") {
@@ -68,8 +81,8 @@ export async function POST(req: Request) {
     }
 
     // Best-effort R2 cleanup
-    const inputKey = job.input_path || `${jobId}/input.pdf`;
-    const outKey = job.output_zip_path || null;
+    const inputKey = cleanKey(job.input_path) || `${jobId}/input.pdf`;
+    const outKey = cleanKey(job.output_zip_path);
 
     await r2DeleteMany(R2_BUCKET_IN, [inputKey]);
     if (outKey) await r2DeleteMany(R2_BUCKET_OUT, [outKey]);
@@ -84,7 +97,8 @@ export async function POST(req: Request) {
         input_path: null,
         output_zip_path: null,
       })
-      .eq("id", jobId);
+      .eq("id", jobId)
+      .eq("owner_token", ownerToken);
 
     if (u2) return json(false, null, u2.message, 500);
 

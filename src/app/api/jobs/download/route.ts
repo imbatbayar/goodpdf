@@ -21,13 +21,10 @@ const LOCKED_TTL_MINUTES = 10;
 const R2_ENDPOINT = process.env.R2_ENDPOINT!;
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID!;
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY!;
-const R2_BUCKET_OUT =
-  process.env.R2_BUCKET_OUT || process.env.R2_BUCKET || "goodpdf-out";
+const R2_BUCKET_OUT = process.env.R2_BUCKET_OUT || process.env.R2_BUCKET || "goodpdf-out";
 
 if (!R2_ENDPOINT || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY) {
-  throw new Error(
-    "Missing R2_ENDPOINT / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY"
-  );
+  throw new Error("Missing R2_ENDPOINT / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY");
 }
 
 const r2 = new S3Client({
@@ -46,6 +43,13 @@ function parseIsoMs(v: any): number | null {
   return Number.isFinite(t) ? t : null;
 }
 
+function cleanKey(k: any): string | null {
+  if (!k) return null;
+  const s = String(k).trim();
+  if (!s) return null;
+  return s.replace(/^\/+/, "");
+}
+
 export async function GET(req: Request) {
   try {
     const { searchParams } = new URL(req.url);
@@ -54,21 +58,33 @@ export async function GET(req: Request) {
 
     if (!jobId) return json(false, null, "Missing jobId", 400);
 
-    // ✅ canonical fields: delete_at + cleaned_at
+    // ✅ SECURITY GATE:
+    // - Header (fetch) OR query param (link click) аль нэгээр token авна
+    const ownerToken =
+      (req.headers.get("x-owner-token") || "").trim() ||
+      (searchParams.get("ot") || "").trim();
+
+    if (!ownerToken) return json(false, null, "Forbidden", 403);
+
+    // ✅ Owner match — token зөрвөл job “байгаа/байхгүй”-г задруулахгүй
     const { data: job, error } = await supabaseAdmin
       .from("jobs")
       .select("id,status,output_zip_path,zip_path,delete_at,cleaned_at")
       .eq("id", jobId)
+      .eq("owner_token", ownerToken)
       .maybeSingle();
 
     if (error) return json(false, null, error.message, 500);
-    if (!job) return json(false, null, "Job not found", 404);
+    if (!job) return json(false, null, "Forbidden", 403);
 
     const status = String(job.status || "").toUpperCase();
+
+    // Only DONE is downloadable
     if (status !== "DONE") {
       return json(false, null, `Not downloadable (status=${status})`, 409);
     }
 
+    // Already cleaned
     if (job.cleaned_at) {
       return json(
         false,
@@ -78,11 +94,8 @@ export async function GET(req: Request) {
       );
     }
 
-    // ✅ Download дарсан мөчөөс countdown эхэлнэ:
-    // delete_at = now + 10min (set/refresh)
-    const newDeleteAtIso = new Date(
-      Date.now() + LOCKED_TTL_MINUTES * 60_000
-    ).toISOString();
+    // ✅ Download дарсан мөчөөс countdown эхэлнэ: delete_at = now + 10min
+    const newDeleteAtIso = new Date(Date.now() + LOCKED_TTL_MINUTES * 60_000).toISOString();
 
     const { data: upd, error: uErr } = await supabaseAdmin
       .from("jobs")
@@ -92,6 +105,7 @@ export async function GET(req: Request) {
         updated_at: new Date().toISOString(),
       })
       .eq("id", jobId)
+      .eq("owner_token", ownerToken) // ✅ extra safety
       .select("delete_at")
       .maybeSingle();
 
@@ -104,27 +118,21 @@ export async function GET(req: Request) {
       );
     }
 
-    // Update хийсний дараах delete_at-г canonical гэж үзнэ
     const effectiveDeleteAt = upd?.delete_at || newDeleteAtIso;
 
-    // Хэрвээ ямар нэг шалтгаанаар delete_at аль хэдийн өнгөрсөн бол блоклоно
     const deleteAtMs = parseIsoMs(effectiveDeleteAt);
     if (deleteAtMs && Date.now() > deleteAtMs) {
       return json(
         false,
         debug
-          ? {
-              reason: "delete_at_passed",
-              delete_at: effectiveDeleteAt,
-              now: new Date().toISOString(),
-            }
+          ? { reason: "delete_at_passed", delete_at: effectiveDeleteAt, now: new Date().toISOString() }
           : null,
         "Expired",
         410
       );
     }
 
-    const outKey = String(job.output_zip_path || job.zip_path || "").trim();
+    const outKey = cleanKey(job.output_zip_path) || cleanKey(job.zip_path);
     if (!outKey) {
       return json(
         false,
@@ -145,7 +153,7 @@ export async function GET(req: Request) {
       { expiresIn: 60 * LOCKED_TTL_MINUTES }
     );
 
-    // 2) Redirect хийхгүй — server-ээр дамжуулж stream хийнэ
+    // 2) Stream via server
     const r = await fetch(signedUrl);
 
     if (!r.ok || !r.body) {
@@ -163,7 +171,7 @@ export async function GET(req: Request) {
       "Content-Type": "application/zip",
       "Content-Disposition": `attachment; filename="goodpdf-${jobId}.zip"`,
       "Cache-Control": "no-store",
-      // debug/ops-д хэрэгтэй: хэрэглэгчийн талд харагдахгүй ч network дээр харагдана
+      // ops/debug: network дээр харагдана
       "x-goodpdf-delete-at": String(effectiveDeleteAt),
     };
     if (contentLength) headers["Content-Length"] = contentLength;

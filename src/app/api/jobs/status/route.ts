@@ -24,14 +24,22 @@ export async function GET(req: Request) {
     const jobId = searchParams.get("jobId");
     if (!jobId) return res(false, null, "Missing jobId", 400);
 
+    // ✅ SECURITY GATE: require owner token
+    const ownerToken = (req.headers.get("x-owner-token") || "").trim();
+    if (!ownerToken) return res(false, null, "Forbidden", 403);
+
+    // ✅ Only fetch if owner_token matches (prevents jobId guessing)
     const { data: job, error } = await supabaseAdmin
       .from("jobs")
       .select("*")
       .eq("id", jobId)
+      .eq("owner_token", ownerToken)
       .maybeSingle();
 
     if (error) return res(false, null, error.message, 500);
-    if (!job) return res(false, null, "Job not found", 404);
+
+    // ✅ Do NOT reveal existence if token mismatch
+    if (!job) return res(false, null, "Forbidden", 403);
 
     const status = String(job.status || "CREATED").toUpperCase();
     const stage = String(job.stage || "").toUpperCase();

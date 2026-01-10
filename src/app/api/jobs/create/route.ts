@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabase/admin";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import crypto from "node:crypto";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -11,7 +12,10 @@ export const revalidate = 0;
 const LOCKED_TTL_MINUTES = 10;
 
 function json(ok: boolean, data?: any, error?: string, status = 200) {
-  return NextResponse.json({ ok, data, error }, { status });
+  return NextResponse.json(
+    { ok, data, error },
+    { status, headers: { "cache-control": "no-store" } }
+  );
 }
 
 console.log("[R2 ENV CHECK]", {
@@ -63,6 +67,9 @@ export async function POST(req: Request) {
     const ttlMinutes = LOCKED_TTL_MINUTES;
     const deleteAtIso = new Date(Date.now() + ttlMinutes * 60_000).toISOString();
 
+    // ✅ owner_token: job-оо эзэмших баталгаа (дараагийн status/start/download/done дээр шалгана)
+    const ownerToken = crypto.randomUUID();
+
     const { data: jobRow, error: jobErr } = await supabaseAdmin
       .from("jobs")
       .insert({
@@ -74,6 +81,9 @@ export async function POST(req: Request) {
         file_size_bytes: fileSizeBytes,
         // schema constraint-д зориулсан fallback (Start дээр жинхэнэ утга орно)
         split_mb: body?.splitMb ?? null,
+
+        // ✅ security gate
+        owner_token: ownerToken,
 
         // 🔒 retention baseline
         ttl_minutes: ttlMinutes,
@@ -122,6 +132,8 @@ export async function POST(req: Request) {
     // -----------------------------
     return json(true, {
       jobId,
+      ownerToken, // ✅ NEW: client localStorage-д хадгална
+
       inputKey: key,
 
       // canonical

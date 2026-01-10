@@ -24,10 +24,13 @@ function parseSplitMb(v: any): { value: number | null; error: string | null } {
   if (n <= 0) return { value: null, error: "splitMb must be > 0." };
 
   // production-safe guard (хэт том утгаас хамгаална)
-  // Хэрвээ чиний UI өөр хүрээ ашигладаг бол энэ дээд хязгаар асуудалгүйгээр өөрчлөгдөнө.
   if (n > 500) return { value: null, error: "splitMb is too large (max 500MB per part)." };
 
   return { value: Math.round(n * 100) / 100, error: null };
+}
+
+function normStatus(s: any) {
+  return String(s || "").trim().toUpperCase();
 }
 
 export async function POST(req: Request) {
@@ -37,16 +40,46 @@ export async function POST(req: Request) {
     const jobId = String(body?.jobId || "").trim();
     if (!jobId) return json(false, null, "jobId is required.", 400);
 
+    // ✅ SECURITY GATE: require owner token
+    const ownerToken = (req.headers.get("x-owner-token") || "").trim();
+    if (!ownerToken) return json(false, null, "Forbidden", 403);
+
     const { value: splitMb, error: splitErr } = parseSplitMb(body?.splitMb);
     if (splitErr) return json(false, null, splitErr, 400);
 
-    // 🔒 Refresh retention window on start
+    // 1) Fetch job with owner check (do NOT leak existence)
+    const { data: job, error: gErr } = await supabaseAdmin
+      .from("jobs")
+      .select("id,status,split_mb,progress,stage,delete_at,ttl_minutes,cleaned_at")
+      .eq("id", jobId)
+      .eq("owner_token", ownerToken)
+      .maybeSingle();
+
+    if (gErr) return json(false, null, gErr.message, 500);
+    if (!job) return json(false, null, "Forbidden", 403);
+
+    const st = normStatus(job.status);
+
+    // 2) Idempotency: if already started (or finished), do NOT re-queue
+    if (st === "QUEUED" || st === "PROCESSING") {
+      return json(true, { job, alreadyStarted: true });
+    }
+    if (st === "DONE") {
+      return json(true, { job, alreadyStarted: true });
+    }
+    if (st === "FAILED" || st === "CLEANED") {
+      return json(false, null, `Job not startable (status=${st})`, 409);
+    }
+
+    // Only UPLOADED can start
+    if (st !== "UPLOADED") {
+      return json(false, null, `Job not startable (status=${st})`, 409);
+    }
+
+    // 🔒 Refresh retention window on start (10 minutes from now)
     const ttlMinutes = LOCKED_TTL_MINUTES;
     const deleteAtIso = new Date(Date.now() + ttlMinutes * 60_000).toISOString();
 
-    // NOTE: урсгал эвдэхгүй:
-    // - зөвхөн UPLOADED / QUEUED үед start зөвшөөрнө (хуучин логик)
-    // - splitMb null байж болно (хуучин split_mb-аа хэвээр үлдээнэ)
     const updatePayload: Record<string, any> = {
       status: "QUEUED",
       stage: "QUEUE",
@@ -57,24 +90,39 @@ export async function POST(req: Request) {
       delete_at: deleteAtIso,
       cleaned_at: null,
 
-      // optional timestamps (байхгүй column байсан ч асуудалгүй — доорх payload-оос аваад устгаж болно)
       updated_at: new Date().toISOString(),
     };
 
     if (splitMb !== null) updatePayload.split_mb = splitMb;
 
-    const { data, error } = await supabaseAdmin
+    // 3) Atomic-ish update: only if still UPLOADED and owner matches
+    const { data: updated, error: uErr } = await supabaseAdmin
       .from("jobs")
       .update(updatePayload)
       .eq("id", jobId)
-      .in("status", ["UPLOADED", "QUEUED"])
+      .eq("owner_token", ownerToken)
+      .eq("status", "UPLOADED")
       .select("id,status,split_mb,progress,stage,delete_at,ttl_minutes,cleaned_at")
       .maybeSingle();
 
-    if (error) return json(false, null, error.message, 500);
-    if (!data) return json(false, null, "Job not found or not startable.", 404);
+    if (uErr) return json(false, null, uErr.message, 500);
 
-    return json(true, { job: data });
+    // If someone else started it between GET and UPDATE, treat as already started (idempotent)
+    if (!updated) {
+      const { data: job2, error: rErr } = await supabaseAdmin
+        .from("jobs")
+        .select("id,status,split_mb,progress,stage,delete_at,ttl_minutes,cleaned_at")
+        .eq("id", jobId)
+        .eq("owner_token", ownerToken)
+        .maybeSingle();
+
+      if (rErr) return json(false, null, rErr.message, 500);
+      if (!job2) return json(false, null, "Forbidden", 403);
+
+      return json(true, { job: job2, alreadyStarted: true });
+    }
+
+    return json(true, { job: updated });
   } catch (e: any) {
     return json(false, null, e?.message || "Server error", 500);
   }

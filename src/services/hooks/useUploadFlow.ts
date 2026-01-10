@@ -7,6 +7,7 @@ import { JobService } from "@/services/JobService";
 // NOTE: MVP/demo user. Paid auth + quota enforcement will be added later.
 const DEV_USER_ID = "00000000-0000-0000-0000-000000000001";
 const LS_JOB_ID = "goodpdf_last_job_id";
+const LS_OWNER_TOKEN = "goodpdf_last_owner_token";
 
 type Phase = "IDLE" | "UPLOADING" | "UPLOADED" | "PROCESSING" | "READY" | "ERROR";
 
@@ -150,6 +151,9 @@ export function useUploadFlow() {
     try {
       localStorage.removeItem(LS_JOB_ID);
     } catch {}
+    try {
+      localStorage.removeItem(LS_OWNER_TOKEN);
+    } catch {}
 
     setUploadPct(0);
     setProgressPct(0);
@@ -168,6 +172,12 @@ export function useUploadFlow() {
         setJobId(saved);
       }
     } catch {}
+
+    // owner token best-effort (JobService will read localStorage later)
+    try {
+      localStorage.getItem(LS_OWNER_TOKEN);
+    } catch {}
+
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -304,6 +314,13 @@ export function useUploadFlow() {
           localStorage.setItem(LS_JOB_ID, created.jobId);
         } catch {}
 
+        // ✅ NEW: owner token save (security gate)
+        try {
+          if (created?.ownerToken) {
+            localStorage.setItem(LS_OWNER_TOKEN, created.ownerToken);
+          }
+        } catch {}
+
         await JobService.uploadToR2(created.uploadUrl, file, (pct) => {
           setUploadPct(clampPct(pct));
         });
@@ -340,6 +357,11 @@ export function useUploadFlow() {
       setDownloadUrl(null);
 
       setBusy(true);
+
+      // ✅ CRITICAL FIX: sync refs immediately so startPolling won't stall
+      phaseRef.current = "PROCESSING";
+      stageRef.current = "Queued";
+
       setPhase("PROCESSING");
       setProgressPct(0);
       setStageLabel("Queued");

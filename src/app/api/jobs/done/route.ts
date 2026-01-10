@@ -24,15 +24,22 @@ export async function POST(req: Request) {
     const jobId = String(body.jobId || "").trim();
     if (!jobId) return json(false, null, "Missing jobId", 400);
 
+    // ✅ SECURITY GATE: require owner token
+    const ownerToken = (req.headers.get("x-owner-token") || "").trim();
+    if (!ownerToken) return json(false, null, "Forbidden", 403);
+
     // DONE = confirm only (no side effects)
     const { data: job, error } = await supabaseAdmin
       .from("jobs")
       .select("id,status,delete_at,ttl_minutes,cleaned_at")
       .eq("id", jobId)
+      .eq("owner_token", ownerToken)
       .maybeSingle();
 
     if (error) return json(false, null, error.message, 500);
-    if (!job) return json(false, null, "Job not found", 404);
+
+    // ✅ Do NOT reveal existence if token mismatch
+    if (!job) return json(false, null, "Forbidden", 403);
 
     const status = String(job.status || "").toUpperCase();
 
