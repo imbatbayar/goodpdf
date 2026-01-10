@@ -44,7 +44,7 @@ const MN_PLANS: Plan[] = [
 function CheckItem({ children }: { children: React.ReactNode }) {
   return (
     <li className="flex gap-2 text-sm text-zinc-700">
-      <span className="mt-[2px] inline-flex h-5 w-5 items-center justify-center rounded-full bg-emerald-50 text-emerald-700">
+      <span className="mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded-full bg-emerald-50 text-emerald-700">
         ✓
       </span>
       <span className="leading-6">{children}</span>
@@ -159,7 +159,7 @@ export function PricingPage() {
             >
               {/* subtle gradient for popular */}
               {popular ? (
-                <div className="pointer-events-none absolute inset-0 rounded-2xl bg-gradient-to-b from-zinc-50 to-white" />
+                <div className="pointer-events-none absolute inset-0 rounded-2xl bg-linear-to-b from-zinc-50 to-white" />
               ) : null}
 
               <div className="relative">
