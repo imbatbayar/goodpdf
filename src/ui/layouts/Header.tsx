@@ -1,16 +1,17 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import styles from "./Header.module.css";
 import { Tooltip } from "@/ui/primitives/Tooltip";
-import { Drawer } from "@/ui/layouts/Drawer";
 import { useCountry } from "@/ui/state/country";
+import { AccountDropdown } from "./account/AccountDropdown";
 
 export function Header() {
   const [open, setOpen] = useState(false);
   const country = useCountry();
+  const anchorRef = useRef<HTMLButtonElement | null>(null);
 
   return (
     <header className={styles.header}>
@@ -46,30 +47,21 @@ export function Header() {
 
           {/* ☰ Menu */}
           <button
-            onClick={() => setOpen(true)}
+            ref={anchorRef}
+            onClick={() => setOpen((v) => !v)}
             aria-label="Menu"
             className={styles.menuBtn}
           >
             ☰
           </button>
 
-          <Drawer
+          <AccountDropdown
             open={open}
             onClose={() => setOpen(false)}
-            title="Menu"
-            items={[
-              { label: "Account", href: "/account" },
-              { label: "Billing / Upgrade", href: "/pricing" },
-              { label: "Usage", href: "/usage" },
-              { label: "Privacy", href: "/privacy" },
-              { label: "Terms", href: "/terms" },
-              { label: "Logout", disabled: true },
-            ]}
-            footer={
-              <div className={styles.drawerFooter}>
-                Country: <b>{country}</b>
-              </div>
-            }
+            anchorRef={anchorRef}
+            country={country}
+            email="you@example.com"
+            planLabel="FREE"
           />
         </div>
       </div>
