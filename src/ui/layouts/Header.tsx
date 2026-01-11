@@ -6,13 +6,11 @@ import { Button } from "@/components/ui/Button";
 import styles from "./Header.module.css";
 import { Tooltip } from "@/ui/primitives/Tooltip";
 import { Drawer } from "@/ui/layouts/Drawer";
-import { useCountry, isCountryLocked } from "@/ui/state/country";
+import { useCountry } from "@/ui/state/country";
 
 export function Header() {
   const [open, setOpen] = useState(false);
   const country = useCountry();
-
-  const locked = typeof window !== "undefined" ? isCountryLocked() : false;
 
   return (
     <header className={styles.header}>
@@ -70,14 +68,6 @@ export function Header() {
             footer={
               <div className={styles.drawerFooter}>
                 Country: <b>{country}</b>
-                <br />
-                {locked ? (
-                  <span>Locked on this device.</span>
-                ) : (
-                  <span>
-                    Choose once in <b>Account</b>.
-                  </span>
-                )}
               </div>
             }
           />

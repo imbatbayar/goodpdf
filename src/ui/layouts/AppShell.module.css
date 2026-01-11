@@ -1,18 +1,35 @@
+.shell {
+  height: 100dvh;
+  /* ✅ mobile safe viewport */
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  overflow: hidden;
+  /* ✅ lock everything */
+}
 
-.shell{
-  min-height: 100vh;
-  display:flex;
-  flex-direction:column;
+.main {
+  flex: 1 1 auto;
+  min-height: 0;
+  /* ✅ allow shrink */
+  overflow: hidden;
+  /* ✅ no scroll inside main */
+  display: flex;
+  align-items: center;
+  /* ✅ center content vertically */
+  justify-content: center;
+  /* ✅ center content horizontally */
+  padding: clamp(12px, 2vw, 20px);
 }
-.main{
-  flex:1;
-  padding: clamp(16px, 3vw, 28px);
-  max-width: 980px;
-  margin: 0 auto;
+
+.mainInner {
   width: 100%;
+  max-width: 980px;
 }
-.footer{
-  padding: 16px;
+
+.footer {
+  flex: 0 0 auto;
+  padding: 12px 16px;
   border-top: 1px solid var(--border);
   background: var(--card);
 }

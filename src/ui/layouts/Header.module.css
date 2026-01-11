@@ -98,10 +98,19 @@
 
 /* Drawer footer text */
 .drawerFooter {
+  margin-top: auto;
+  text-align: center;
   font-size: 12px;
-  line-height: 1.35;
   color: rgb(82 82 91);
-  /* zinc-600 */
+  padding: 12px 16px;
+}
+
+.drawerFooter b {
+  display: inline-block;
+  margin-left: 4px;
+  font-weight: 600;
+  color: rgb(24 24 27);
+  /* zinc-900 */
 }
 
 .muted {

@@ -22,7 +22,11 @@ export function AccountPage() {
         </p>
       </div>
 
-      <div className="rounded-2xl border bg-[var(--card)] p-5 space-y-5">
+      <div
+        className="rounded-2xl border p-5 space-y-5"
+        style={{ background: "var(--card)" }}
+        >
+
         {/* Country block */}
         <div className="rounded-2xl border border-zinc-200 bg-white/0 p-4">
           <div className="flex items-start justify-between gap-3">

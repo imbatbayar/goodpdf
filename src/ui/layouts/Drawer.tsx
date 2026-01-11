@@ -1,8 +1,13 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useMemo, useRef } from "react";
 
-type Item = { label: string; href?: string; onClick?: () => void; disabled?: boolean };
+type Item = {
+  label: string;
+  href?: string;
+  onClick?: () => void;
+  disabled?: boolean;
+};
 
 export function Drawer({
   open,
@@ -17,115 +22,129 @@ export function Drawer({
   items: Item[];
   footer?: React.ReactNode;
 }) {
-  // ESC to close
+  const panelRef = useRef<HTMLElement | null>(null);
+
+  // ESC + Outside click/touch to close (CAPTURE => reliable)
   useEffect(() => {
     if (!open) return;
+
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
+
+    const onOutside = (e: MouseEvent | TouchEvent) => {
+      const target = e.target as Node | null;
+      const panel = panelRef.current;
+      if (!panel || !target) return;
+
+      // If click/touch is outside panel => close
+      if (!panel.contains(target)) onClose();
+    };
+
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    document.addEventListener("mousedown", onOutside, true); // capture
+    document.addEventListener("touchstart", onOutside, true); // capture
+
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onOutside, true);
+      document.removeEventListener("touchstart", onOutside, true);
+    };
   }, [open, onClose]);
+
+  // Active highlight (client-only)
+  const activePath = useMemo(() => {
+    if (typeof window === "undefined") return "";
+    return window.location.pathname || "";
+  }, []);
 
   if (!open) return null;
 
   return (
-    <div
-      style={{
-        position: "fixed",
-        inset: 0,
-        zIndex: 100,
-        background: "rgba(0,0,0,0.25)",
-        display: "flex",
-        justifyContent: "flex-end",
-      }}
-      onMouseDown={onClose}
-    >
+    <div className="fixed inset-0 z-60" role="dialog" aria-modal="true">
+      {/* overlay (visual only; outside-close handled by document listener) */}
+      <div className="absolute inset-0 bg-black/30 backdrop-blur-[2px]" />
+
+      {/* panel */}
       <aside
-        style={{
-          width: "min(360px, 90vw)",
-          height: "100%",
-          background: "var(--card)",
-          borderLeft: "1px solid var(--border)",
-          padding: 16,
-          boxShadow: "0 20px 60px rgba(15,23,42,.20)",
-          display: "flex",
-          flexDirection: "column",
-          gap: 12,
+        ref={(el) => {
+          panelRef.current = el;
         }}
-        onMouseDown={(e) => e.stopPropagation()}
-        aria-modal="true"
-        role="dialog"
+        className={[
+          "absolute right-3 top-3 h-[calc(100vh-24px)] w-[320px] max-w-[calc(100vw-24px)]",
+          "rounded-3xl bg-white shadow-[0_18px_55px_rgba(0,0,0,0.18)]",
+          "border border-zinc-200/70 overflow-hidden",
+          "flex flex-col",
+        ].join(" ")}
       >
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-          <div style={{ fontWeight: 900 }}>{title}</div>
+        {/* header */}
+        <div className="flex items-center justify-between px-5 py-4">
+          <div className="text-sm font-semibold text-zinc-900">{title}</div>
           <button
             onClick={onClose}
-            style={{
-              border: "1px solid var(--border)",
-              background: "transparent",
-              borderRadius: 10,
-              padding: "6px 10px",
-              fontWeight: 800,
-              cursor: "pointer",
-            }}
+            className="rounded-xl border border-zinc-200 bg-white px-3 py-2 text-xs font-semibold text-zinc-800 hover:bg-zinc-50"
+            aria-label="Close"
           >
             ✕
           </button>
         </div>
 
-        <div style={{ display: "grid", gap: 8, paddingTop: 6 }}>
-          {items.map((it) => {
-            const common = {
-              key: it.label,
-              style: {
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                padding: "10px 12px",
-                borderRadius: 12,
-                border: "1px solid var(--border)",
-                background: "var(--card)",
-                fontWeight: 800,
-                cursor: it.disabled ? "not-allowed" : "pointer",
-                opacity: it.disabled ? 0.55 : 1,
-                textDecoration: "none",
-                color: "inherit",
-              } as React.CSSProperties,
-            };
-
-            if (it.href && !it.disabled) {
-              return (
-                <a {...common} href={it.href}>
-                  <span>{it.label}</span>
-                  <span style={{ opacity: 0.5 }}>›</span>
-                </a>
-              );
-            }
-
-            return (
-              <div
-                {...common}
-                onClick={() => {
-                  if (it.disabled) return;
-                  it.onClick?.();
-                  onClose();
-                }}
-              >
-                <span>{it.label}</span>
-                <span style={{ opacity: 0.5 }}>{it.disabled ? "Soon" : "›"}</span>
-              </div>
-            );
-          })}
+        <div className="px-3">
+          <div className="h-px bg-zinc-200/70" />
         </div>
 
-        <div style={{ marginTop: "auto" }}>
+        {/* items (scroll area) */}
+        <nav className="flex-1 overflow-auto px-3 py-3">
+          <div className="grid gap-1">
+            {items.map((it) => {
+              const isActive = !!it.href && it.href === activePath;
+              const disabled = !!it.disabled;
+
+              const base =
+                "flex items-center justify-between rounded-2xl px-4 py-3 text-sm font-medium transition";
+              const state = disabled
+                ? "text-zinc-400 cursor-not-allowed"
+                : isActive
+                  ? "bg-zinc-100 text-zinc-900"
+                  : "text-zinc-700 hover:bg-zinc-50 hover:text-zinc-900";
+
+              const rightMark = disabled ? "Soon" : "›";
+
+              if (it.href && !disabled) {
+                return (
+                  <a key={it.label} href={it.href} className={`${base} ${state}`}>
+                    <span>{it.label}</span>
+                    <span className="text-xs text-zinc-400">{rightMark}</span>
+                  </a>
+                );
+              }
+
+              return (
+                <button
+                  key={it.label}
+                  type="button"
+                  className={`${base} ${state} text-left`}
+                  onClick={() => {
+                    if (disabled) return;
+                    it.onClick?.();
+                    onClose();
+                  }}
+                >
+                  <span>{it.label}</span>
+                  <span className="text-xs text-zinc-400">{rightMark}</span>
+                </button>
+              );
+            })}
+          </div>
+        </nav>
+
+        {/* footer (always bottom) */}
+        <div className="mt-auto px-5 pb-5">
           {footer ? (
             footer
           ) : (
-            <div style={{ fontSize: 12, opacity: 0.75, lineHeight: 1.3 }}>
-              Mongolia • QPay (coming soon)<br />
-              Others • Card (coming soon)
+            <div className="rounded-2xl bg-zinc-50 px-4 py-3 text-xs text-zinc-500">
+              Privacy-first. Files auto-delete after 10 minutes.
             </div>
           )}
         </div>
