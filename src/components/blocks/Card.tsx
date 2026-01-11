@@ -1,6 +1,19 @@
-export function Card({ children }: { children: React.ReactNode }) {
+import * as React from "react";
+
+type Props = {
+  children: React.ReactNode;
+  className?: string;
+};
+
+/**
+ * Shared Card primitive.
+ * Keep it purely presentational.
+ */
+export function Card({ children, className = "" }: Props) {
   return (
-    <div style={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 16, padding: 16 }}>
+    <div
+      className={`rounded-2xl border border-[var(--border)] bg-[var(--card)] p-6 shadow-sm ${className}`}
+    >
       {children}
     </div>
   );
