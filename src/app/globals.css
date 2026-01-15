@@ -79,6 +79,23 @@ a:hover {
   outline: 2px solid var(--primary);
   outline-offset: 2px;
 }
+/* --- Number input: hide native spinners (Chrome/Edge/Safari) --- */
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+/* Firefox */
+input[type="number"] {
+  -moz-appearance: textfield;
+}
+
+/* --- Opt-out focus outline for our stepper only --- */
+.no-focus:focus-visible {
+  outline: none !important;
+  outline-offset: 0 !important;
+}
 
 /* ---------- Utilities ---------- */
 .card {

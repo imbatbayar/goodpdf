@@ -5,14 +5,14 @@ export function Progress({ value }: { value: number }) {
 
   return (
     <div
-      className="h-[10px] w-full overflow-hidden rounded-full bg-[rgba(15,23,42,.08)]"
+      className="h-2 w-full overflow-hidden rounded-full bg-zinc-100"
       role="progressbar"
       aria-valuemin={0}
       aria-valuemax={100}
       aria-valuenow={pct}
     >
       <div
-        className="h-full rounded-full bg-[var(--primary)] transition-[width] duration-300 ease-out"
+        className="h-full rounded-full bg-(--primary) transition-[width] duration-300 ease-out"
         style={{ width: `${pct}%` }}
       />
     </div>

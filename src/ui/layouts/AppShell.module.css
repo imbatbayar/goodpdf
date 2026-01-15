@@ -1,24 +1,24 @@
 .shell {
   height: 100dvh;
-  /* ✅ mobile safe viewport */
   display: flex;
   flex-direction: column;
   background: var(--bg);
-  overflow: hidden;
-  /* ✅ lock everything */
+
+  /* ✅ page scroll */
+  overflow-y: auto;
 }
 
 .main {
   flex: 1 1 auto;
-  min-height: 0;
-  /* ✅ allow shrink */
-  overflow: hidden;
-  /* ✅ no scroll inside main */
+
+  /* ✅ we want content to start from the top */
   display: flex;
-  align-items: center;
-  /* ✅ center content vertically */
+  align-items: flex-start;
+
+  /* ✅ and be centered horizontally */
   justify-content: center;
-  /* ✅ center content horizontally */
+
+  overflow: visible;
   padding: clamp(12px, 2vw, 20px);
 }
 
