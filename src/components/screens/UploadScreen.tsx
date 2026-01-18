@@ -21,9 +21,10 @@ function parseMbInt(s: string) {
 }
 
 function validateMb(mb: number | null) {
-  if (mb == null) return { ok: false, msg: "Enter a number (MB)" };
+  // parseMbInt() нь integer л зөвшөөрдөг тул эндхийн UX мессеж ч тэрийгээ дагана.
+  if (mb == null) return { ok: false, msg: "Enter a whole number (MB)" };
   if (mb <= 0) return { ok: false, msg: "Must be greater than 0" };
-  if (mb > 500) return { ok: false, msg: "Max is 500MB" };
+  if (mb > 500) return { ok: false, msg: "Maximum is 500 MB" };
   return { ok: true, msg: "" };
 }
 
@@ -159,19 +160,16 @@ export function UploadScreen() {
   return (
     <ScreenShell
       title="Split PDF by Size"
-      subtitle="Smart, balanced auto-compression. Split close to your target size."
+      subtitle="Preserve quality while splitting your PDF into parts up to your target size."
     >
-      {/* 1) Container-ийг нэг мөр болгож, overlay spacing эвдрэлээс салгав */}
       <div className="mx-auto w-full max-w-2xl px-4 pb-10">
         <div className="mt-1 flex justify-center">
           <StepHeader step={step} />
         </div>
 
-        {/* 2) Нэг stack spacing */}
         <div className="mt-5 grid gap-4">
           {step === "PICK" && (
             <>
-              {/* Dropzone + Upload status inline */}
               <div className="grid gap-3">
                 <FileDropzone
                   onPick={async (f) => {
@@ -183,7 +181,6 @@ export function UploadScreen() {
                   }}
                 />
 
-                {/* INLINE болгосон upload strip */}
                 <UploadStatusStrip
                   phase={flow.phase}
                   pct={flow.uploadPct}
@@ -191,16 +188,13 @@ export function UploadScreen() {
                 />
               </div>
 
-              {/* Доорх info блок — дараагийн алхамд callout болгож цэвэрлэнэ.
-                  Одоохондоо зай тасрахгүйгээр нэг stack дотор байна. */}
               {!file ? (
                 <Card className="rounded-xl border border-zinc-200 bg-white p-5 shadow-sm">
                   <div className="grid gap-3">
                     <div className="text-sm leading-relaxed text-zinc-700">
                       <b>goodPDF</b> preserves quality while splitting your PDF
-                      into parts that are as close as possible to your target
-                      size, then packs everything into a single ZIP for easy
-                      download.
+                      into parts up to your target size, then packs everything
+                      into a single ZIP for easy download.
                     </div>
 
                     <div className="text-sm leading-relaxed text-zinc-600">
@@ -225,57 +219,56 @@ export function UploadScreen() {
                   </div>
 
                   <div className="flex items-stretch overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm">
-                  <input
-                    type="number"
-                    inputMode="numeric"
-                    min={1}
-                    max={500}
-                    step={1}
-                    value={splitMbText}
-                    onChange={(e) => setSplitMbText(e.target.value)}
-                    placeholder="Example: 9"
-                    className="w-full flex-1 bg-transparent px-4 py-2.5 text-base font-semibold text-zinc-900 outline-none focus-visible:outline-none"
-                  />
+                    <input
+                      type="number"
+                      inputMode="numeric"
+                      min={1}
+                      max={500}
+                      step={1}
+                      value={splitMbText}
+                      onChange={(e) => setSplitMbText(e.target.value)}
+                      placeholder="Example: 9"
+                      className="no-focus w-full flex-1 bg-transparent px-4 py-2.5 text-base font-semibold text-zinc-900 outline-none focus-visible:outline-none"
+                    />
 
-                  <div className="w-px bg-zinc-200" />
+                    <div className="w-px bg-zinc-200" />
 
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const cur = parseInt(splitMbText || "", 10);
-                      const base = Number.isFinite(cur) && cur > 0 ? cur : 1;
-                      const next = Math.max(1, base - 1);
-                      setSplitMbText(String(next));
-                    }}
-                    className="w-12 select-none grid place-items-center text-xl font-semibold text-zinc-700 hover:bg-zinc-50 active:bg-zinc-100 focus-visible:outline-none"
-                    aria-label="Decrease"
-                  >
-                    –
-                  </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const cur = parseInt(splitMbText || "", 10);
+                        const base = Number.isFinite(cur) && cur > 0 ? cur : 1;
+                        const next = Math.max(1, base - 1);
+                        setSplitMbText(String(next));
+                      }}
+                      className="w-12 select-none grid place-items-center text-xl font-semibold text-zinc-700 hover:bg-zinc-50 active:bg-zinc-100 focus-visible:outline-none"
+                      aria-label="Decrease"
+                    >
+                      –
+                    </button>
 
-                  <div className="w-px bg-zinc-200" />
+                    <div className="w-px bg-zinc-200" />
 
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const cur = parseInt(splitMbText || "", 10);
-                      const base = Number.isFinite(cur) && cur > 0 ? cur : 1;
-                      const next = Math.min(500, base + 1);
-                      setSplitMbText(String(next));
-                    }}
-                    className="w-12 select-none grid place-items-center text-xl font-semibold text-zinc-700 hover:bg-zinc-50 active:bg-zinc-100 focus-visible:outline-none"
-                    aria-label="Increase"
-                  >
-                    +
-                  </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const cur = parseInt(splitMbText || "", 10);
+                        const base = Number.isFinite(cur) && cur > 0 ? cur : 1;
+                        const next = Math.min(500, base + 1);
+                        setSplitMbText(String(next));
+                      }}
+                      className="w-12 select-none grid place-items-center text-xl font-semibold text-zinc-700 hover:bg-zinc-50 active:bg-zinc-100 focus-visible:outline-none"
+                      aria-label="Increase"
+                    >
+                      +
+                    </button>
 
-                  <div className="w-px bg-zinc-200" />
+                    <div className="w-px bg-zinc-200" />
 
-                  <div className="grid place-items-center bg-zinc-50 px-3 text-xs font-semibold text-zinc-600">
-                    MB
+                    <div className="grid place-items-center bg-zinc-50 px-3 text-xs font-semibold text-zinc-600">
+                      MB
+                    </div>
                   </div>
-                </div>
-
 
                   {!splitValid.ok && splitMbText.trim().length > 0 ? (
                     <div className="text-xs font-semibold text-red-600">
@@ -285,7 +278,7 @@ export function UploadScreen() {
 
                   {splitValid.ok ? (
                     <div className="text-xs text-zinc-500">
-                      Parts will be generated close to <b>{splitMb}</b>MB.
+                      Parts will be generated up to <b>{splitMb}</b>MB.
                     </div>
                   ) : (
                     <div className="text-xs text-zinc-500">
@@ -310,8 +303,8 @@ export function UploadScreen() {
               </div>
 
               <div className="text-left text-xs leading-5 text-zinc-500">
-                Quality-first compression • Parts are as close as possible to
-                your target size • Auto-delete in 10 minutes
+                Parts are split up to your target size • Packed into a single ZIP
+                • Auto-delete within 10 minutes
               </div>
             </>
           )}
@@ -341,7 +334,9 @@ export function UploadScreen() {
               {flow.error ? (
                 <Card>
                   <div className="grid gap-2">
-                    <div className="font-semibold text-zinc-900">Error</div>
+                    <div className="font-semibold text-zinc-900">
+                      Something went wrong
+                    </div>
                     <div className="whitespace-pre-wrap text-xs text-zinc-500">
                       {flow.error}
                     </div>
@@ -434,7 +429,7 @@ export function UploadScreen() {
                     </div>
 
                     <div className="text-left text-xs leading-5 text-zinc-500">
-                      Privacy-first processing • Auto-delete in 10 minutes
+                      Privacy-first processing • Auto-delete within 10 minutes
                     </div>
                   </div>
                 </Card>
@@ -542,7 +537,9 @@ function StepHeader({ step }: { step: Step }) {
       <span
         className={[
           "grid h-5.5 w-5.5 place-items-center rounded-full text-xs font-semibold",
-          active ? "bg-(--primary) text-white" : "bg-zinc-200 text-zinc-700",
+          active
+            ? "bg-(--primary) text-white"
+            : "bg-zinc-200 text-zinc-700",
         ].join(" ")}
       >
         {n}
@@ -552,9 +549,9 @@ function StepHeader({ step }: { step: Step }) {
   );
 
   return (
-    <div className="flex flex-wrap gap-2.5">
+    <div className="flex flex-nowrap gap-2.5 overflow-x-auto">
       <Item n={1} label="Upload" active={step === "PICK"} />
-      <Item n={2} label="Process" active={step === "SETTINGS"} />
+      <Item n={2} label="Size" active={step === "SETTINGS"} />
       <Item n={3} label="Download" active={step === "RUN"} />
     </div>
   );

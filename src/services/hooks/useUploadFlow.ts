@@ -9,6 +9,33 @@ const DEV_USER_ID = "00000000-0000-0000-0000-000000000001";
 const LS_JOB_ID = "goodpdf_last_job_id";
 const LS_OWNER_TOKEN = "goodpdf_last_owner_token";
 
+/**
+ * Pricing / Plans (LOCKED)
+ * - 90 days:  25 jobs —  7,000₮
+ * - 180 days: 100 jobs — 29,000₮
+ * - 365 days: 250 jobs — 59,000₮
+ *
+ * Rule: 1 job = Start (processing) success.
+ */
+type PlanTier = "P90" | "P180" | "P365";
+type Plan = {
+  tier: PlanTier;
+  days: 90 | 180 | 365;
+  quotaJobs: number; // 25 / 100 / 250
+  priceMnt: number; // 7000 / 29000 / 59000
+  activatedAt: number; // epoch ms (window anchor)
+};
+
+type Usage = {
+  used: number;
+  remaining: number;
+  quota: number;
+  windowDays: number;
+};
+
+const LS_PLAN = "goodpdf_plan_v1";
+const LS_JOB_EVENTS = "goodpdf_job_events_v1"; // number[] epoch ms (each = 1 Start)
+
 type Phase = "IDLE" | "UPLOADING" | "UPLOADED" | "PROCESSING" | "READY" | "ERROR";
 
 type ResultSummary = {
@@ -16,6 +43,70 @@ type ResultSummary = {
   maxPartMb?: number | null;
   targetMb?: number | null;
 };
+
+function nowMs() {
+  return Date.now();
+}
+
+function safeJsonParse<T>(raw: string | null): T | null {
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
+function readPlan(): Plan | null {
+  try {
+    const p = safeJsonParse<Plan>(localStorage.getItem(LS_PLAN));
+    if (!p) return null;
+    if (!p.tier || !p.days || !p.quotaJobs || !p.priceMnt || !p.activatedAt) return null;
+    return p;
+  } catch {
+    return null;
+  }
+}
+
+function readJobEvents(): number[] {
+  try {
+    const arr = safeJsonParse<number[]>(localStorage.getItem(LS_JOB_EVENTS));
+    if (!Array.isArray(arr)) return [];
+    return arr.filter((t) => Number.isFinite(t) && t > 0);
+  } catch {
+    return [];
+  }
+}
+
+function writeJobEvents(events: number[]) {
+  try {
+    localStorage.setItem(LS_JOB_EVENTS, JSON.stringify(events));
+  } catch {}
+}
+
+function planWindowMs(days: number) {
+  return days * 24 * 60 * 60 * 1000;
+}
+
+function computeUsage(plan: Plan | null): Usage | null {
+  if (!plan) return null;
+
+  const cutoff = nowMs() - planWindowMs(plan.days);
+  const used = readJobEvents().filter((t) => t >= cutoff).length;
+  const remaining = Math.max(0, plan.quotaJobs - used);
+
+  return { used, remaining, quota: plan.quotaJobs, windowDays: plan.days };
+}
+
+/**
+ * Record 1 job event. Keep events bounded to 365 days to avoid growth.
+ */
+function recordJobEvent(ts: number) {
+  const cutoff = ts - planWindowMs(365);
+  const events = readJobEvents().filter((t) => t >= cutoff);
+  events.push(ts);
+  writeJobEvents(events);
+}
 
 function clampPct(n: any) {
   const x = Number(n);
@@ -49,18 +140,12 @@ function statusToPhase(status?: string | null): Phase {
 }
 
 /**
- * Adaptive polling delay (production-safe):
- * - PROCESSING: ~0.9–2.5s depending on backoff + stage
- * - Hidden tab: >= 2.5s
- * - Small jitter to avoid thundering herd
+ * Adaptive polling delay (production-safe)
  */
 function nextPollDelayMs(phase: Phase, stageLabel: string, backoffStep: number) {
-  // Base delay by phase/stage
   let ms = 900;
-
   if (phase !== "PROCESSING") ms = 1200;
 
-  // Stage-sensitive (labels are human-facing; we check keywords)
   const st = (stageLabel || "").toLowerCase();
   if (st.includes("queued")) ms = 1100;
   if (st.includes("downloading")) ms = 1200;
@@ -68,28 +153,18 @@ function nextPollDelayMs(phase: Phase, stageLabel: string, backoffStep: number) 
   if (st.includes("splitting")) ms = 1100;
   if (st.includes("creating zip") || st.includes("uploading zip")) ms = 1600;
 
-  // Backoff grows slowly, capped
   ms += Math.min(1200, Math.max(0, backoffStep) * 200);
 
-  // Background tab: slow down to reduce load
   if (typeof document !== "undefined" && document.visibilityState === "hidden") {
     ms = Math.max(ms, 2500);
   }
 
-  // Jitter 0..180ms
   ms += Math.floor(Math.random() * 181);
-
   return ms;
 }
 
-/**
- * Adaptive caps based on expected parts count:
- * - small jobs: still responsive
- * - large jobs: fewer requests
- */
 function maxBackoffSteps(partsCount?: number | null) {
   const n = typeof partsCount === "number" && Number.isFinite(partsCount) ? partsCount : 0;
-  // cap between 6..12
   return Math.min(12, Math.max(6, 2 + Math.ceil(n / 6)));
 }
 
@@ -181,6 +256,24 @@ export function useUploadFlow() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Optional usage snapshot (for later pricing UI)
+  const usage = useMemo(() => {
+    return computeUsage(readPlan());
+  }, [phase]);
+
+  const assertJobQuotaOrThrow = useCallback(() => {
+    const plan = readPlan();
+    if (!plan) return; // MVP: if no plan set, allow
+    const u = computeUsage(plan);
+    if (!u) return;
+
+    if (u.remaining <= 0) {
+      throw new Error(
+        `Quota reached (${u.used}/${u.quota}). Please upgrade or wait for your ${u.windowDays}-day window to refresh.`
+      );
+    }
+  }, []);
+
   const pollOnce = useCallback(
     async (jid: string) => {
       const st = await JobService.status(jid);
@@ -191,7 +284,6 @@ export function useUploadFlow() {
       setProgressPct(clampPct(st.progress));
       setStageLabel(stageToLabel(st.stage));
 
-      // result summary (shown in READY card)
       setResult({
         partsCount: st.partsCount ?? null,
         maxPartMb: st.maxPartMb ?? null,
@@ -199,7 +291,6 @@ export function useUploadFlow() {
       });
 
       if (nextPhase === "READY") {
-        // backend may already return signed URL; if not, fallback to route url
         setDownloadUrl(st.downloadUrl || JobService.downloadUrl(jid));
         setBusy(false);
         stopPolling();
@@ -213,7 +304,6 @@ export function useUploadFlow() {
         return;
       }
 
-      // keep polling
       setBusy(true);
     },
     [stopPolling]
@@ -221,7 +311,6 @@ export function useUploadFlow() {
 
   const scheduleNextPoll = useCallback(
     (jid: string) => {
-      // Safety: only schedule while processing
       if (phaseRef.current !== "PROCESSING") return;
 
       const delay = nextPollDelayMs(phaseRef.current, stageRef.current, pollBackoff.current);
@@ -229,7 +318,6 @@ export function useUploadFlow() {
       pollTimer.current = window.setTimeout(async () => {
         if (phaseRef.current !== "PROCESSING") return;
 
-        // Prevent overlap
         if (pollInFlight.current) {
           scheduleNextPoll(jid);
           return;
@@ -239,7 +327,6 @@ export function useUploadFlow() {
         try {
           await pollOnce(jid);
 
-          // If still processing, gradually back off (cap based on parts count)
           if (phaseRef.current === "PROCESSING") {
             const cap = maxBackoffSteps(partsCountRef.current);
             pollBackoff.current = Math.min(cap, pollBackoff.current + 1);
@@ -263,7 +350,6 @@ export function useUploadFlow() {
       stopPolling();
       pollBackoff.current = 0;
 
-      // Immediate first poll (no waiting), then schedule next
       pollInFlight.current = true;
       pollOnce(jid)
         .then(() => {
@@ -284,8 +370,7 @@ export function useUploadFlow() {
   );
 
   /**
-   * Upload only (NO splitMb from UI)
-   * - Uses splitMbFallback only if backend schema needs it.
+   * Upload only (NO job counting here)
    */
   const uploadOnly = useCallback(
     async (file: File, splitMbFallback: number = DEFAULT_SPLIT_MB) => {
@@ -304,7 +389,6 @@ export function useUploadFlow() {
         const created = await JobService.createJob({
           file,
           userId: DEV_USER_ID,
-          // compress does not exist in product; keep legacy field harmless
           quality: "ORIGINAL",
           splitMbFallback,
         });
@@ -314,7 +398,6 @@ export function useUploadFlow() {
           localStorage.setItem(LS_JOB_ID, created.jobId);
         } catch {}
 
-        // ✅ NEW: owner token save (security gate)
         try {
           if (created?.ownerToken) {
             localStorage.setItem(LS_OWNER_TOKEN, created.ownerToken);
@@ -325,7 +408,6 @@ export function useUploadFlow() {
           setUploadPct(clampPct(pct));
         });
 
-        // ✅ DB дээр status=UPLOADED болгоно (Start ажиллахын тулд хэрэгтэй)
         await JobService.markUploaded(created.jobId);
 
         setBusy(false);
@@ -341,7 +423,8 @@ export function useUploadFlow() {
   );
 
   /**
-   * Start processing (✅ splitMb is REQUIRED from Start tab)
+   * Start processing
+   * ✅ Job is counted HERE (on Start success)
    */
   const startProcessing = useCallback(
     async (splitMb: number) => {
@@ -352,13 +435,23 @@ export function useUploadFlow() {
         return;
       }
 
+      // Enforce job quota BEFORE starting expensive processing
+      try {
+        assertJobQuotaOrThrow();
+      } catch (e: any) {
+        setBusy(false);
+        setPhase("ERROR");
+        setError(e?.message || "Quota reached");
+        return;
+      }
+
       setError(null);
       setResult(null);
       setDownloadUrl(null);
 
       setBusy(true);
 
-      // ✅ CRITICAL FIX: sync refs immediately so startPolling won't stall
+      // Sync refs immediately so startPolling won't stall
       phaseRef.current = "PROCESSING";
       stageRef.current = "Queued";
 
@@ -368,6 +461,10 @@ export function useUploadFlow() {
 
       try {
         await JobService.start(jid, splitMb);
+
+        // ✅ COUNT 1 JOB only after Start succeeded
+        recordJobEvent(nowMs());
+
         startPolling(jid);
       } catch (e: any) {
         setBusy(false);
@@ -375,11 +472,12 @@ export function useUploadFlow() {
         setError(e?.message || "Start failed");
       }
     },
-    [jobId, startPolling]
+    [assertJobQuotaOrThrow, jobId, startPolling]
   );
 
   /**
    * Confirm done (starts cleanup timer on server side)
+   * ❌ DOES NOT count job.
    */
   const confirmDone = useCallback(async () => {
     const jid = jobId;
@@ -391,19 +489,14 @@ export function useUploadFlow() {
     }
   }, [jobId]);
 
-  /**
-   * New file (UI convenience)
-   */
   const newFile = useCallback(() => {
     resetAll();
   }, [resetAll]);
 
-  // Extra safety: if tab becomes visible again while processing, do one immediate poll and continue
   useEffect(() => {
     const onVis = () => {
       if (document.visibilityState === "visible") {
         if (jobId && phaseRef.current === "PROCESSING") {
-          // do a quick refresh, then resume adaptive schedule
           startPolling(jobId);
         }
       }
@@ -412,7 +505,6 @@ export function useUploadFlow() {
     return () => document.removeEventListener("visibilitychange", onVis);
   }, [jobId, startPolling]);
 
-  // Derived
   const isReady = useMemo(() => phase === "READY", [phase]);
 
   return {
@@ -429,6 +521,9 @@ export function useUploadFlow() {
     result,
     downloadUrl,
 
+    // optional usage
+    usage,
+
     // actions
     uploadOnly,
     startProcessing,
@@ -436,4 +531,29 @@ export function useUploadFlow() {
     newFile,
     resetAll,
   };
+}
+
+/* ------------------------------------------------------------------
+  Plan helpers (pricing/auth screens later)
+------------------------------------------------------------------- */
+
+export function setActivePlan(tier: PlanTier) {
+  const map: Record<PlanTier, Omit<Plan, "activatedAt">> = {
+    P90: { tier: "P90", days: 90, quotaJobs: 25, priceMnt: 7000 },
+    P180: { tier: "P180", days: 180, quotaJobs: 100, priceMnt: 29000 },
+    P365: { tier: "P365", days: 365, quotaJobs: 250, priceMnt: 59000 },
+  };
+
+  const p = map[tier];
+  try {
+    localStorage.setItem(LS_PLAN, JSON.stringify({ ...p, activatedAt: nowMs() }));
+  } catch {}
+}
+
+export function getCurrentPlan(): Plan | null {
+  return readPlan();
+}
+
+export function getCurrentUsage(): Usage | null {
+  return computeUsage(readPlan());
 }

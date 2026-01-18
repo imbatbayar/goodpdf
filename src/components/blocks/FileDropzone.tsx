@@ -1,32 +1,29 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useRef, useState } from "react";
 
 export function FileDropzone({ onPick }: { onPick: (f: File) => void }) {
   const inputRef = useRef<HTMLInputElement | null>(null);
-
   const [isHover, setIsHover] = useState(false);
-  const [file, setFile] = useState<File | null>(null);
-
-  const meta = useMemo(() => {
-    if (!file) return null;
-    const mb = file.size / (1024 * 1024);
-    const mb2 = Math.round(mb * 100) / 100;
-    return { name: file.name, mb: mb2 };
-  }, [file]);
-
-  const openPicker = () => inputRef.current?.click();
-
-  const pick = (f: File) => {
-    setFile(f);
-    onPick(f);
-  };
 
   const acceptPdf = (f: File) => {
     // quiet guard: pdf mime OR .pdf extension
-    return (
-      f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf")
-    );
+    return f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf");
+  };
+
+  const openPicker = () => {
+    // allow re-selecting the same file reliably
+    if (inputRef.current) inputRef.current.value = "";
+    inputRef.current?.click();
+  };
+
+  const pick = (f: File) => {
+    if (!acceptPdf(f)) return;
+
+    // keep input clean so selecting the same file again works reliably
+    if (inputRef.current) inputRef.current.value = "";
+
+    onPick(f);
   };
 
   return (
@@ -63,14 +60,16 @@ export function FileDropzone({ onPick }: { onPick: (f: File) => void }) {
           setIsHover(false);
           const f = e.dataTransfer.files?.[0];
           if (!f) return;
-          if (!acceptPdf(f)) return;
           pick(f);
         }}
         role="button"
         tabIndex={0}
         aria-label="Upload PDF"
         onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") openPicker();
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault(); // avoid page scroll on Space
+            openPicker();
+          }
         }}
       >
         {/* icon */}
@@ -100,31 +99,9 @@ export function FileDropzone({ onPick }: { onPick: (f: File) => void }) {
           onChange={(e) => {
             const f = e.target.files?.[0];
             if (!f) return;
-            if (!acceptPdf(f)) return;
             pick(f);
           }}
         />
-      </div>
-
-      {/* quiet feedback (no layout drift) */}
-      <div className="mt-4">
-        {meta ? (
-          <div className="rounded-2xl bg-white px-4 py-3 ring-1 ring-zinc-200">
-            <div className="flex items-center justify-between gap-3">
-              <div className="min-w-0">
-                <div className="truncate text-sm font-semibold text-zinc-900">
-                  {meta.name}
-                </div>
-                <div className="mt-1 text-xs text-zinc-500">Selected</div>
-              </div>
-              <div className="shrink-0 text-xs font-semibold text-zinc-700">
-                {meta.mb}MB
-              </div>
-            </div>
-          </div>
-        ) : (
-          <div className="text-xs text-zinc-500">No file selected.</div>
-        )}
       </div>
     </div>
   );
