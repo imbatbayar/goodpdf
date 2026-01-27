@@ -6,6 +6,9 @@ export function FileDropzone({ onPick }: { onPick: (f: File) => void }) {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [isHover, setIsHover] = useState(false);
 
+  // selected file name shown INSIDE the grey dropzone
+  const [selectedName, setSelectedName] = useState<string>("");
+
   const acceptPdf = (f: File) => {
     // quiet guard: pdf mime OR .pdf extension
     return f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf");
@@ -22,6 +25,9 @@ export function FileDropzone({ onPick }: { onPick: (f: File) => void }) {
 
     // keep input clean so selecting the same file again works reliably
     if (inputRef.current) inputRef.current.value = "";
+
+    // only show file name inside the grey box
+    setSelectedName(f.name);
 
     onPick(f);
   };
@@ -72,23 +78,29 @@ export function FileDropzone({ onPick }: { onPick: (f: File) => void }) {
           }
         }}
       >
-        {/* icon */}
-        <div className="mb-3 grid h-11 w-11 place-items-center rounded-2xl bg-white shadow-sm ring-1 ring-zinc-200">
-          <span className="text-xl leading-none">＋</span>
-        </div>
+        {/* When a file is selected: show ONLY the file name (no bold) */}
+        {selectedName ? (
+          <div className="w-full px-2">
+            <div className="text-sm text-zinc-900 truncate">{selectedName}</div>
+          </div>
+        ) : (
+          <>
+            {/* icon */}
+            <div className="mb-3 grid h-11 w-11 place-items-center rounded-2xl bg-white shadow-sm ring-1 ring-zinc-200">
+              <span className="text-xl leading-none">＋</span>
+            </div>
 
-        <div className="text-sm font-semibold text-zinc-900">
-          Drag &amp; drop a PDF here
-        </div>
+            <div className="text-sm text-zinc-900">Drag &amp; drop a PDF here</div>
 
-        <div className="mt-1 text-xs text-zinc-600">
-          or{" "}
-          <span className="font-semibold text-(--primary)">click to browse</span>
-        </div>
+            <div className="mt-1 text-xs text-zinc-600">
+              or <span className="text-(--primary)">click to browse</span>
+            </div>
 
-        <div className="mt-3 text-[11px] tracking-wide text-zinc-500">
-          PDF only • 1 file per job
-        </div>
+            <div className="mt-3 text-[11px] tracking-wide text-zinc-500">
+              PDF only • 1 file per job
+            </div>
+          </>
+        )}
 
         {/* hidden input */}
         <input

@@ -38,7 +38,7 @@ export function UploadScreen() {
   const [step, setStep] = useState<Step>("PICK");
   const [file, setFile] = useState<File | null>(null);
 
-  const [splitMbText, setSplitMbText] = useState<string>("");
+  const [splitMbText, setSplitMbText] = useState<string>("9");
 
   const [dlUx, setDlUx] = useState<DownloadUX>("IDLE");
   const [fakePct, setFakePct] = useState(0);
@@ -227,7 +227,7 @@ export function UploadScreen() {
                       step={1}
                       value={splitMbText}
                       onChange={(e) => setSplitMbText(e.target.value)}
-                      placeholder="Example: 9"
+                      placeholder="9"
                       className="no-focus w-full flex-1 bg-transparent px-4 py-2.5 text-base font-semibold text-zinc-900 outline-none focus-visible:outline-none"
                     />
 
@@ -551,7 +551,7 @@ function StepHeader({ step }: { step: Step }) {
   return (
     <div className="flex flex-nowrap gap-2.5 overflow-x-auto">
       <Item n={1} label="Upload" active={step === "PICK"} />
-      <Item n={2} label="Size" active={step === "SETTINGS"} />
+      <Item n={2} label="Split size" active={step === "SETTINGS"} />
       <Item n={3} label="Download" active={step === "RUN"} />
     </div>
   );
