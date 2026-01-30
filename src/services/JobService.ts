@@ -43,6 +43,9 @@ export type StatusResp = {
 
   errorText?: string | null;
   errorCode?: string | null;
+
+  // non-fatal warning shown on success
+  warningText?: string | null;
 };
 
 type CreateArgs = {

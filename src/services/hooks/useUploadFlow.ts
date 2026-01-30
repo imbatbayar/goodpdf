@@ -36,6 +36,8 @@ type Usage = {
 const LS_PLAN = "goodpdf_plan_v1";
 const LS_JOB_EVENTS = "goodpdf_job_events_v1"; // number[] epoch ms (each = 1 Start)
 
+type Mode = "SYSTEM" | "MANUAL";
+
 type Phase = "IDLE" | "UPLOADING" | "UPLOADED" | "PROCESSING" | "READY" | "ERROR";
 
 type ResultSummary = {
@@ -178,8 +180,11 @@ export function useUploadFlow() {
   const [progressPct, setProgressPct] = useState(0);
 
   const [stageLabel, setStageLabel] = useState<string>("");
+  const [messageLine, setMessageLine] = useState<string>("");
 
   const [error, setError] = useState<string | null>(null);
+
+  const [warning, setWarning] = useState<string | null>(null);
 
   const [result, setResult] = useState<ResultSummary | null>(null);
 
@@ -235,6 +240,7 @@ export function useUploadFlow() {
     setStageLabel("");
 
     setError(null);
+    setWarning(null);
     setResult(null);
     setDownloadUrl(null);
   }, [stopPolling]);
@@ -283,12 +289,15 @@ export function useUploadFlow() {
 
       setProgressPct(clampPct(st.progress));
       setStageLabel(stageToLabel(st.stage));
+      setMessageLine(String((st as any).message || ""));
 
       setResult({
         partsCount: st.partsCount ?? null,
         maxPartMb: st.maxPartMb ?? null,
         targetMb: st.targetMb ?? null,
       });
+
+      setWarning((st as any).warningText ?? null);
 
       if (nextPhase === "READY") {
         setDownloadUrl(st.downloadUrl || JobService.downloadUrl(jid));
@@ -376,6 +385,7 @@ export function useUploadFlow() {
     async (file: File, splitMbFallback: number = DEFAULT_SPLIT_MB) => {
       stopPolling();
       setError(null);
+      setWarning(null);
       setResult(null);
       setDownloadUrl(null);
 
@@ -427,7 +437,7 @@ export function useUploadFlow() {
    * ✅ Job is counted HERE (on Start success)
    */
   const startProcessing = useCallback(
-    async (splitMb: number) => {
+    async ({ mode, splitMb }: { mode: Mode; splitMb: number }) => {
       const jid = jobId;
       if (!jid) {
         setPhase("ERROR");
@@ -446,6 +456,7 @@ export function useUploadFlow() {
       }
 
       setError(null);
+      setWarning(null);
       setResult(null);
       setDownloadUrl(null);
 
@@ -518,6 +529,7 @@ export function useUploadFlow() {
     progressPct,
     stageLabel,
     error,
+    warning,
     result,
     downloadUrl,
 

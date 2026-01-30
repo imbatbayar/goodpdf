@@ -11,6 +11,17 @@ import { Card } from "@/components/blocks/Card";
 type DownloadUX = "IDLE" | "PREPARE" | "CONFIRM" | "SUCCESS";
 type Step = "PICK" | "SETTINGS" | "RUN";
 
+const SYSTEM_TICK_MESSAGES = [
+  "Scanning pages…",
+  "Reading object streams…",
+  "Normalizing page tree…",
+  "Preparing split map…",
+  "Optimizing output compatibility…",
+  "Packing files (store)…",
+  "Verifying parts…",
+  "Finalizing…",
+];
+
 function parseMbInt(s: string) {
   const t = String(s || "").trim();
   if (!t) return null;
@@ -37,12 +48,25 @@ function clampPct(v: number) {
 export function UploadScreen() {
   const [step, setStep] = useState<Step>("PICK");
   const [file, setFile] = useState<File | null>(null);
+  const [mode, setMode] = useState<"SYSTEM" | "MANUAL">("SYSTEM");
+
+  // SYSTEM mode constraints (portal/email compatibility)
+  const SYSTEM_MAX_PART_MB = 9;
+  const SYSTEM_MAX_PARTS = 5;
+  // Sentinel value stored in split_mb to trigger SYSTEM pipeline in worker (no DB schema changes)
+  const SYSTEM_SENTINEL_SPLIT_MB = 499.99;
 
   const [splitMbText, setSplitMbText] = useState<string>("9");
 
   const [dlUx, setDlUx] = useState<DownloadUX>("IDLE");
   const [fakePct, setFakePct] = useState(0);
   const fakeTimerRef = useRef<number | null>(null);
+
+  // PROCESSING үеийн “хиймэл” progress + нэг мөр систем мессеж
+  const [procFakePct, setProcFakePct] = useState(1);
+  const [procTick, setProcTick] = useState(0);
+  const procPctTimerRef = useRef<number | null>(null);
+  const procTickTimerRef = useRef<number | null>(null);
 
   const flow = useUploadFlow();
 
@@ -75,7 +99,10 @@ export function UploadScreen() {
   }, [file]);
 
   const canStart =
-    !!file && !flow.busy && flow.phase === "UPLOADED" && splitValid.ok;
+    !!file &&
+    !flow.busy &&
+    flow.phase === "UPLOADED" &&
+    (mode === "SYSTEM" || splitValid.ok);
 
   const canDownload = !flow.busy && flow.phase === "READY";
 
@@ -83,6 +110,17 @@ export function UploadScreen() {
     if (fakeTimerRef.current) {
       window.clearInterval(fakeTimerRef.current);
       fakeTimerRef.current = null;
+    }
+  };
+
+  const stopProcFakeTimers = () => {
+    if (procPctTimerRef.current) {
+      window.clearInterval(procPctTimerRef.current);
+      procPctTimerRef.current = null;
+    }
+    if (procTickTimerRef.current) {
+      window.clearInterval(procTickTimerRef.current);
+      procTickTimerRef.current = null;
     }
   };
 
@@ -95,20 +133,75 @@ export function UploadScreen() {
     setFakePct(0);
     stopFakeTimer();
 
+    // processing fake-ийг цэвэрлэнэ
+    setProcFakePct(1);
+    setProcTick(0);
+    stopProcFakeTimers();
+
     flow.resetAll();
   };
 
+  // ✅ PROCESSING үед “хиймэл” progress + систем мессежийг ажиллуулна
   useEffect(() => {
-    return () => stopFakeTimer();
-  }, []);
+    const real = typeof flow.progressPct === "number" ? flow.progressPct : 0;
+    const hasReal = real > 0;
+    const shouldRun =
+      flow.phase === "PROCESSING" && !flow.error && !hasReal;
+
+    // PROCESSING биш бол / real progress орж ирвэл fake-г зогсооно
+    if (!shouldRun) {
+      stopProcFakeTimers();
+      // real progress байвал fake-ийг 0 болгохгүй (UI огцом үсрэхээс хамгаална)
+      return;
+    }
+
+    // эхлэхэд 1% дээр барина
+    setProcFakePct((p) => (p <= 0 ? 1 : p));
+
+    if (!procPctTimerRef.current) {
+      procPctTimerRef.current = window.setInterval(() => {
+        setProcFakePct((p) => {
+          // 1..99 хүртэл “амьд” өсөлт
+          if (p >= 99) return 99;
+          const step = p < 60 ? 2 : 1;
+          return Math.min(99, p + step);
+        });
+      }, 700);
+    }
+
+    if (!procTickTimerRef.current) {
+      procTickTimerRef.current = window.setInterval(() => {
+        setProcTick((t) => t + 1);
+      }, 900);
+    }
+
+    return () => {
+      // phase солигдох үед цэвэрлэнэ
+      stopProcFakeTimers();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [flow.phase, flow.progressPct, flow.error]);
 
   const doStart = async () => {
     if (!file) return;
-    if (!splitValid.ok || splitMb == null) return;
+
+    const splitMbToSend =
+      mode === "SYSTEM" ? SYSTEM_SENTINEL_SPLIT_MB : splitMb;
+
+    if (mode === "MANUAL" && (!splitValid.ok || splitMbToSend == null)) return;
 
     setStep("RUN");
+
+    // PROCESSING эхлэхэд fake-ийг шинэчлэх
+    setProcFakePct(1);
+    setProcTick(0);
+
     try {
-      await flow.startProcessing(splitMb);
+      await flow.startProcessing({
+        mode: mode === "SYSTEM" ? ("SYSTEM" as any) : ("MANUAL" as any),
+        splitMb: splitMbToSend as number,
+      });
+
     } catch {}
   };
 
@@ -157,10 +250,25 @@ export function UploadScreen() {
       </Card>
     ) : null;
 
+  // UI дээр харуулах progress / нэг мөр систем мэдээлэл
+  const realProgress = typeof flow.progressPct === "number" ? flow.progressPct : 0;
+  const uiProgress =
+    flow.phase === "PROCESSING"
+      ? (realProgress > 0 ? realProgress : procFakePct)
+      : realProgress;
+
+  const uiLine =
+        (SYSTEM_TICK_MESSAGES[procTick % SYSTEM_TICK_MESSAGES.length] || "");
+
+
   return (
     <ScreenShell
       title="Split PDF by Size"
-      subtitle="Preserve quality while splitting your PDF into parts up to your target size."
+      subtitle={
+        mode === "SYSTEM"
+          ? "System-fit: maximize compatibility (≤9MB each, ≤5 files). Visual quality may be reduced."
+          : "Preserve quality while splitting your PDF into parts up to your target size."
+      }
     >
       <div className="mx-auto w-full max-w-2xl px-4 pb-10">
         <div className="mt-1 flex justify-center">
@@ -214,76 +322,125 @@ export function UploadScreen() {
 
               <Card>
                 <div className="grid gap-3">
-                  <div className="font-semibold text-zinc-900">
-                    Target size per part
-                  </div>
-
-                  <div className="flex items-stretch overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm">
-                    <input
-                      type="number"
-                      inputMode="numeric"
-                      min={1}
-                      max={500}
-                      step={1}
-                      value={splitMbText}
-                      onChange={(e) => setSplitMbText(e.target.value)}
-                      placeholder="9"
-                      className="no-focus w-full flex-1 bg-transparent px-4 py-2.5 text-base font-semibold text-zinc-900 outline-none focus-visible:outline-none"
-                    />
-
-                    <div className="w-px bg-zinc-200" />
-
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const cur = parseInt(splitMbText || "", 10);
-                        const base = Number.isFinite(cur) && cur > 0 ? cur : 1;
-                        const next = Math.max(1, base - 1);
-                        setSplitMbText(String(next));
-                      }}
-                      className="w-12 select-none grid place-items-center text-xl font-semibold text-zinc-700 hover:bg-zinc-50 active:bg-zinc-100 focus-visible:outline-none"
-                      aria-label="Decrease"
-                    >
-                      –
-                    </button>
-
-                    <div className="w-px bg-zinc-200" />
-
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const cur = parseInt(splitMbText || "", 10);
-                        const base = Number.isFinite(cur) && cur > 0 ? cur : 1;
-                        const next = Math.min(500, base + 1);
-                        setSplitMbText(String(next));
-                      }}
-                      className="w-12 select-none grid place-items-center text-xl font-semibold text-zinc-700 hover:bg-zinc-50 active:bg-zinc-100 focus-visible:outline-none"
-                      aria-label="Increase"
-                    >
-                      +
-                    </button>
-
-                    <div className="w-px bg-zinc-200" />
-
-                    <div className="grid place-items-center bg-zinc-50 px-3 text-xs font-semibold text-zinc-600">
-                      MB
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="font-semibold text-zinc-900">
+                      {mode === "SYSTEM" ? "System-fit" : "Target size per part"}
+                    </div>
+                    <div className="inline-flex rounded-full border border-zinc-200 bg-white p-1 shadow-sm">
+                      <button
+                        type="button"
+                        onClick={() => setMode("SYSTEM")}
+                        className={`px-3 py-1 text-xs font-semibold rounded-full transition focus-visible:outline-none ${
+                          mode === "SYSTEM"
+                            ? "bg-zinc-900 text-white"
+                            : "text-zinc-700 hover:bg-zinc-50"
+                        }`}
+                        aria-pressed={mode === "SYSTEM"}
+                      >
+                        Default
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setMode("MANUAL")}
+                        className={`px-3 py-1 text-xs font-semibold rounded-full transition focus-visible:outline-none ${
+                          mode === "MANUAL"
+                            ? "bg-zinc-900 text-white"
+                            : "text-zinc-700 hover:bg-zinc-50"
+                        }`}
+                        aria-pressed={mode === "MANUAL"}
+                      >
+                        Manual
+                      </button>
                     </div>
                   </div>
 
-                  {!splitValid.ok && splitMbText.trim().length > 0 ? (
-                    <div className="text-xs font-semibold text-red-600">
-                      {splitValid.msg}
-                    </div>
-                  ) : null}
-
-                  {splitValid.ok ? (
-                    <div className="text-xs text-zinc-500">
-                      Parts will be generated up to <b>{splitMb}</b>MB.
+                  {mode === "SYSTEM" ? (
+                    <div className="rounded-xl border border-zinc-200 bg-white p-4 shadow-sm">
+                      <div className="grid gap-1 text-sm text-zinc-700">
+                        <div>
+                          Max size: <b>≤{SYSTEM_MAX_PART_MB}MB</b>
+                        </div>
+                        <div>
+                          Max split: <b>≤{SYSTEM_MAX_PARTS} files</b>
+                        </div>
+                      </div>
+                      <div className="mt-2 text-xs text-zinc-500">
+                        This mode prioritizes system compatibility over visual
+                        quality. Files remain readable.
+                      </div>
                     </div>
                   ) : (
-                    <div className="text-xs text-zinc-500">
-                      Enter a whole number (MB).
-                    </div>
+                    <>
+                      <div className="flex items-stretch overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm">
+                        <input
+                          type="number"
+                          inputMode="numeric"
+                          min={1}
+                          max={500}
+                          step={1}
+                          value={splitMbText}
+                          onChange={(e) => setSplitMbText(e.target.value)}
+                          placeholder="9"
+                          className="no-focus w-full flex-1 bg-transparent px-4 py-2.5 text-base font-semibold text-zinc-900 outline-none focus-visible:outline-none"
+                        />
+
+                        <div className="w-px bg-zinc-200" />
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const cur = parseInt(splitMbText || "", 10);
+                            const base =
+                              Number.isFinite(cur) && cur > 0 ? cur : 1;
+                            const next = Math.max(1, base - 1);
+                            setSplitMbText(String(next));
+                          }}
+                          className="w-12 select-none grid place-items-center text-xl font-semibold text-zinc-700 hover:bg-zinc-50 active:bg-zinc-100 focus-visible:outline-none"
+                          aria-label="Decrease"
+                        >
+                          –
+                        </button>
+
+                        <div className="w-px bg-zinc-200" />
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const cur = parseInt(splitMbText || "", 10);
+                            const base =
+                              Number.isFinite(cur) && cur > 0 ? cur : 1;
+                            const next = Math.min(500, base + 1);
+                            setSplitMbText(String(next));
+                          }}
+                          className="w-12 select-none grid place-items-center text-xl font-semibold text-zinc-700 hover:bg-zinc-50 active:bg-zinc-100 focus-visible:outline-none"
+                          aria-label="Increase"
+                        >
+                          +
+                        </button>
+
+                        <div className="w-px bg-zinc-200" />
+
+                        <div className="grid place-items-center bg-zinc-50 px-3 text-xs font-semibold text-zinc-600">
+                          MB
+                        </div>
+                      </div>
+
+                      {!splitValid.ok && splitMbText.trim().length > 0 ? (
+                        <div className="text-xs font-semibold text-red-600">
+                          {splitValid.msg}
+                        </div>
+                      ) : null}
+
+                      {splitValid.ok ? (
+                        <div className="text-xs text-zinc-500">
+                          Parts will be generated up to <b>{splitMb}</b>MB.
+                        </div>
+                      ) : (
+                        <div className="text-xs text-zinc-500">
+                          Enter a whole number (MB).
+                        </div>
+                      )}
+                    </>
                   )}
                 </div>
               </Card>
@@ -303,8 +460,10 @@ export function UploadScreen() {
               </div>
 
               <div className="text-left text-xs leading-5 text-zinc-500">
-                Parts are split up to your target size • Packed into a single ZIP
-                • Auto-delete within 10 minutes
+                {mode === "SYSTEM"
+                  ? `Parts are generated to fit ≤${SYSTEM_MAX_PART_MB}MB each (≤${SYSTEM_MAX_PARTS} files)`
+                  : "Parts are split up to your target size"}{" "}
+                • Packed into a single ZIP • Auto-delete within 10 minutes
               </div>
             </>
           )}
@@ -321,10 +480,13 @@ export function UploadScreen() {
                     <div className="grid gap-2">
                       <div className="text-xs text-zinc-500">
                         {flow.stageLabel || "Working"}
+                        {uiLine ? ` — ${uiLine}` : ""}
                       </div>
-                      <Progress value={flow.progressPct} />
+
+                      <Progress value={uiProgress} />
+
                       <div className="text-xs text-zinc-500">
-                        {flow.progressPct}%
+                        {clampPct(uiProgress)}%
                       </div>
                     </div>
                   </div>
@@ -361,6 +523,13 @@ export function UploadScreen() {
                   <div className="grid gap-3">
                     <div className="font-semibold text-zinc-900">Ready ✅</div>
 
+{flow.warning ? (
+  <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
+    {flow.warning}
+  </div>
+) : null}
+
+
                     <div className="grid gap-2 text-sm">
                       <div>
                         <span className="text-zinc-500">Split into:</span>{" "}
@@ -377,7 +546,12 @@ export function UploadScreen() {
                       </div>
 
                       <div className="text-xs text-zinc-500">
-                        Target size: <b>{splitMbText || "—"}MB</b>
+                        Target size:{" "}
+                        <b>
+                          {mode === "SYSTEM"
+                            ? `${SYSTEM_MAX_PART_MB}MB`
+                            : `${splitMbText || "—"}MB`}
+                        </b>
                       </div>
                     </div>
 
@@ -468,11 +642,7 @@ function UploadStatusStrip({
     ? "Uploading…"
     : "";
 
-  const rightLabel = showUploading
-    ? `${pctClamped}%`
-    : showUploaded
-    ? "100%"
-    : "";
+  const rightLabel = showUploading ? `${pctClamped}%` : showUploaded ? "100%" : "";
 
   return (
     <div
@@ -497,11 +667,7 @@ function UploadStatusStrip({
           <div
             className="h-full rounded-full bg-(--primary) transition-[width,opacity] duration-200 ease-out"
             style={{
-              width: showUploading
-                ? `${pctClamped}%`
-                : showUploaded
-                ? "100%"
-                : "0%",
+              width: showUploading ? `${pctClamped}%` : showUploaded ? "100%" : "0%",
               opacity: showUploading || showUploaded ? 1 : 0,
             }}
           />

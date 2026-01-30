@@ -12,79 +12,55 @@ function json(ok: boolean, data?: any, error?: string, status = 200) {
   );
 }
 
-function normStatus(s: any) {
-  return String(s || "").trim().toUpperCase();
-}
-
-/**
- * Client calls:
- *  POST /api/jobs/upload
- *  Body: { jobId: string }
- *  Purpose: mark job as UPLOADED after direct PUT to R2 succeeded.
- */
 export async function POST(req: Request) {
   try {
-    const body = await req.json().catch(() => ({} as any));
-    const jobId = String(body.jobId || "").trim();
+    // ✅ JobService.markUploaded() чинь JSON явуулдаг:
+    // fetch("/api/jobs/upload", { headers:{ "content-type":"application/json", "x-owner-token":... }, body: JSON.stringify({jobId}) })
+    const ct = req.headers.get("content-type") || "";
+    if (!ct.includes("application/json")) {
+      return json(false, null, "Unsupported Content-Type. Expected application/json", 415);
+    }
+
+    const ownerToken = req.headers.get("x-owner-token") || "";
+    if (!ownerToken) return json(false, null, "Missing x-owner-token", 401);
+
+    const body = await req.json().catch(() => null);
+    const jobId = String(body?.jobId || "");
     if (!jobId) return json(false, null, "Missing jobId", 400);
 
-    // ✅ SECURITY GATE: require owner token
-    const ownerToken = (req.headers.get("x-owner-token") || "").trim();
-    if (!ownerToken) return json(false, null, "Forbidden", 403);
-
-    // 1) Fetch job with owner check (do NOT leak existence)
-    const { data: job, error: gErr } = await supabaseAdmin
+    // ✅ Owner-token gate: jobId таахаас хамгаална
+    const { data: job, error: selErr } = await supabaseAdmin
       .from("jobs")
-      .select("id,status,owner_token,input_path,uploaded_at")
+      .select("id,input_path,delete_at,owner_token,status")
       .eq("id", jobId)
       .eq("owner_token", ownerToken)
       .maybeSingle();
 
-    if (gErr) return json(false, null, gErr.message, 500);
+    if (selErr) return json(false, null, selErr.message, 500);
     if (!job) return json(false, null, "Forbidden", 403);
 
-    const st = normStatus(job.status);
+    const inputKey = String(job.input_path || "");
+    if (!inputKey) return json(false, null, "Missing input_path for job", 500);
 
-    const inputKey = `${jobId}/input.pdf`;
-
-    // 2) Idempotency:
-    // - If already UPLOADED/QUEUED/PROCESSING/DONE => treat as ok (do not downgrade state)
-    if (st === "UPLOADED" || st === "QUEUED" || st === "PROCESSING" || st === "DONE") {
-      return json(true, { jobId, inputKey, alreadyUploaded: true });
-    }
-    if (st === "FAILED" || st === "CLEANED") {
-      return json(false, null, `Not uploadable (status=${st})`, 409);
-    }
-
-    // 3) Update only if still UPLOADING (or CREATED)
-    const { error: uErr } = await supabaseAdmin
+    // ✅ Mark uploaded (status API чинь UPLOADED-г хүлээдэг)
+    const { error: updErr } = await supabaseAdmin
       .from("jobs")
       .update({
         status: "UPLOADED",
         stage: "UPLOAD",
-        progress: 10,
+        progress_pct: 0,
         uploaded_at: new Date().toISOString(),
-        input_path: inputKey, // ✅ canonical key worker-той таарна
-        error_text: null,
+        updated_at: new Date().toISOString(),
+        error: null,
       })
       .eq("id", jobId)
-      .eq("owner_token", ownerToken)
-      .in("status", ["UPLOADING", "CREATED"]); // allow legacy states
+      .eq("owner_token", ownerToken);
 
-    if (uErr) return json(false, null, uErr.message, 500);
+    if (updErr) return json(false, null, updErr.message, 500);
 
-    return json(true, { jobId, inputKey });
+    // JobService.markUploaded() -> { ok, data:{ jobId, inputKey } } shape
+    return json(true, { jobId, inputKey, expires_at: job.delete_at || null });
   } catch (e: any) {
-    return json(false, null, e?.message || "Server error", 500);
+    return json(false, null, e?.message || "Upload failed", 500);
   }
-}
-
-// Keep PUT returning 405 to catch old clients
-export async function PUT() {
-  return json(
-    false,
-    null,
-    "Use POST with JSON body { jobId }. Client must PUT directly to signed URL.",
-    405
-  );
 }

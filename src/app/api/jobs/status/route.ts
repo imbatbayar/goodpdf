@@ -12,23 +12,38 @@ function res(ok: boolean, data?: any, error?: string, status = 200) {
   );
 }
 
+function normStatus(s: any) {
+  const v = String(s || "").toUpperCase();
+  // allow known states; otherwise pass-through
+  return v || "UNKNOWN";
+}
+
 function clampPct(v: any, fallback = 0) {
   const n = Number(v);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(0, Math.min(100, Math.round(n)));
 }
 
+/**
+ * GET /api/jobs/status?jobId=<uuid>
+ * - Requires: x-owner-token header
+ * - Returns: { status, stage, progressPct, ... , errorText?, warningText? }
+ *
+ * Rules:
+ * - errorText ONLY when status === FAILED
+ * - warningText ONLY when status === DONE (fallback notice)
+ * - Never treat warning as error (prevents "Something went wrong" modal)
+ */
 export async function GET(req: Request) {
   try {
-    const { searchParams } = new URL(req.url);
-    const jobId = searchParams.get("jobId");
+    const url = new URL(req.url);
+    const jobId = String(url.searchParams.get("jobId") || "");
+    const ownerToken = req.headers.get("x-owner-token") || "";
+
     if (!jobId) return res(false, null, "Missing jobId", 400);
+    if (!ownerToken) return res(false, null, "Missing x-owner-token", 401);
 
-    // ✅ SECURITY GATE: require owner token
-    const ownerToken = (req.headers.get("x-owner-token") || "").trim();
-    if (!ownerToken) return res(false, null, "Forbidden", 403);
-
-    // ✅ Only fetch if owner_token matches (prevents jobId guessing)
+    // ✅ safest: select('*') so schema drift won't break (missing columns won't 500)
     const { data: job, error } = await supabaseAdmin
       .from("jobs")
       .select("*")
@@ -37,40 +52,61 @@ export async function GET(req: Request) {
       .maybeSingle();
 
     if (error) return res(false, null, error.message, 500);
+    if (!job) return res(false, null, "Not found", 404);
 
-    // ✅ Do NOT reveal existence if token mismatch
-    if (!job) return res(false, null, "Forbidden", 403);
+    const status = normStatus(job.status);
+    const stage = String(job.stage || "");
 
-    const status = String(job.status || "CREATED").toUpperCase();
-    const stage = String(job.stage || "").toUpperCase();
+    // Prefer progress_pct if exists, else fallback to progress
+    const progressPct = clampPct(job.progress_pct ?? job.progress ?? 0, 0);
 
-    const outputZipPath = job.output_zip_path || null;
+    // "expires" / "delete" anchors (support both)
+    const expiresAt = job.expires_at ?? job.delete_at ?? null;
 
-    // split-only progress
-    const progress = clampPct(job.progress, 0);
-    const splitProgress = clampPct(job.split_progress, progress);
+    // outputs (support both)
+    const zipPath = job.output_zip_path ?? job.zip_path ?? job.output_path ?? null;
+
+    // warning field (preferred) — if not present, simply null (won't break)
+    const warningText =
+      status === "DONE"
+        ? (job.warning_text ?? null)
+        : null;
+
+    // error field — ONLY for FAILED
+    const errorText =
+      status === "FAILED"
+        ? (job.error_text ?? job.error ?? null)
+        : null;
 
     return res(true, {
+      id: job.id,
       status,
       stage,
-      outputZipPath,
+      progressPct,
 
-      // progress (backward compat + canonical)
-      progress,
-      compressProgress: 100,
-      splitProgress,
-      compress_progress: 100,
-      split_progress: splitProgress,
+      // file meta
+      fileName: job.file_name ?? null,
+      fileSizeBytes: job.file_size_bytes ?? null,
+      fileType: job.file_type ?? null,
 
-      // summary
-      partsCount: job.parts_count ?? null,
-      maxPartMb: job.max_part_mb ?? null,
+      // split settings
+      splitMb: job.split_mb ?? null,
       targetMb: job.target_mb ?? job.split_mb ?? null,
+      maxPartMb: job.max_part_mb ?? null,
+
+      // results
+      partsCount: job.parts_count ?? null,
+      outputZipPath: zipPath,
+      outputZipBytes: job.output_zip_bytes ?? null,
 
       // lifecycle
-      expiresAt: job.expires_at ?? null,
+      expiresAt,
       cleaned: job.cleaned_at != null || status === "CLEANED",
-      errorText: job.error_text ?? null,
+      doneAt: job.done_at ?? null,
+
+      // messaging (IMPORTANT)
+      errorText,     // only when FAILED
+      warningText,   // only when DONE
     });
   } catch (e: any) {
     return res(false, null, e?.message || "Server error", 500);

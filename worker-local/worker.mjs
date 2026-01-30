@@ -1,6 +1,6 @@
 // worker-local/worker.mjs — GOODPDF (Split-only) Production Worker
 // Supabase schema (from jobs_rows.csv):
-// - output_zip_path, zip_path, ttl_minutes, delete_at, cleaned_at
+// - output_zip_path, zip_path, ttl_minutes, expires_at, cleaned_at
 // - parts_json, parts_count, total_parts_bytes, output_zip_bytes
 // - stage, progress, split_progress, error_text, error_code, claimed_by, claimed_at
 
@@ -17,6 +17,29 @@ import {
   PutObjectCommand,
   DeleteObjectCommand,
 } from "@aws-sdk/client-s3";
+
+function resolve7zExe() {
+  const envPath = (process.env.SEVEN_Z_EXE || "").trim();
+  const candidates = [
+    envPath || null,
+    "C:\\Program Files\\7-Zip\\7z.exe",
+    "C:\\Program Files (x86)\\7-Zip\\7z.exe",
+    "7z",
+  ].filter(Boolean);
+
+  for (const c of candidates) {
+    if (c === "7z") return c; // assume on PATH
+    try {
+      if (c.toLowerCase().endsWith(".exe") && fs.existsSync(c)) return c;
+    } catch {}
+  }
+  const err = new Error("7-Zip not found. Install 7-Zip or set SEVEN_Z_EXE env var.");
+  err.code = "MISSING_7Z";
+  throw err;
+}
+
+const SEVEN_Z_EXE = resolve7zExe();
+
 
 // ----------------------
 // ENV
@@ -61,7 +84,6 @@ const TIMEOUT_7Z_MS = Math.max(
 // Binaries (Dockerfile sets defaults; keep runtime flexible)
 const GS_EXE = process.env.GS_EXE || "gs";
 const QPDF_EXE = process.env.QPDF_EXE || "qpdf";
-const SEVEN_Z_EXE = process.env.SEVEN_Z_EXE || process.env.SEVENZ_EXE || "7z";
 
 // Preprocess behavior (Adobe-like): stabilize PDF structure + optionally recompress images.
 // (Not rasterizing pages; keeps PDF pages as PDF.)
@@ -107,6 +129,12 @@ function nowIso() {
 }
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function remainingMsFromExpiresAt(expiresAtIso) {
+  const t = Date.parse(expiresAtIso || "");
+  if (!Number.isFinite(t)) return null;
+  return t - Date.now();
 }
 function tmpDir(jobId) {
   const d = path.join(os.tmpdir(), `goodpdf_${jobId}`);
@@ -212,7 +240,7 @@ async function fetchQueue(limit = 1) {
   const { data, error } = await supabase
     .from("jobs")
     .select(
-      "id,input_path,split_mb,status,created_at,file_name,file_size_bytes,claimed_by,ttl_minutes"
+      "id,input_path,split_mb,status,created_at,file_name,file_size_bytes,claimed_by,ttl_minutes,expires_at"
     )
     .in("status", ["QUEUED"])
     .is("claimed_by", null)
@@ -280,7 +308,7 @@ async function uploadToR2(key, filePath, contentType) {
 }
 
 // ----------------------
-// Cleanup (delete_at + input_path + output_zip_path)
+// Cleanup (expires_at + input_path + output_zip_path)
 // ----------------------
 async function cleanupExpiredOutputs() {
   if (!DO_CLEANUP) return 0;
@@ -288,11 +316,11 @@ async function cleanupExpiredOutputs() {
   const { data, error } = await supabase
     .from("jobs")
     .select(
-      "id,input_path,output_zip_path,zip_path,delete_at,cleaned_at,status"
+      "id,input_path,output_zip_path,zip_path,expires_at,cleaned_at,status"
     )
     .is("cleaned_at", null)
-    .not("delete_at", "is", null)
-    .lt("delete_at", nowIso())
+    .not("expires_at", "is", null)
+    .lt("expires_at", nowIso())
     .limit(50);
 
   if (error) throw error;
@@ -1021,7 +1049,7 @@ async function splitPdfGreedy({
   return { partFiles, partMeta };
 }
 
-async function zipParts(partsDir, outZipPath) {
+async function zipParts(partsDir, outZipPath, timeoutMs) {
   // ✅ Wildcard ашиглахгүй — бодит PDF жагсаалтыг 7z-д өгнө (хоосон ZIP асуудлыг бүр мөсөн хаана)
   const pdfs = fs
     .readdirSync(partsDir)
@@ -1042,7 +1070,7 @@ async function zipParts(partsDir, outZipPath) {
   // outZipPath абсолют байж болно; cwd=partsDir үед файлуудыг нэрээр нь нэмнэ
   await runCmd(
     SEVEN_Z_EXE,
-    ["a", "-tzip", outZipPath, ...pdfs],
+    ["a", "-tzip", "-mx=0", "-mmt=on", outZipPath, ...pdfs],
     TIMEOUT_7Z_MS,
     {
       cwd: partsDir,
@@ -1054,6 +1082,11 @@ async function zipParts(partsDir, outZipPath) {
 // Process one job
 // ----------------------
 async function processOneJob(job) {
+  // 🔒 Hard pipeline deadline (sync with expires_at)
+  const remaining0 = remainingMsFromExpiresAt(job.expires_at);
+  if (remaining0 !== null && remaining0 <= 0) {
+    throw Object.assign(new Error("DEADLINE_EXCEEDED"), { code: "DEADLINE_EXCEEDED" });
+  }
   const jobId = job.id;
 
   const claimed = await claimJob(jobId);
@@ -1080,12 +1113,18 @@ async function processOneJob(job) {
 
     const originalBytes = safeStatSize(inPdf) ?? null;
 
-    const splitMb = Number(job.split_mb || 0);
-    if (!Number.isFinite(splitMb) || splitMb <= 0) {
+    const rawSplitMb = Number(job.split_mb || 0);
+    if (!Number.isFinite(rawSplitMb) || rawSplitMb <= 0) {
       throw Object.assign(new Error("split_mb missing/invalid"), {
         code: "SPLIT_MB_INVALID",
       });
     }
+
+    // SYSTEM-FIT mode uses a sentinel split_mb (no DB schema changes).
+    // Any value >= 490 triggers: max 5 files, max 9MB each (compatibility-first).
+    const systemFit = rawSplitMb >= 490;
+    const splitMb = systemFit ? 9 : rawSplitMb;
+    const maxParts = systemFit ? 5 : null;
 
     const limitBytes = mbToBytes(splitMb);
     let workPdf = inPdf;
@@ -1113,7 +1152,7 @@ async function processOneJob(job) {
       updated_at: nowIso(),
     });
 
-    const expectedParts = (() => {
+    const expectedParts = systemFit ? maxParts : (() => {
       const b = safeStatSize(inPdf);
       if (typeof b === "number" && b > 0)
         return Math.max(1, Math.ceil(b / limitBytes));
@@ -1130,9 +1169,11 @@ async function processOneJob(job) {
     // If the result is wildly more parts than expected, the PDF is still "size-unstable".
     // Do one more (stronger) preprocess pass and split again.
     if (
-      expectedParts &&
-      partFiles.length > Math.ceil(expectedParts * 1.6) &&
-      PREPROCESS_MODE !== "OFF"
+      PREPROCESS_MODE !== "OFF" &&
+      (
+        (systemFit && maxParts && partFiles.length > maxParts) ||
+        (expectedParts && partFiles.length > Math.ceil(expectedParts * 1.6))
+      )
     ) {
       // Stronger preset (still NOT rasterizing pages)
       await updateJob(jobId, {
@@ -1200,6 +1241,20 @@ async function processOneJob(job) {
       }));
     }
 
+
+// SYSTEM-FIT primary goal: try to stay within maxParts (usually 5).
+// If we cannot do that without excessive quality loss, we do NOT stop.
+// We keep the per-part size cap (e.g., 9MB) and allow more parts, and we attach a user-facing warning.
+if (systemFit && maxParts && partFiles.length > maxParts) {
+  const warn =
+    `We tried to split into ≤${maxParts} files under ${splitMb}MB each. ` +
+    `This PDF would require excessive quality loss to fit in ≤${maxParts}, ` +
+    `so we split into ${partFiles.length} files (still ≤${splitMb}MB each) to preserve quality. ` +
+    `If you want a smaller per-file size, use Manual mode.`;
+
+  // Best-effort: store warning in `error` (exists in DB). We do not change status.
+  await updateJob(jobId, { warning_text: warn, updated_at: nowIso() });
+}
     await updateJob(jobId, {
       stage: "ZIP",
       progress: 70,
@@ -1208,7 +1263,14 @@ async function processOneJob(job) {
     });
 
     const outZip = path.join(wd, "goodpdf.zip");
-    await zipParts(partsDir, outZip);
+      // 🔒 ZIP timeout is bounded by remaining time
+  const remainingZip = remainingMsFromExpiresAt(job.expires_at);
+  const timeoutZip =
+    remainingZip === null
+      ? TIMEOUT_7Z_MS
+      : Math.max(30_000, Math.min(180_000, remainingZip - 30_000));
+
+  await zipParts(partsDir, outZip, timeoutZip);
 
     await updateJob(jobId, {
       stage: "UPLOAD_OUT",
@@ -1248,7 +1310,7 @@ async function processOneJob(job) {
       zip_path: outZipKey, // legacy compatibility
 
       ttl_minutes: ttlMinutes,
-      delete_at: deleteAtIso,
+      expires_at: deleteAtIso,
 
       parts_count: partFiles.length,
       parts_json: partMeta,
