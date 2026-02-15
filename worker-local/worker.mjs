@@ -65,6 +65,8 @@ const R2_BUCKET_OUT =
 
 const POLL_MS = Number(process.env.POLL_MS || 2000);
 const CONCURRENCY = Math.max(1, Number(process.env.CONCURRENCY || 1));
+const SPLIT_PAR = Math.max(1, Number(process.env.SPLIT_PAR || 4));
+const SYS_CHUNK_PAR = Math.max(1, Number(process.env.SYS_CHUNK_PAR || 1));
 const DEFAULT_TTL_MINUTES = 10;
 
 const DO_CLEANUP =
@@ -178,6 +180,24 @@ function mbToBytes(mb) {
 }
 function rand6() {
   return crypto.randomBytes(3).toString("hex");
+}
+
+// Simple async pool (concurrency limiter) without deps
+async function asyncPool(limit, items, iteratorFn) {
+  const ret = new Array(items.length);
+  let i = 0;
+
+  const workers = new Array(Math.min(limit, items.length))
+    .fill(0)
+    .map(async () => {
+      while (i < items.length) {
+        const idx = i++;
+        ret[idx] = await iteratorFn(items[idx], idx);
+      }
+    });
+
+  await Promise.all(workers);
+  return ret;
 }
 function streamToFile(stream, outPath) {
   return new Promise((resolve, reject) => {
@@ -781,8 +801,9 @@ async function splitSinglePass({ inPdf, partsDir, ranges, expiresAtIso }) {
       `.__range_${String(i + 1).padStart(3, "0")}_${s}_${e}_${rand6()}.pdf`,
     );
 
-  for (let i = 0; i < ranges.length; i++) {
-    const { start, end } = ranges[i];
+  // Parallel extract ranges with qpdf (order preserved by index)
+  const results = await asyncPool(SPLIT_PAR, ranges, async (r, i) => {
+    const { start, end } = r;
     const outPath = tmpName(i, start, end);
 
     await runCmd(
@@ -792,8 +813,10 @@ async function splitSinglePass({ inPdf, partsDir, ranges, expiresAtIso }) {
     );
 
     const b = safeStatSize(outPath) ?? 0;
-    tmpParts.push({ tmpPath: outPath, start, end, bytes: b });
-  }
+    return { tmpPath: outPath, start, end, bytes: b };
+  });
+
+  for (const p of results) tmpParts.push(p);
 
   const totalParts = tmpParts.length;
   const partFiles = [];
@@ -872,7 +895,7 @@ async function systemChunkCompressToParts({
 }) {
   const CAP = SYSTEM_PART_BYTES;
   const TARGET = Math.max(256 * 1024, CAP - 180 * 1024); // keep headroom; stay near 9MB
-  const ranges = buildSystemChunkRanges(totalPages);
+  let workRanges = buildSystemChunkRanges(totalPages);
   const tmpOuts = [];
 
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
@@ -955,12 +978,19 @@ async function systemChunkCompressToParts({
     return bestUnder;
   }
 
-  for (let i = 0; i < ranges.length; i++) {
-    const { start, end } = ranges[i];
-    const extracted = path.join(
-      wd,
-      `sys_chunk_${String(i + 1).padStart(2, "0")}_${start}_${end}.pdf`,
-    );
+  // Dynamic shrink: if a chunk cannot be compressed under 9MB, split its page-range and retry.
+  // This guarantees the 9MB law without breaking the job.
+  let chunkSeq = 0;
+  const MAX_DYNAMIC_PARTS = 50; // safety
+
+  while (workRanges.length > 0) {
+    const r = workRanges.shift();
+    const { start, end } = r;
+
+    chunkSeq += 1;
+    const tag = String(chunkSeq).padStart(2, "0");
+
+    const extracted = path.join(wd, `sys_chunk_${tag}_${start}_${end}.pdf`);
 
     await extractRangePdf({
       inPdf,
@@ -970,12 +1000,36 @@ async function systemChunkCompressToParts({
       expiresAtIso,
     });
 
-    const best = await compressOneChunk(
-      extracted,
-      `sys_chunk_${String(i + 1).padStart(2, "0")}`,
-    );
+    try {
+      const best = await compressOneChunk(extracted, `sys_chunk_${tag}`);
+      tmpOuts.push({ tmpPath: best.pdf, bytes: best.bytes, start, end });
+    } catch (e) {
+      const code = e?.code || "";
+      if (code === "SYSTEM_PART_OVER_9MB") {
+        // If we can split further, split the range and retry (keep order).
+        if (start < end) {
+          const mid = Math.floor((start + end) / 2);
+          workRanges = [
+            { start, end: mid },
+            { start: mid + 1, end },
+            ...workRanges,
+          ];
 
-    tmpOuts.push({ tmpPath: best.pdf, bytes: best.bytes, start, end });
+          if (workRanges.length > MAX_DYNAMIC_PARTS) {
+            const ee = new Error("SYSTEM_TOO_MANY_PARTS");
+            ee.code = "SYSTEM_TOO_MANY_PARTS";
+            throw ee;
+          }
+          continue;
+        }
+
+        // Single page still cannot fit under 9MB (extremely rare).
+        const ee = new Error("SYSTEM_SINGLE_PAGE_OVER_9MB");
+        ee.code = "SYSTEM_SINGLE_PAGE_OVER_9MB";
+        throw ee;
+      }
+      throw e;
+    }
   }
 
   // Write final names into partsDir
