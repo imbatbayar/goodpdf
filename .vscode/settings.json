@@ -32,5 +32,6 @@
   },
   "[typescriptreact]": {
     "editor.defaultFormatter": "denoland.vscode-deno"
-  }
+  },
+  "python-envs.pythonProjects": []
 }
