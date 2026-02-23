@@ -88,8 +88,6 @@ const CLEANUP_EVERY_MS = Math.max(
 // Binaries
 const GS_EXE = process.env.GS_EXE || "gs";
 const QPDF_EXE = process.env.QPDF_EXE || "qpdf";
-const DEBUG_LOGS =
-  String(process.env.DEBUG_LOGS || "false").toLowerCase() === "true";
 
 // Timeouts (bounded by expires_at too)
 const TIMEOUT_QPDF_MS = Math.max(
@@ -336,9 +334,6 @@ async function updateJob(jobId, patch) {
 
 async function fetchQueue(limit = 1) {
   // Robust queue fetch with debug + timeout (prevents silent hangs)
-  if (DEBUG_LOGS) {
-    console.log("[fetchQueue] enter (limit =", limit + ")");
-  }
   const t0 = Date.now();
 
   // Accept multiple status spellings to avoid mismatches between API + worker.
@@ -378,7 +373,7 @@ async function fetchQueue(limit = 1) {
   }
 
   const rows = res?.data || [];
-  if (DEBUG_LOGS) {
+  if (rows.length > 0) {
     console.log("[fetchQueue] exit got =", rows.length, "(ms =", ms + ")");
   }
   return rows;
@@ -401,7 +396,7 @@ async function claimJob(jobId) {
     .from("jobs")
     .update(patch)
     .eq("id", jobId)
-    .eq("status", "QUEUED")
+    .in("status", ["QUEUED", "UPLOADED"])
     .select("id")
     .maybeSingle();
 
@@ -1001,13 +996,15 @@ async function processDefaultFast({
     });
 
     const p1 = path.join(wd, `.__auto_${rand6()}.pdf`);
+    const startBytes = safeStatSize(workPdf) ?? 0;
     const ok1 = await gsCompressOnce({
       inPdf: workPdf,
       outPdf: p1,
       mode: "PRESET",
-      dpi: 85,
-      jpegQ: 45,
-      pdfSettings: "/screen",
+      // Bigger inputs need more aggressive downsample to reach ~45MB cap.
+      dpi: startBytes > 150 * 1024 * 1024 ? 80 : 95,
+      jpegQ: startBytes > 150 * 1024 * 1024 ? 35 : 45,
+      pdfSettings: startBytes > 150 * 1024 * 1024 ? "/screen" : "/ebook",
       expiresAtIso,
     });
     if (ok1) workPdf = p1;
@@ -1022,121 +1019,70 @@ async function processDefaultFast({
     updated_at: nowIso(),
   });
 
-  const pages = await qpdfPages(workPdf, expiresAtIso);
+  // ----------------------
+  // SPLIT (DEFAULT / system-fit) — LOCKED RULES
+  //  - Always target <= SYSTEM_MAX_PARTS parts (default 5)
+  //  - Part size target = SYSTEM_PART_MB (default 9MB)
+  //  - At most: 1 split attempt + 1 ULTRA compress + 1 split attempt
+  //  - If still oversize, use oversize-safe (no fail)
+  // ----------------------
 
-  // Split by 9MB (hard). Parts unlimited.
-  const targetBytes = SYSTEM_PART_BYTES; // 9MB default
+  const targetBytes = SYSTEM_PART_BYTES; // 9MB
+  const maxParts = Math.max(1, SYSTEM_MAX_PARTS); // 5
 
+  // helper: wipe parts dir
   const wipePartsDir = () => {
     try {
       for (const f of fs.readdirSync(partsDir)) {
         if (f.toLowerCase().endsWith(".pdf"))
           safeUnlink(path.join(partsDir, f));
       }
+      // remove internal temp dirs if any
+      safeRm(path.join(partsDir, ".__single_pages"));
     } catch {}
   };
 
-  const attemptSplit = async (partsCount) => {
+  const attemptSplitLocked = async (pdfPath) => {
     wipePartsDir();
+    const pages0 = await qpdfPages(pdfPath, expiresAtIso);
+    const ranges = buildEqualRanges(pages0, Math.min(maxParts, pages0));
     return await splitSinglePass({
-      inPdf: workPdf,
+      inPdf: pdfPath,
       partsDir,
-      ranges: buildEqualRanges(pages, partsCount),
+      ranges,
       expiresAtIso,
     });
   };
 
-  const fill = 0.92;
-  let parts = Math.max(
-    1,
-    Math.min(
-      pages,
-      Math.ceil(bytes / Math.max(256 * 1024, Math.floor(targetBytes * fill))),
-    ),
-  );
+  // 1) split once (<=5)
+  let res = await attemptSplitLocked(workPdf);
 
-  let res = await attemptSplit(parts);
-
-  // Enforce hard part size: resplit with more parts (bounded; qpdf is fast).
-  let guard = 0;
-  while (
-    maxPartBytes(res.partMeta) > targetBytes &&
-    parts < pages &&
-    guard < 6
-  ) {
-    const nextParts = Math.min(
-      pages,
-      Math.max(parts + 1, Math.ceil(parts * 1.5)),
-    );
-    if (nextParts === parts) break;
-    parts = nextParts;
-    res = await attemptSplit(parts);
-    guard++;
-  }
-
-  // If we still can't fit (even at high part count), this usually means
-  // one or more SINGLE pages are too large to be <= 9MB after the default pass.
-  // To avoid failing for these rare cases, do ONE extra aggressive pass, then retry split.
-  if (maxPartBytes(res.partMeta) > targetBytes && !softStop()) {
+  // 2) if oversize, do ONE ULTRA GS pass, then split once more (<=5)
+  if (!softStop() && maxPartBytes(res.partMeta) > targetBytes) {
     await updateJob(jobId, {
-      stage: "FALLBACK_ULTRA_COMPRESS",
+      stage: "FALLBACK_ULTRA",
       progress: 62,
       split_progress: 44,
       updated_at: nowIso(),
     });
 
-    const p2 = path.join(wd, `.__auto_ultra_${rand6()}.pdf`);
-    const ok2 = await gsCompressOnce({
+    const ultraPdf = path.join(wd, `.__ultra_${rand6()}.pdf`);
+    const okU = await gsCompressOnce({
       inPdf: workPdf,
-      outPdf: p2,
-      mode: "PRESET",
-      dpi: 75, // more aggressive
-      jpegQ: 35, // more aggressive
-      pdfSettings: "/screen",
+      outPdf: ultraPdf,
+      mode: "NUCLEAR",
       expiresAtIso,
+      dpi: 72,
+      jpegQ: 30,
+      pdfSettings: "/screen",
     });
+    if (okU) workPdf = ultraPdf;
 
-    if (ok2) {
-      workPdf = p2;
-
-      const bytes2 = safeStatSize(workPdf) ?? bytes;
-      const pages2 = await qpdfPages(workPdf, expiresAtIso);
-
-      const fill2 = 0.9;
-      parts = Math.max(
-        1,
-        Math.min(
-          pages2,
-          Math.ceil(
-            bytes2 / Math.max(256 * 1024, Math.floor(targetBytes * fill2)),
-          ),
-        ),
-      );
-
-      res = await attemptSplit(parts);
-
-      let guard2 = 0;
-      while (
-        maxPartBytes(res.partMeta) > targetBytes &&
-        parts < pages2 &&
-        guard2 < 8
-      ) {
-        const nextParts = Math.min(
-          pages2,
-          Math.max(parts + 1, Math.ceil(parts * 1.6)),
-        );
-        if (nextParts === parts) break;
-        parts = nextParts;
-        res = await attemptSplit(parts);
-        guard2++;
-      }
-    }
+    res = await attemptSplitLocked(workPdf);
   }
 
+  // 3) still oversize -> oversize-safe split (no fail)
   if (maxPartBytes(res.partMeta) > targetBytes) {
-    // Oversize-safe fallback: do NOT fail the job.
-    // Emit OVERSIZE_pageNN.pdf for pages that cannot fit <= targetBytes,
-    // and pack the rest into normal parts.
     await updateJob(jobId, {
       stage: "OVERSIZE_SAFE_SPLIT",
       progress: 70,
@@ -1144,6 +1090,7 @@ async function processDefaultFast({
       updated_at: nowIso(),
     });
 
+    // oversize-safe may create OVERSIZE_pageNN + packed parts
     res = await splitOversizeSafe({
       inPdf: workPdf,
       partsDir,
@@ -1466,7 +1413,7 @@ async function main() {
 
   let lastCleanupAt = 0;
   let pollTick = 0;
-  let lastNoJobsPollLogAt = 0;
+  let lastIdlePollLogAt = 0;
 
   while (true) {
     try {
@@ -1477,21 +1424,20 @@ async function main() {
       }
 
       const jobs = await fetchQueue(CONCURRENCY);
+      pollTick++;
 
       if (!jobs.length) {
         const nowMs = Date.now();
-        if (nowMs - lastNoJobsPollLogAt >= 30_000) {
-          lastNoJobsPollLogAt = nowMs;
-          console.log("[POLL] idle, tick =", ++pollTick, "no jobs");
+        if (nowMs - lastIdlePollLogAt >= 30_000) {
+          lastIdlePollLogAt = nowMs;
+          console.log("[POLL] idle tick =", pollTick, "jobs = 0");
         }
         await sleep(POLL_MS);
         continue;
       }
 
       console.log(
-        "[POLL] jobs =",
-        jobs.length,
-        "first_job_id =",
+        "[POLL] taking first job =",
         jobs[0]?.id,
         "status =",
         jobs[0]?.status,
