@@ -9,7 +9,7 @@ import { useUploadFlow } from "@/services/hooks/useUploadFlow";
 import { JobService } from "@/services/JobService";
 import { Card } from "@/components/blocks/Card";
 
-type DownloadUX = "IDLE" | "PREPARE" | "CONFIRM" | "SUCCESS";
+type DownloadUX = "IDLE" | "PREPARE" | "SUCCESS";
 type Step = "PICK" | "SETTINGS" | "RUN";
 type StepState = "pending" | "active" | "done";
 type PipelineRow = { key: string; label: string; stages: string[]; state: StepState; pct: number };
@@ -136,6 +136,14 @@ function activeStageKey(rows: PipelineRow[]) {
 function kickoffPctForIndex(i: number) {
   // 3/4/5%-ийн зөөлөн эхлэл (stage transition UI feel)
   return 3 + (i % 3);
+}
+function stageWorkingLabel(key: string) {
+  const k = String(key || "").toUpperCase();
+  if (k === "ANALYZE") return "Analyze";
+  if (k === "COMPRESS") return "Compress";
+  if (k === "SPLIT") return "Split";
+  if (k === "ZIP") return "Zipping";
+  return "Analyze";
 }
 
 function parseMbInt(s: string) {
@@ -379,19 +387,15 @@ export function UploadScreen() {
 
     try {
       await JobService.downloadZip(flow.jobId);
-      setDlUx("CONFIRM");
+      try {
+        await flow.confirmDone();
+      } catch {}
+      setDlUx("SUCCESS");
+      window.setTimeout(() => hardReset(), 1000);
     } catch (e: any) {
       setDlUx("IDLE");
       setDownloadError(e?.message || "Download failed");
     }
-  };
-
-  const confirmCleanupAndReset = async () => {
-    setDlUx("SUCCESS");
-    try {
-      await flow.confirmDone();
-    } catch {}
-    window.setTimeout(() => hardReset(), 1000);
   };
 
   const FileMetaCard = () =>
@@ -406,9 +410,12 @@ export function UploadScreen() {
       </Card>
     ) : null;
 
-  // UI дээр харуулах progress / нэг мөр систем мэдээлэл
+  // UI progress:
+  // - Top "Processing %": real backend progress only
+  // - 4 pipeline rows: real + soft heartbeat to avoid frozen feeling
   const realProgress = typeof flow.progressPct === "number" ? flow.progressPct : 0;
-  const uiProgress =
+  const processingProgress = clampPct(realProgress);
+  const pipelineProgress =
     flow.phase === "PROCESSING"
       ? Math.max(realProgress, procFakePct)
       : realProgress;
@@ -416,8 +423,8 @@ export function UploadScreen() {
   const uiLine =
         (SYSTEM_TICK_MESSAGES[procTick % SYSTEM_TICK_MESSAGES.length] || "");
   const pipelineRowsRaw = useMemo(
-    () => calcPipelineRows(flow.stageCode || "", clampPct(uiProgress), flow.phase),
-    [flow.phase, flow.stageCode, uiProgress]
+    () => calcPipelineRows(flow.stageCode || "", clampPct(pipelineProgress), flow.phase),
+    [flow.phase, flow.stageCode, pipelineProgress]
   );
   const showProcessingCard = step === "RUN" && flow.phase !== "READY" && !flow.error;
 
@@ -431,15 +438,9 @@ export function UploadScreen() {
       return;
     }
     if (flow.phase === "PROCESSING") {
-      const target = Math.min(99, Math.max(1, clampPct(uiProgress)));
-      setStableRunPct((prev) => {
-        // Keep continuous motion but avoid unrealistic leaps.
-        if (target > prev + 2) return prev + 2;
-        if (target < prev) return prev;
-        return target;
-      });
+      setStableRunPct((prev) => Math.max(prev, processingProgress));
     }
-  }, [step, flow.phase, uiProgress]);
+  }, [step, flow.phase, processingProgress]);
 
   useEffect(() => {
     if (step !== "RUN") return;
@@ -448,7 +449,7 @@ export function UploadScreen() {
       const noActive = target.every((r) => r.state === "pending" && r.pct === 0);
       if (flow.phase === "PROCESSING" && noActive && target.length > 0) {
         target[0].state = "active";
-        target[0].pct = Math.max(1, Math.min(25, clampPct(uiProgress)));
+        target[0].pct = Math.max(1, Math.min(25, clampPct(pipelineProgress)));
       }
       return prev.map((oldRow, i) => {
         const nxt = target[i] || oldRow;
@@ -462,7 +463,7 @@ export function UploadScreen() {
         return { ...oldRow, state, pct };
       });
     });
-  }, [step, flow.phase, uiProgress, pipelineRowsRaw]);
+  }, [step, flow.phase, pipelineProgress, pipelineRowsRaw]);
 
   // Smooth row percentages to avoid abrupt jumps.
   useEffect(() => {
@@ -477,38 +478,40 @@ export function UploadScreen() {
             target.state === "pending" &&
             row.pct <= 0 &&
             prevDone;
+          const isStageActive =
+            flow.phase === "PROCESSING" &&
+            (target.state === "active" || row.state === "active" || bridgeKick);
           let nextPct = row.pct;
           if (flow.phase === "READY") {
             nextPct = 100;
           } else if (target.state === "done") {
-            nextPct = Math.min(100, row.pct + 2);
-          } else if (target.state === "active" && flow.phase === "PROCESSING") {
+            nextPct = Math.min(100, row.pct + 1);
+          } else if (isStageActive) {
             const total = Math.max(1, stickyRows.length);
             const span = 100 / total;
-            const overall = clampPct(uiProgress);
+            const overall = clampPct(pipelineProgress);
             const base = i * span;
             const derived = Math.max(
               0,
               Math.min(97, Math.round(((overall - base) / span) * 100)),
             );
-            // Keep active stage moving, but prevent unrealistic jump-to-99 behavior.
-            const softCap = Math.min(94, Math.max(28, derived + 8));
-            const stepInc = derived > row.pct ? 2 : 1;
-            if (derived > row.pct) {
-              nextPct = Math.min(softCap, row.pct + stepInc);
-              rowHeartbeatAtRef.current[i] = Date.now();
-            } else {
-              // Heartbeat UX: if a stage seems stuck, nudge +1% every 10s.
-              const now = Date.now();
-              const lastAt = rowHeartbeatAtRef.current[i] || 0;
-              if (now - lastAt >= 10_000 && row.pct < softCap) {
-                nextPct = Math.min(softCap, row.pct + 1);
-                rowHeartbeatAtRef.current[i] = now;
-              }
+            // Controlled active growth: +1% every 2s from current/stuck value.
+            // This avoids premature 90%+ spikes while still preventing "frozen" feeling.
+            const softCap = Math.min(90, Math.max(24, derived + 6));
+            const now = Date.now();
+            const lastAt = rowHeartbeatAtRef.current[i] || 0;
+            if (row.pct <= 0) {
+              // Immediately show life when a stage becomes active.
+              nextPct = Math.min(softCap, kickoffPctForIndex(i));
+              rowHeartbeatAtRef.current[i] = now;
+            } else if (now - lastAt >= 2_000 && row.pct < softCap) {
+              nextPct = Math.min(softCap, row.pct + 1);
+              rowHeartbeatAtRef.current[i] = now;
             }
           } else if (bridgeKick) {
             // If previous stage finished, pre-warm next stage at 3-5%.
             nextPct = Math.max(row.pct, kickoffPctForIndex(i));
+            rowHeartbeatAtRef.current[i] = Date.now();
           }
           return {
             ...row,
@@ -519,7 +522,7 @@ export function UploadScreen() {
       );
     }, 90);
     return () => window.clearInterval(timer);
-  }, [step, stickyRows, flow.phase, uiProgress]);
+  }, [step, stickyRows, flow.phase, pipelineProgress]);
 
   useEffect(() => {
     if (step !== "RUN" || flow.phase !== "PROCESSING" || flow.error) {
@@ -769,7 +772,8 @@ export function UploadScreen() {
                       <span>{stableRunPct}%</span>
                     </div>
                     <div className="text-xs text-zinc-500">
-                      Working: <span className="font-semibold">{String(stageCounter).padStart(3, "0")}</span>
+                      Working {stageWorkingLabel(activeStage)}{" "}
+                      <span className="font-semibold">{String(stageCounter).padStart(3, "0")}</span>
                       {liveStageLine ? ` • ${liveStageLine}` : ""}
                     </div>
 
@@ -874,7 +878,7 @@ export function UploadScreen() {
                           disabled={!canDownload || !flow.jobId}
                           onClick={startDownloadAndPrepare}
                         >
-                          Download ZIP
+                          Download
                         </Button>
                       ) : null}
                       {downloadError ? (
@@ -885,22 +889,9 @@ export function UploadScreen() {
 
                       {dlUx === "PREPARE" ? (
                         <>
-                          <Button disabled>End</Button>
+                          <Button disabled>Download</Button>
                           <div className="text-xs text-zinc-500">
-                            End
-                          </div>
-                        </>
-                      ) : null}
-
-                      {dlUx === "CONFIRM" ? (
-                        <>
-                          <Button onClick={confirmCleanupAndReset}>
-                            Confirm
-                          </Button>
-                          <div className="text-xs text-zinc-500">
-                            Secure cleanup in progress. Your files are already
-                            scheduled for deletion and will be permanently
-                            removed within 10 minutes.
+                            Download
                           </div>
                         </>
                       ) : null}
