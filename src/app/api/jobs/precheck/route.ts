@@ -184,6 +184,29 @@ function estimateProfile(
     etaMinHigh = Math.max(etaMinHigh, 14);
   }
 
+  // Guardrails: avoid undercharging obvious heavy-image workloads.
+  if (
+    etaMinHigh >= 8 ||
+    (avgMbPerPage != null && avgMbPerPage >= 1.0) ||
+    imgPerSampleMb >= 2.5
+  ) {
+    tokenCost = Math.max(tokenCost, 2) as 1 | 2 | 3;
+    if (tokenCost >= 2) mode = "HEAVY";
+    etaMinLow = Math.max(etaMinLow, 5);
+    etaMinHigh = Math.max(etaMinHigh, 9);
+  }
+  if (
+    etaMinHigh >= 12 ||
+    (avgMbPerPage != null &&
+      avgMbPerPage >= 1.4 &&
+      (sig.jpxRefs >= 1 || imgPerSampleMb >= 3.2))
+  ) {
+    tokenCost = 3;
+    mode = "EXTREME";
+    etaMinLow = Math.max(etaMinLow, 8);
+    etaMinHigh = Math.max(etaMinHigh, 14);
+  }
+
   if (tokenCost === 1) reason.push("Fast path: low complexity (cost-saving)");
   if (fileSizeMb >= 45) reason.push("Large input file");
   if (avgMbPerPage != null && avgMbPerPage >= 0.9) reason.push("High MB per page");
