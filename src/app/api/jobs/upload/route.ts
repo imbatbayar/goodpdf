@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabase/admin";
+import { checkRateLimit, rateLimitResponse } from "@/lib/rate-limit";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -14,6 +15,9 @@ function json(ok: boolean, data?: any, error?: string, status = 200) {
 
 export async function POST(req: Request) {
   try {
+    const rl = checkRateLimit(req, { key: "jobs:upload", limit: 40, windowMs: 60_000 });
+    if (!rl.ok) return rateLimitResponse(rl.retryAfterSec);
+
     // ✅ JobService.markUploaded() чинь JSON явуулдаг:
     // fetch("/api/jobs/upload", { headers:{ "content-type":"application/json", "x-owner-token":... }, body: JSON.stringify({jobId}) })
     const ct = req.headers.get("content-type") || "";
@@ -36,7 +40,7 @@ export async function POST(req: Request) {
       .eq("owner_token", ownerToken)
       .maybeSingle();
 
-    if (selErr) return json(false, null, selErr.message, 500);
+    if (selErr) return json(false, null, "Failed to validate upload", 500);
     if (!job) return json(false, null, "Forbidden", 403);
 
     const inputKey = String(job.input_path || "");
@@ -56,11 +60,11 @@ export async function POST(req: Request) {
       .eq("id", jobId)
       .eq("owner_token", ownerToken);
 
-    if (updErr) return json(false, null, updErr.message, 500);
+    if (updErr) return json(false, null, "Failed to mark upload", 500);
 
     // JobService.markUploaded() -> { ok, data:{ jobId, inputKey } } shape
     return json(true, { jobId, inputKey, expires_at: job.delete_at || null });
   } catch (e: any) {
-    return json(false, null, e?.message || "Upload failed", 500);
+    return json(false, null, "Upload failed", 500);
   }
 }

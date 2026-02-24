@@ -5,6 +5,7 @@ export const revalidate = 0;
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabase/admin";
 import { S3Client, DeleteObjectsCommand } from "@aws-sdk/client-s3";
+import { checkRateLimit, rateLimitResponse } from "@/lib/rate-limit";
 
 function json(ok: boolean, data?: any, error?: string, status = 200) {
   return NextResponse.json(
@@ -38,7 +39,11 @@ function cleanKey(k: any): string | null {
   if (!k) return null;
   const s = String(k).trim();
   if (!s) return null;
-  return s.replace(/^\/+/, "");
+  const normalized = s.replace(/^\/+/, "");
+  if (normalized.includes("..")) return null;
+  if (normalized.includes("\\")) return null;
+  if (!/^[A-Za-z0-9._/-]+$/.test(normalized)) return null;
+  return normalized;
 }
 
 async function r2DeleteMany(bucket: string, keys: (string | null | undefined)[]) {
@@ -55,6 +60,9 @@ async function r2DeleteMany(bucket: string, keys: (string | null | undefined)[])
 
 export async function POST(req: Request) {
   try {
+    const rl = checkRateLimit(req, { key: "jobs:cancel", limit: 20, windowMs: 60_000 });
+    if (!rl.ok) return rateLimitResponse(rl.retryAfterSec);
+
     const body = await req.json().catch(() => ({} as any));
     const jobId = String(body.jobId || "").trim();
     if (!jobId) return json(false, null, "Missing jobId", 400);
@@ -70,7 +78,7 @@ export async function POST(req: Request) {
       .eq("owner_token", ownerToken)
       .maybeSingle();
 
-    if (error) return json(false, null, error.message, 500);
+    if (error) return json(false, null, "Failed to read job", 500);
 
     // ✅ Do NOT reveal existence if token mismatch
     if (!job) return json(false, null, "Forbidden", 403);
@@ -100,10 +108,10 @@ export async function POST(req: Request) {
       .eq("id", jobId)
       .eq("owner_token", ownerToken);
 
-    if (u2) return json(false, null, u2.message, 500);
+    if (u2) return json(false, null, "Failed to finalize cancellation", 500);
 
     return json(true, { jobId, status: "CLEANED", cleanedAt: now });
   } catch (e: any) {
-    return json(false, null, e?.message || "Server error", 500);
+    return json(false, null, "Server error", 500);
   }
 }

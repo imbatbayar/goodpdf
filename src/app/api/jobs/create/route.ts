@@ -3,6 +3,7 @@ import { supabaseAdmin } from "@/lib/supabase/admin";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import crypto from "node:crypto";
+import { checkRateLimit, rateLimitResponse } from "@/lib/rate-limit";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -10,6 +11,9 @@ export const revalidate = 0;
 
 // 🔒 LOCKED TTL: privacy-first retention baseline
 const LOCKED_TTL_MINUTES = 10;
+const MAX_UPLOAD_BYTES = 500 * 1024 * 1024;
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function json(ok: boolean, data?: any, error?: string, status = 200) {
   return NextResponse.json(
@@ -28,6 +32,9 @@ console.log("[R2 ENV CHECK]", {
 
 export async function POST(req: Request) {
   try {
+    const rl = checkRateLimit(req, { key: "jobs:create", limit: 20, windowMs: 60_000 });
+    if (!rl.ok) return rateLimitResponse(rl.retryAfterSec);
+
     const body = await req.json().catch(() => null);
 
     const userId = String(body?.userId || "").trim();
@@ -35,9 +42,16 @@ export async function POST(req: Request) {
     const fileSizeBytes = Number(body?.fileSizeBytes || 0);
 
     if (!userId) return json(false, null, "userId is required.", 400);
+    if (!UUID_RE.test(userId)) return json(false, null, "userId is invalid.", 400);
     if (!fileName) return json(false, null, "fileName is required.", 400);
     if (!Number.isFinite(fileSizeBytes) || fileSizeBytes <= 0) {
       return json(false, null, "fileSizeBytes is invalid.", 400);
+    }
+    if (fileSizeBytes > MAX_UPLOAD_BYTES) {
+      return json(false, null, "File is too large. Maximum is 500MB.", 413);
+    }
+    if (!fileName.toLowerCase().endsWith(".pdf")) {
+      return json(false, null, "Only PDF files are supported.", 400);
     }
 
     const R2_ENDPOINT = process.env.R2_ENDPOINT!;
@@ -96,7 +110,7 @@ export async function POST(req: Request) {
       .select("id")
       .single();
 
-    if (jobErr) return json(false, null, jobErr.message, 500);
+    if (jobErr) return json(false, null, "Failed to create job.", 500);
 
     const jobId = jobRow.id as string;
 
@@ -125,7 +139,7 @@ export async function POST(req: Request) {
       })
       .eq("id", jobId);
 
-    if (updErr) return json(false, null, updErr.message, 500);
+    if (updErr) return json(false, null, "Failed to initialize job.", 500);
 
     // -----------------------------
     // response
@@ -144,6 +158,6 @@ export async function POST(req: Request) {
     });
   } catch (e: any) {
     console.error("[/api/jobs/create ERROR]", e);
-    return json(false, null, String(e?.message || e), 500);
+    return json(false, null, "Create failed.", 500);
   }
 }
