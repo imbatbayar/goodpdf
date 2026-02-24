@@ -4,6 +4,7 @@ export const revalidate = 0;
 
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabase/admin";
+import { checkRateLimit, rateLimitResponse } from "@/lib/rate-limit";
 
 function res(ok: boolean, data?: any, error?: string, status = 200) {
   return NextResponse.json(
@@ -36,6 +37,9 @@ function clampPct(v: any, fallback = 0) {
  */
 export async function GET(req: Request) {
   try {
+    const rl = checkRateLimit(req, { key: "jobs:status", limit: 120, windowMs: 60_000 });
+    if (!rl.ok) return rateLimitResponse(rl.retryAfterSec);
+
     const url = new URL(req.url);
     const jobId = String(url.searchParams.get("jobId") || "");
     const ownerToken = req.headers.get("x-owner-token") || "";
@@ -51,14 +55,14 @@ export async function GET(req: Request) {
       .eq("owner_token", ownerToken)
       .maybeSingle();
 
-    if (error) return res(false, null, error.message, 500);
+    if (error) return res(false, null, "Failed to read status", 500);
     if (!job) return res(false, null, "Not found", 404);
 
     const status = normStatus(job.status);
     const stage = String(job.stage || "");
 
-    // Prefer progress_pct if exists, else fallback to progress
-    const progressPct = clampPct(job.progress_pct ?? job.progress ?? 0, 0);
+    // Prefer worker progress first; fallback to legacy progress_pct
+    const progressPct = clampPct(job.progress ?? job.progress_pct ?? 0, 0);
 
     // "expires" / "delete" anchors (support both)
     const expiresAt = job.expires_at ?? job.delete_at ?? null;
@@ -109,6 +113,6 @@ export async function GET(req: Request) {
       warningText,   // only when DONE
     });
   } catch (e: any) {
-    return res(false, null, e?.message || "Server error", 500);
+    return res(false, null, "Server error", 500);
   }
 }

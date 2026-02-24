@@ -34,6 +34,7 @@ type StartJobResp = {
 export type StatusResp = {
   status: string;
   progress: number;
+  progressPct?: number;
   stage?: string | null;
   downloadUrl?: string | null;
 
@@ -222,17 +223,36 @@ export class JobService {
   }
 
   /**
-   * 7) Download URL (frontend convenience)
-   * ⚠️ Browser navigation дээр header attach хийх боломжгүй.
-   * Дараагийн алхамд download gating-ийг өөр аргаар шийднэ.
+   * 7) Download URL (internal helper)
    */
   static downloadUrl(jobId: string) {
-  let tok = "";
-  try {
-    tok = localStorage.getItem("goodpdf_last_owner_token") || "";
-  } catch {}
-  const base = `/api/jobs/download?jobId=${encodeURIComponent(jobId)}`;
-  return tok ? `${base}&ot=${encodeURIComponent(tok)}` : base;
-}
+    return `/api/jobs/download?jobId=${encodeURIComponent(jobId)}`;
+  }
+
+  static async downloadZip(jobId: string) {
+    const r = await fetch(this.downloadUrl(jobId), {
+      method: "GET",
+      headers: ownerHeaders({ "cache-control": "no-store" }),
+    });
+
+    if (!r.ok) {
+      let msg = `Download failed (HTTP ${r.status})`;
+      try {
+        const j = await r.json();
+        if (j?.error) msg = String(j.error);
+      } catch {}
+      throw new Error(msg);
+    }
+
+    const blob = await r.blob();
+    const obj = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = obj;
+    a.download = `goodpdf-${jobId}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(obj);
+  }
 
 }

@@ -121,8 +121,15 @@ function stageToLabel(stage?: string | null) {
   if (!s) return "Working";
   if (s === "QUEUE") return "Queued";
   if (s === "DOWNLOAD") return "Downloading";
+  if (s === "ANALYZE") return "Analyzing pages";
+  if (s === "PREFLIGHT") return "Preparing plan";
+  if (s === "DEFAULT") return "System optimization";
+  if (s === "MANUAL") return "Manual optimization";
+  if (s.startsWith("COMPRESS_")) return "Compressing";
   if (s === "PREPROCESS") return "Optimizing PDF";
   if (s === "SPLIT") return "Splitting";
+  if (s === "OVERSIZE_SAFE_SPLIT") return "Safe splitting";
+  if (s === "PART_FIT_9MB_FAST" || s === "PART_SURGERY") return "Fitting parts near 9MB";
   if (s === "ZIP") return "Creating ZIP";
   if (s === "UPLOAD_OUT") return "Uploading ZIP";
   if (s === "DONE") return "Done";
@@ -178,6 +185,7 @@ export function useUploadFlow() {
 
   const [uploadPct, setUploadPct] = useState(0);
   const [progressPct, setProgressPct] = useState(0);
+  const [stageCode, setStageCode] = useState<string>("");
 
   const [stageLabel, setStageLabel] = useState<string>("");
   const [messageLine, setMessageLine] = useState<string>("");
@@ -238,6 +246,7 @@ export function useUploadFlow() {
     setUploadPct(0);
     setProgressPct(0);
     setStageLabel("");
+    setStageCode("");
 
     setError(null);
     setWarning(null);
@@ -287,8 +296,11 @@ export function useUploadFlow() {
       const nextPhase = statusToPhase(st.status);
       setPhase(nextPhase);
 
-      setProgressPct(clampPct(st.progress));
-      setStageLabel(stageToLabel(st.stage));
+      const rawStage = String(st.stage || "").toUpperCase();
+      const nextProgress = clampPct((st as any).progressPct ?? st.progress);
+      setProgressPct(nextProgress);
+      setStageCode(rawStage);
+      setStageLabel(stageToLabel(rawStage));
       setMessageLine(String((st as any).message || ""));
 
       setResult({
@@ -528,6 +540,7 @@ export function useUploadFlow() {
     uploadPct,
     progressPct,
     stageLabel,
+    stageCode,
     error,
     warning,
     result,

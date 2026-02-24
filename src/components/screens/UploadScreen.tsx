@@ -6,10 +6,12 @@ import { FileDropzone } from "@/components/blocks/FileDropzone";
 import { Button } from "@/components/ui/Button";
 import { Progress } from "@/components/ui/Progress";
 import { useUploadFlow } from "@/services/hooks/useUploadFlow";
+import { JobService } from "@/services/JobService";
 import { Card } from "@/components/blocks/Card";
 
 type DownloadUX = "IDLE" | "PREPARE" | "CONFIRM" | "SUCCESS";
 type Step = "PICK" | "SETTINGS" | "RUN";
+type StepState = "pending" | "active" | "done";
 
 const SYSTEM_TICK_MESSAGES = [
   "Scanning pages…",
@@ -21,6 +23,56 @@ const SYSTEM_TICK_MESSAGES = [
   "Verifying parts…",
   "Finalizing…",
 ];
+
+const PIPELINE_STEPS: Array<{ key: string; label: string; stages: string[] }> = [
+  { key: "download", label: "Download", stages: ["DOWNLOAD"] },
+  { key: "analyze", label: "Analyze", stages: ["ANALYZE", "PREFLIGHT"] },
+  {
+    key: "compress",
+    label: "Compress",
+    stages: [
+      "DEFAULT",
+      "MANUAL",
+      "SCAN_REBUILD",
+      "COMPRESS_TURBO_PRIMARY",
+      "COMPRESS_FORCE5_MAX",
+      "COMPRESS_FORCE5_LAST",
+      "COMPRESS_DEFAULT_ULTRA",
+      "COMPRESS_DEFAULT_LASTMILE",
+      "COMPRESS_MANUAL",
+      "PART_FIT_9MB_FAST",
+      "PART_SURGERY",
+    ],
+  },
+  { key: "split", label: "Split", stages: ["SPLIT", "OVERSIZE_SAFE_SPLIT"] },
+  { key: "zip", label: "ZIP", stages: ["ZIP"] },
+  { key: "upload", label: "Upload", stages: ["UPLOAD_OUT"] },
+];
+
+function stageIndex(stageCode: string) {
+  const code = String(stageCode || "").toUpperCase();
+  const idx = PIPELINE_STEPS.findIndex((s) => s.stages.includes(code));
+  return idx >= 0 ? idx : -1;
+}
+
+function calcPipelineRows(stageCode: string, globalPct: number, phase: string) {
+  const idx = stageIndex(stageCode);
+  const doneAll = phase === "READY";
+  const idle = idx < 0 && !doneAll;
+  return PIPELINE_STEPS.map((s, i) => {
+    const state: StepState = doneAll
+      ? "done"
+      : idle
+      ? "pending"
+      : i < idx
+      ? "done"
+      : i === idx
+      ? "active"
+      : "pending";
+    const pct = state === "done" ? 100 : state === "pending" ? 0 : Math.max(3, Math.min(99, globalPct));
+    return { ...s, state, pct };
+  });
+}
 
 function parseMbInt(s: string) {
   const t = String(s || "").trim();
@@ -45,6 +97,12 @@ function clampPct(v: number) {
   return Math.max(0, Math.min(100, Math.round(n)));
 }
 
+function stageDotClass(state: StepState) {
+  if (state === "done") return "bg-emerald-600 text-white";
+  if (state === "active") return "bg-(--primary) text-white";
+  return "bg-zinc-200 text-zinc-700";
+}
+
 export function UploadScreen() {
   const [step, setStep] = useState<Step>("PICK");
   const [file, setFile] = useState<File | null>(null);
@@ -59,6 +117,7 @@ export function UploadScreen() {
   const [splitMbText, setSplitMbText] = useState<string>("9");
 
   const [dlUx, setDlUx] = useState<DownloadUX>("IDLE");
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   const [fakePct, setFakePct] = useState(0);
   const fakeTimerRef = useRef<number | null>(null);
 
@@ -130,6 +189,7 @@ export function UploadScreen() {
     setStep("PICK");
 
     setDlUx("IDLE");
+    setDownloadError(null);
     setFakePct(0);
     stopFakeTimer();
 
@@ -205,16 +265,11 @@ export function UploadScreen() {
     } catch {}
   };
 
-  const startDownloadAndPrepare = () => {
-    if (!flow.downloadUrl) return;
-
-    const url = `${flow.downloadUrl}${
-      flow.downloadUrl.includes("?") ? "&" : "?"
-    }cb=${Date.now()}`;
-
-    window.location.assign(url);
+  const startDownloadAndPrepare = async () => {
+    if (!flow.jobId) return;
 
     setDlUx("PREPARE");
+    setDownloadError(null);
     setFakePct(0);
     stopFakeTimer();
 
@@ -228,6 +283,14 @@ export function UploadScreen() {
         setDlUx("CONFIRM");
       }
     }, 50);
+
+    try {
+      await JobService.downloadZip(flow.jobId);
+    } catch (e: any) {
+      stopFakeTimer();
+      setDlUx("IDLE");
+      setDownloadError(e?.message || "Download failed");
+    }
   };
 
   const confirmCleanupAndReset = async () => {
@@ -259,6 +322,10 @@ export function UploadScreen() {
 
   const uiLine =
         (SYSTEM_TICK_MESSAGES[procTick % SYSTEM_TICK_MESSAGES.length] || "");
+  const pipelineRows = useMemo(
+    () => calcPipelineRows(flow.stageCode || "", clampPct(uiProgress), flow.phase),
+    [flow.phase, flow.stageCode, uiProgress]
+  );
 
 
   return (
@@ -489,6 +556,32 @@ export function UploadScreen() {
                         {clampPct(uiProgress)}%
                       </div>
                     </div>
+
+                    <div className="grid gap-2 pt-1">
+                      {pipelineRows.map((r) => (
+                        <div
+                          key={r.key}
+                          className="rounded-lg border border-zinc-200 bg-white p-2.5"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-2 text-xs font-semibold text-zinc-800">
+                              <span
+                                className={`grid h-5 w-5 place-items-center rounded-full text-[11px] ${stageDotClass(
+                                  r.state
+                                )}`}
+                              >
+                                {r.state === "done" ? "✓" : r.state === "active" ? "…" : "•"}
+                              </span>
+                              {r.label}
+                            </div>
+                            <div className="text-[11px] text-zinc-500">{r.pct}%</div>
+                          </div>
+                          <div className="mt-1.5">
+                            <Progress value={r.pct} />
+                          </div>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 </Card>
               ) : null}
@@ -522,6 +615,10 @@ export function UploadScreen() {
                 <Card>
                   <div className="grid gap-3">
                     <div className="font-semibold text-zinc-900">Ready ✅</div>
+
+                    <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-2 text-xs text-emerald-800">
+                      Analyze 100% ✓
+                    </div>
 
 {flow.warning ? (
   <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
@@ -558,11 +655,16 @@ export function UploadScreen() {
                     <div className="grid gap-3 pt-1">
                       {dlUx === "IDLE" ? (
                         <Button
-                          disabled={!canDownload || !flow.downloadUrl}
+                          disabled={!canDownload || !flow.jobId}
                           onClick={startDownloadAndPrepare}
                         >
                           Download ZIP
                         </Button>
+                      ) : null}
+                      {downloadError ? (
+                        <div className="rounded-lg border border-red-200 bg-red-50 p-2 text-xs text-red-700">
+                          {downloadError}
+                        </div>
                       ) : null}
 
                       {dlUx === "PREPARE" ? (
