@@ -12,6 +12,7 @@ import { Card } from "@/components/blocks/Card";
 type DownloadUX = "IDLE" | "PREPARE" | "CONFIRM" | "SUCCESS";
 type Step = "PICK" | "SETTINGS" | "RUN";
 type StepState = "pending" | "active" | "done";
+type PipelineRow = { key: string; label: string; stages: string[]; state: StepState; pct: number };
 
 const SYSTEM_TICK_MESSAGES = [
   "Scanning pages…",
@@ -23,10 +24,55 @@ const SYSTEM_TICK_MESSAGES = [
   "Verifying parts…",
   "Finalizing…",
 ];
+const STAGE_MESSAGES: Record<string, string[]> = {
+  ANALYZE: [
+    "Reading PDF header",
+    "Indexing objects",
+    "Measuring page distribution",
+    "Inspecting media density",
+    "Building analysis map",
+    "Validating structure",
+  ],
+  COMPRESS: [
+    "Selecting compression profile",
+    "Optimizing image streams",
+    "Balancing quality and size",
+    "Applying hard-fit pass",
+    "Normalizing content",
+    "Rechecking output size",
+  ],
+  SPLIT: [
+    "Planning part boundaries",
+    "Packing pages near target",
+    "Checking oversized pages",
+    "Refining split ranges",
+    "Verifying part sizes",
+    "Final split validation",
+  ],
+  ZIP: [
+    "Collecting result parts",
+    "Building zip package",
+    "Writing zip index",
+    "Streaming output archive",
+    "Final integrity check",
+    "Preparing download",
+  ],
+};
+const STAGE_TICK_MS: Record<string, number> = {
+  ANALYZE: 90,
+  COMPRESS: 120,
+  SPLIT: 110,
+  ZIP: 150,
+};
+const STAGE_COUNTER_CAP: Record<string, number> = {
+  ANALYZE: 1400,
+  COMPRESS: 2200,
+  SPLIT: 1600,
+  ZIP: 1200,
+};
 
 const PIPELINE_STEPS: Array<{ key: string; label: string; stages: string[] }> = [
-  { key: "download", label: "Download", stages: ["DOWNLOAD"] },
-  { key: "analyze", label: "Analyze", stages: ["ANALYZE", "PREFLIGHT"] },
+  { key: "analyze", label: "Analyze", stages: ["ANALYZE", "PREFLIGHT", "DOWNLOAD"] },
   {
     key: "compress",
     label: "Compress",
@@ -42,11 +88,13 @@ const PIPELINE_STEPS: Array<{ key: string; label: string; stages: string[] }> = 
       "COMPRESS_MANUAL",
       "PART_FIT_9MB_FAST",
       "PART_SURGERY",
+      "COMPRESS_HARDFIT",
+      "COMPRESS_HARDFIT_NUCLEAR",
+      "PART_FIT_9MB",
     ],
   },
   { key: "split", label: "Split", stages: ["SPLIT", "OVERSIZE_SAFE_SPLIT"] },
-  { key: "zip", label: "ZIP", stages: ["ZIP"] },
-  { key: "upload", label: "Upload", stages: ["UPLOAD_OUT"] },
+  { key: "zip", label: "ZIP", stages: ["ZIP", "UPLOAD_OUT", "DONE"] },
 ];
 
 function stageIndex(stageCode: string) {
@@ -69,9 +117,25 @@ function calcPipelineRows(stageCode: string, globalPct: number, phase: string) {
       : i === idx
       ? "active"
       : "pending";
-    const pct = state === "done" ? 100 : state === "pending" ? 0 : Math.max(3, Math.min(99, globalPct));
+    const pct =
+      state === "done" ? 100 : state === "pending" ? 0 : Math.max(3, Math.min(99, globalPct));
     return { ...s, state, pct };
   });
+}
+
+function stateRank(s: StepState) {
+  if (s === "pending") return 0;
+  if (s === "active") return 1;
+  return 2;
+}
+
+function activeStageKey(rows: PipelineRow[]) {
+  const active = rows.find((r) => r.state === "active");
+  return active?.key?.toUpperCase() || "ANALYZE";
+}
+function kickoffPctForIndex(i: number) {
+  // 3/4/5%-ийн зөөлөн эхлэл (stage transition UI feel)
+  return 3 + (i % 3);
 }
 
 function parseMbInt(s: string) {
@@ -118,14 +182,27 @@ export function UploadScreen() {
 
   const [dlUx, setDlUx] = useState<DownloadUX>("IDLE");
   const [downloadError, setDownloadError] = useState<string | null>(null);
-  const [fakePct, setFakePct] = useState(0);
-  const fakeTimerRef = useRef<number | null>(null);
 
   // PROCESSING үеийн “хиймэл” progress + нэг мөр систем мессеж
   const [procFakePct, setProcFakePct] = useState(1);
   const [procTick, setProcTick] = useState(0);
   const procPctTimerRef = useRef<number | null>(null);
   const procTickTimerRef = useRef<number | null>(null);
+  const [stableRunPct, setStableRunPct] = useState(0);
+  const stageActivityRef = useRef<string>("ANALYZE");
+  const [stageCounter, setStageCounter] = useState(0);
+  const [stageMsgIdx, setStageMsgIdx] = useState(0);
+  const stageTickerRef = useRef<number | null>(null);
+  const stageTickMsRef = useRef<number>(120);
+  const [stickyRows, setStickyRows] = useState<PipelineRow[]>(
+    PIPELINE_STEPS.map((s) => ({ ...s, state: "pending" as StepState, pct: 0 })),
+  );
+  const [displayRows, setDisplayRows] = useState<PipelineRow[]>(
+    PIPELINE_STEPS.map((s) => ({ ...s, state: "pending" as StepState, pct: 0 })),
+  );
+  const rowHeartbeatAtRef = useRef<number[]>(
+    PIPELINE_STEPS.map(() => Date.now()),
+  );
 
   const flow = useUploadFlow();
 
@@ -165,13 +242,6 @@ export function UploadScreen() {
 
   const canDownload = !flow.busy && flow.phase === "READY";
 
-  const stopFakeTimer = () => {
-    if (fakeTimerRef.current) {
-      window.clearInterval(fakeTimerRef.current);
-      fakeTimerRef.current = null;
-    }
-  };
-
   const stopProcFakeTimers = () => {
     if (procPctTimerRef.current) {
       window.clearInterval(procPctTimerRef.current);
@@ -182,6 +252,24 @@ export function UploadScreen() {
       procTickTimerRef.current = null;
     }
   };
+  const stopStageTicker = () => {
+    if (stageTickerRef.current) {
+      window.clearInterval(stageTickerRef.current);
+      stageTickerRef.current = null;
+    }
+  };
+  const startStageTicker = (tickMs: number) => {
+    stopStageTicker();
+    stageTickMsRef.current = tickMs;
+    stageTickerRef.current = window.setInterval(() => {
+      setStageCounter((n) => {
+        const key = stageActivityRef.current || "ANALYZE";
+        const cap = STAGE_COUNTER_CAP[key] || 1800;
+        return n >= cap ? 0 : n + 1;
+      });
+      setStageMsgIdx((i) => i + 1);
+    }, tickMs);
+  };
 
   const hardReset = () => {
     setFile(null);
@@ -190,13 +278,23 @@ export function UploadScreen() {
 
     setDlUx("IDLE");
     setDownloadError(null);
-    setFakePct(0);
-    stopFakeTimer();
 
     // processing fake-ийг цэвэрлэнэ
     setProcFakePct(1);
     setProcTick(0);
+    setStableRunPct(0);
+    setStageCounter(0);
+    setStageMsgIdx(0);
+    stageActivityRef.current = "ANALYZE";
+    setStickyRows(
+      PIPELINE_STEPS.map((s) => ({ ...s, state: "pending" as StepState, pct: 0 })),
+    );
+    setDisplayRows(
+      PIPELINE_STEPS.map((s) => ({ ...s, state: "pending" as StepState, pct: 0 })),
+    );
+    rowHeartbeatAtRef.current = PIPELINE_STEPS.map(() => Date.now());
     stopProcFakeTimers();
+    stopStageTicker();
 
     flow.resetAll();
   };
@@ -204,9 +302,7 @@ export function UploadScreen() {
   // ✅ PROCESSING үед “хиймэл” progress + систем мессежийг ажиллуулна
   useEffect(() => {
     const real = typeof flow.progressPct === "number" ? flow.progressPct : 0;
-    const hasReal = real > 0;
-    const shouldRun =
-      flow.phase === "PROCESSING" && !flow.error && !hasReal;
+    const shouldRun = flow.phase === "PROCESSING" && !flow.error;
 
     // PROCESSING биш бол / real progress орж ирвэл fake-г зогсооно
     if (!shouldRun) {
@@ -221,12 +317,11 @@ export function UploadScreen() {
     if (!procPctTimerRef.current) {
       procPctTimerRef.current = window.setInterval(() => {
         setProcFakePct((p) => {
-          // 1..99 хүртэл “амьд” өсөлт
-          if (p >= 99) return 99;
-          const step = p < 60 ? 2 : 1;
-          return Math.min(99, p + step);
+          // Slow trickle while processing to avoid "stuck then jump" perception.
+          if (p >= 95) return 95;
+          return Math.min(95, p + 1);
         });
-      }, 700);
+      }, 2000);
     }
 
     if (!procTickTimerRef.current) {
@@ -255,6 +350,17 @@ export function UploadScreen() {
     // PROCESSING эхлэхэд fake-ийг шинэчлэх
     setProcFakePct(1);
     setProcTick(0);
+    setStableRunPct(0);
+    setStageCounter(0);
+    setStageMsgIdx(0);
+    stageActivityRef.current = "ANALYZE";
+    setStickyRows(
+      PIPELINE_STEPS.map((s) => ({ ...s, state: "pending" as StepState, pct: 0 })),
+    );
+    setDisplayRows(
+      PIPELINE_STEPS.map((s) => ({ ...s, state: "pending" as StepState, pct: 0 })),
+    );
+    rowHeartbeatAtRef.current = PIPELINE_STEPS.map(() => Date.now());
 
     try {
       await flow.startProcessing({
@@ -270,24 +376,11 @@ export function UploadScreen() {
 
     setDlUx("PREPARE");
     setDownloadError(null);
-    setFakePct(0);
-    stopFakeTimer();
-
-    const startedAt = Date.now();
-    fakeTimerRef.current = window.setInterval(() => {
-      const elapsed = Date.now() - startedAt;
-      const pct = Math.min(100, Math.round((elapsed / 5000) * 100));
-      setFakePct(pct);
-      if (pct >= 100) {
-        stopFakeTimer();
-        setDlUx("CONFIRM");
-      }
-    }, 50);
 
     try {
       await JobService.downloadZip(flow.jobId);
+      setDlUx("CONFIRM");
     } catch (e: any) {
-      stopFakeTimer();
       setDlUx("IDLE");
       setDownloadError(e?.message || "Download failed");
     }
@@ -317,15 +410,146 @@ export function UploadScreen() {
   const realProgress = typeof flow.progressPct === "number" ? flow.progressPct : 0;
   const uiProgress =
     flow.phase === "PROCESSING"
-      ? (realProgress > 0 ? realProgress : procFakePct)
+      ? Math.max(realProgress, procFakePct)
       : realProgress;
 
   const uiLine =
         (SYSTEM_TICK_MESSAGES[procTick % SYSTEM_TICK_MESSAGES.length] || "");
-  const pipelineRows = useMemo(
+  const pipelineRowsRaw = useMemo(
     () => calcPipelineRows(flow.stageCode || "", clampPct(uiProgress), flow.phase),
     [flow.phase, flow.stageCode, uiProgress]
   );
+  const showProcessingCard = step === "RUN" && flow.phase !== "READY" && !flow.error;
+
+  useEffect(() => {
+    if (step !== "RUN") {
+      setStableRunPct(0);
+      return;
+    }
+    if (flow.phase === "READY") {
+      setStableRunPct(100);
+      return;
+    }
+    if (flow.phase === "PROCESSING") {
+      const target = Math.min(99, Math.max(1, clampPct(uiProgress)));
+      setStableRunPct((prev) => {
+        // Keep continuous motion but avoid unrealistic leaps.
+        if (target > prev + 2) return prev + 2;
+        if (target < prev) return prev;
+        return target;
+      });
+    }
+  }, [step, flow.phase, uiProgress]);
+
+  useEffect(() => {
+    if (step !== "RUN") return;
+    setStickyRows((prev) => {
+      const target = pipelineRowsRaw.map((r) => ({ ...r }));
+      const noActive = target.every((r) => r.state === "pending" && r.pct === 0);
+      if (flow.phase === "PROCESSING" && noActive && target.length > 0) {
+        target[0].state = "active";
+        target[0].pct = Math.max(1, Math.min(25, clampPct(uiProgress)));
+      }
+      return prev.map((oldRow, i) => {
+        const nxt = target[i] || oldRow;
+        const pct = flow.phase === "READY" ? 100 : Math.max(oldRow.pct, nxt.pct);
+        const state =
+          flow.phase === "READY"
+            ? "done"
+            : stateRank(nxt.state as StepState) > stateRank(oldRow.state)
+              ? (nxt.state as StepState)
+              : oldRow.state;
+        return { ...oldRow, state, pct };
+      });
+    });
+  }, [step, flow.phase, uiProgress, pipelineRowsRaw]);
+
+  // Smooth row percentages to avoid abrupt jumps.
+  useEffect(() => {
+    if (step !== "RUN") return;
+    const timer = window.setInterval(() => {
+      setDisplayRows((prev) =>
+        prev.map((row, i) => {
+          const target = stickyRows[i] || row;
+          const prevDone = i > 0 ? (prev[i - 1]?.pct || 0) >= 100 : false;
+          const bridgeKick =
+            flow.phase === "PROCESSING" &&
+            target.state === "pending" &&
+            row.pct <= 0 &&
+            prevDone;
+          let nextPct = row.pct;
+          if (flow.phase === "READY") {
+            nextPct = 100;
+          } else if (target.state === "done") {
+            nextPct = Math.min(100, row.pct + 2);
+          } else if (target.state === "active" && flow.phase === "PROCESSING") {
+            const total = Math.max(1, stickyRows.length);
+            const span = 100 / total;
+            const overall = clampPct(uiProgress);
+            const base = i * span;
+            const derived = Math.max(
+              0,
+              Math.min(97, Math.round(((overall - base) / span) * 100)),
+            );
+            // Keep active stage moving, but prevent unrealistic jump-to-99 behavior.
+            const softCap = Math.min(94, Math.max(28, derived + 8));
+            const stepInc = derived > row.pct ? 2 : 1;
+            if (derived > row.pct) {
+              nextPct = Math.min(softCap, row.pct + stepInc);
+              rowHeartbeatAtRef.current[i] = Date.now();
+            } else {
+              // Heartbeat UX: if a stage seems stuck, nudge +1% every 10s.
+              const now = Date.now();
+              const lastAt = rowHeartbeatAtRef.current[i] || 0;
+              if (now - lastAt >= 10_000 && row.pct < softCap) {
+                nextPct = Math.min(softCap, row.pct + 1);
+                rowHeartbeatAtRef.current[i] = now;
+              }
+            }
+          } else if (bridgeKick) {
+            // If previous stage finished, pre-warm next stage at 3-5%.
+            nextPct = Math.max(row.pct, kickoffPctForIndex(i));
+          }
+          return {
+            ...row,
+            state: bridgeKick ? "active" : target.state,
+            pct: Math.max(0, Math.min(100, Math.round(nextPct))),
+          };
+        }),
+      );
+    }, 90);
+    return () => window.clearInterval(timer);
+  }, [step, stickyRows, flow.phase, uiProgress]);
+
+  useEffect(() => {
+    if (step !== "RUN" || flow.phase !== "PROCESSING" || flow.error) {
+      stopStageTicker();
+      return;
+    }
+    if (!stageTickerRef.current) {
+      const key = stageActivityRef.current || "ANALYZE";
+      startStageTicker(STAGE_TICK_MS[key] || 120);
+    }
+    return () => {
+      stopStageTicker();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step, flow.phase, flow.error]);
+
+  const activeStage = activeStageKey(stickyRows);
+  useEffect(() => {
+    if (flow.phase !== "PROCESSING") return;
+    if (stageActivityRef.current !== activeStage) {
+      stageActivityRef.current = activeStage;
+      setStageCounter(0);
+      setStageMsgIdx(0);
+      if (stageTickerRef.current) {
+        startStageTicker(STAGE_TICK_MS[activeStage] || 120);
+      }
+    }
+  }, [activeStage, flow.phase]);
+  const stageMsgs = STAGE_MESSAGES[activeStage] || STAGE_MESSAGES.ANALYZE;
+  const liveStageLine = stageMsgs[stageMsgIdx % stageMsgs.length] || uiLine;
 
 
   return (
@@ -537,28 +761,20 @@ export function UploadScreen() {
 
           {step === "RUN" && (
             <>
-              {flow.phase === "PROCESSING" ? (
+              {showProcessingCard ? (
                 <Card>
                   <div className="grid gap-3">
-                    <div className="font-semibold text-zinc-900">
-                      Processing…
+                    <div className="font-semibold text-zinc-900 flex items-center justify-between">
+                      <span>Processing...</span>
+                      <span>{stableRunPct}%</span>
                     </div>
-
-                    <div className="grid gap-2">
-                      <div className="text-xs text-zinc-500">
-                        {flow.stageLabel || "Working"}
-                        {uiLine ? ` — ${uiLine}` : ""}
-                      </div>
-
-                      <Progress value={uiProgress} />
-
-                      <div className="text-xs text-zinc-500">
-                        {clampPct(uiProgress)}%
-                      </div>
+                    <div className="text-xs text-zinc-500">
+                      Working: <span className="font-semibold">{String(stageCounter).padStart(3, "0")}</span>
+                      {liveStageLine ? ` • ${liveStageLine}` : ""}
                     </div>
 
                     <div className="grid gap-2 pt-1">
-                      {pipelineRows.map((r) => (
+                      {displayRows.map((r) => (
                         <div
                           key={r.key}
                           className="rounded-lg border border-zinc-200 bg-white p-2.5"
@@ -669,17 +885,9 @@ export function UploadScreen() {
 
                       {dlUx === "PREPARE" ? (
                         <>
-                          <Button disabled>Download ZIP</Button>
-                          <div className="grid gap-2">
-                            <Progress value={fakePct} />
-                            <div className="text-xs text-zinc-500">
-                              Secure cleanup in progress. Your files are already
-                              scheduled for deletion and will be permanently
-                              removed within 10 minutes.
-                            </div>
-                            <div className="text-xs text-zinc-500">
-                              {fakePct}%
-                            </div>
+                          <Button disabled>End</Button>
+                          <div className="text-xs text-zinc-500">
+                            End
                           </div>
                         </>
                       ) : null}
@@ -819,8 +1027,8 @@ function StepHeader({ step }: { step: Step }) {
   return (
     <div className="flex flex-nowrap gap-2.5 overflow-x-auto">
       <Item n={1} label="Upload" active={step === "PICK"} />
-      <Item n={2} label="Split size" active={step === "SETTINGS"} />
-      <Item n={3} label="Download" active={step === "RUN"} />
+      <Item n={2} label="Start" active={step === "SETTINGS"} />
+      <Item n={3} label="End" active={step === "RUN"} />
     </div>
   );
 }
