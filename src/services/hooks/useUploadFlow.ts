@@ -138,6 +138,7 @@ function stageToLabel(stage?: string | null) {
   const s = String(stage || "").toUpperCase();
   if (!s) return "Working";
   if (s === "QUEUE") return "Queued";
+  if (s === "QUEUE_HEAVY") return "Queued (heavy)";
   if (s === "DOWNLOAD") return "Preparing input";
   if (s === "ANALYZE") return "Analyzing pages";
   if (s === "PREFLIGHT") return "Preparing plan";
@@ -494,7 +495,15 @@ export function useUploadFlow() {
    * ✅ Job is counted HERE (on Start success)
    */
   const startProcessing = useCallback(
-    async ({ mode, splitMb }: { mode: Mode; splitMb: number }) => {
+    async ({
+      mode,
+      splitMb,
+      precheckMode,
+    }: {
+      mode: Mode;
+      splitMb: number;
+      precheckMode?: "NORMAL" | "HEAVY" | "EXTREME";
+    }) => {
       const jid = jobId;
       if (!jid) {
         setPhase("ERROR");
@@ -529,7 +538,7 @@ export function useUploadFlow() {
       processingStartedRef.current = true;
 
       try {
-        await JobService.start(jid, splitMb);
+        await JobService.start(jid, splitMb, precheckMode);
 
         // ✅ COUNT 1 JOB only after Start succeeded
         recordJobEvent(nowMs());

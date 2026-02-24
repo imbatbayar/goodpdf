@@ -18,6 +18,8 @@ export async function POST(req: Request) {
     const ownerToken = String(req.headers.get("x-owner-token") || "").trim();
 
     const splitMbRaw = Number(body?.splitMb);
+    const precheckModeRaw = String(body?.precheckMode || "").toUpperCase();
+    const queueStage = precheckModeRaw === "EXTREME" ? "QUEUE_HEAVY" : "QUEUE";
     if (!jobId) return jsonError("Missing jobId", 400);
     if (!ownerToken) return jsonError("Forbidden", 403);
     if (!Number.isFinite(splitMbRaw)) return jsonError("Invalid splitMb", 400);
@@ -46,7 +48,7 @@ export async function POST(req: Request) {
       .from("jobs")
       .update({
         status: "QUEUED",
-        stage: "QUEUE",
+        stage: queueStage,
         progress: 1,
         progress_pct: 1,
         split_mb: splitMb, // numeric(10,2)

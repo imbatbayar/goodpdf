@@ -18,11 +18,17 @@ type PrecheckInfo = {
   mode: "NORMAL" | "HEAVY" | "EXTREME";
   etaMinLow: number;
   etaMinHigh: number;
+  estimatedCpuMin?: number;
   fileSizeMb: number;
   pages: number | null;
   avgMbPerPage: number | null;
+  confidence?: "HIGH" | "MEDIUM" | "LOW";
+  confidenceNote?: string;
+  recommendation?: string;
   reason: string[];
 };
+
+const LS_PRECHECK_CALIBRATION = "goodpdf_precheck_calibration_v1";
 
 const SYSTEM_TICK_MESSAGES = [
   "Scanning pages…",
@@ -35,13 +41,13 @@ const SYSTEM_TICK_MESSAGES = [
   "Finalizing…",
 ];
 const STAGE_MESSAGES: Record<string, string[]> = {
-  ANALYZE: [
-    "Reading PDF header",
-    "Indexing objects",
-    "Measuring page distribution",
-    "Inspecting media density",
-    "Building analysis map",
-    "Validating structure",
+  PREP: [
+    "Preparing workspace",
+    "Loading input metadata",
+    "Validating input structure",
+    "Building execution plan",
+    "Checking compatibility constraints",
+    "Initializing processing context",
   ],
   COMPRESS: [
     "Selecting compression profile",
@@ -69,20 +75,20 @@ const STAGE_MESSAGES: Record<string, string[]> = {
   ],
 };
 const STAGE_TICK_MS: Record<string, number> = {
-  ANALYZE: 90,
+  PREP: 90,
   COMPRESS: 120,
   SPLIT: 110,
   ZIP: 150,
 };
 const STAGE_COUNTER_CAP: Record<string, number> = {
-  ANALYZE: 1400,
+  PREP: 1400,
   COMPRESS: 2200,
   SPLIT: 1600,
   ZIP: 1200,
 };
 
 const PIPELINE_STEPS: Array<{ key: string; label: string; stages: string[] }> = [
-  { key: "analyze", label: "Analyze", stages: ["ANALYZE", "PREFLIGHT", "DOWNLOAD"] },
+  { key: "prep", label: "Prepare", stages: ["ANALYZE", "PREFLIGHT", "DOWNLOAD", "QUEUE"] },
   {
     key: "compress",
     label: "Compress",
@@ -141,7 +147,7 @@ function stateRank(s: StepState) {
 
 function activeStageKey(rows: PipelineRow[]) {
   const active = rows.find((r) => r.state === "active");
-  return active?.key?.toUpperCase() || "ANALYZE";
+  return active?.key?.toUpperCase() || "PREP";
 }
 function kickoffPctForIndex(i: number) {
   // 3/4/5%-ийн зөөлөн эхлэл (stage transition UI feel)
@@ -149,11 +155,11 @@ function kickoffPctForIndex(i: number) {
 }
 function stageWorkingLabel(key: string) {
   const k = String(key || "").toUpperCase();
-  if (k === "ANALYZE") return "Analyze";
+  if (k === "PREP") return "Prepare workspace";
   if (k === "COMPRESS") return "Compress";
   if (k === "SPLIT") return "Split";
   if (k === "ZIP") return "Zipping";
-  return "Analyze";
+  return "Prepare workspace";
 }
 
 function parseMbInt(s: string) {
@@ -185,6 +191,12 @@ function stageDotClass(state: StepState) {
   return "bg-zinc-200 text-zinc-700";
 }
 
+function confidenceBadge(conf?: "HIGH" | "MEDIUM" | "LOW") {
+  if (conf === "HIGH") return { label: "High confidence", cls: "bg-emerald-100 text-emerald-800" };
+  if (conf === "LOW") return { label: "Low confidence", cls: "bg-amber-100 text-amber-800" };
+  return { label: "Medium confidence", cls: "bg-zinc-200 text-zinc-700" };
+}
+
 export function UploadScreen() {
   const [step, setStep] = useState<Step>("PICK");
   const [file, setFile] = useState<File | null>(null);
@@ -203,6 +215,11 @@ export function UploadScreen() {
   const [precheck, setPrecheck] = useState<PrecheckInfo | null>(null);
   const [precheckLoading, setPrecheckLoading] = useState(false);
   const [precheckError, setPrecheckError] = useState<string | null>(null);
+  const [precheckPct, setPrecheckPct] = useState(0);
+  const precheckTimerRef = useRef<number | null>(null);
+  const processingStartedAtRef = useRef<number | null>(null);
+  const precheckEstimateAtStartRef = useRef<number | null>(null);
+  const calibrationAppliedForRunRef = useRef(false);
 
   // PROCESSING үеийн “хиймэл” progress + нэг мөр систем мессеж
   const [procFakePct, setProcFakePct] = useState(1);
@@ -210,7 +227,7 @@ export function UploadScreen() {
   const procPctTimerRef = useRef<number | null>(null);
   const procTickTimerRef = useRef<number | null>(null);
   const [stableRunPct, setStableRunPct] = useState(0);
-  const stageActivityRef = useRef<string>("ANALYZE");
+  const stageActivityRef = useRef<string>("PREP");
   const [stageCounter, setStageCounter] = useState(0);
   const [stageMsgIdx, setStageMsgIdx] = useState(0);
   const stageTickerRef = useRef<number | null>(null);
@@ -275,6 +292,12 @@ export function UploadScreen() {
       procTickTimerRef.current = null;
     }
   };
+  const stopPrecheckTimer = () => {
+    if (precheckTimerRef.current) {
+      window.clearInterval(precheckTimerRef.current);
+      precheckTimerRef.current = null;
+    }
+  };
   const stopStageTicker = () => {
     if (stageTickerRef.current) {
       window.clearInterval(stageTickerRef.current);
@@ -286,7 +309,7 @@ export function UploadScreen() {
     stageTickMsRef.current = tickMs;
     stageTickerRef.current = window.setInterval(() => {
       setStageCounter((n) => {
-        const key = stageActivityRef.current || "ANALYZE";
+        const key = stageActivityRef.current || "PREP";
         const cap = STAGE_COUNTER_CAP[key] || 1800;
         return n >= cap ? 0 : n + 1;
       });
@@ -304,6 +327,10 @@ export function UploadScreen() {
     setPrecheck(null);
     setPrecheckLoading(false);
     setPrecheckError(null);
+    setPrecheckPct(0);
+    processingStartedAtRef.current = null;
+    precheckEstimateAtStartRef.current = null;
+    calibrationAppliedForRunRef.current = false;
 
     // processing fake-ийг цэвэрлэнэ
     setProcFakePct(1);
@@ -311,7 +338,7 @@ export function UploadScreen() {
     setStableRunPct(0);
     setStageCounter(0);
     setStageMsgIdx(0);
-    stageActivityRef.current = "ANALYZE";
+    stageActivityRef.current = "PREP";
     setStickyRows(
       PIPELINE_STEPS.map((s) => ({ ...s, state: "pending" as StepState, pct: 0 })),
     );
@@ -320,6 +347,7 @@ export function UploadScreen() {
     );
     rowHeartbeatAtRef.current = PIPELINE_STEPS.map(() => Date.now());
     stopProcFakeTimers();
+    stopPrecheckTimer();
     stopStageTicker();
 
     flow.resetAll();
@@ -329,16 +357,19 @@ export function UploadScreen() {
     let cancelled = false;
     const run = async () => {
       if (flow.phase !== "UPLOADED" || !flow.jobId) return;
+      setPrecheckPct(4);
       setPrecheckLoading(true);
       setPrecheckError(null);
       try {
         const info = (await JobService.precheck(flow.jobId)) as PrecheckInfo;
         if (cancelled) return;
         setPrecheck(info);
+        setPrecheckPct(100);
       } catch (e: any) {
         if (cancelled) return;
         setPrecheck(null);
         setPrecheckError(e?.message || "Precheck failed");
+        setPrecheckPct(0);
       } finally {
         if (!cancelled) setPrecheckLoading(false);
       }
@@ -348,6 +379,22 @@ export function UploadScreen() {
       cancelled = true;
     };
   }, [flow.phase, flow.jobId]);
+
+  useEffect(() => {
+    if (flow.phase !== "UPLOADED" || !precheckLoading) {
+      stopPrecheckTimer();
+      return;
+    }
+    if (!precheckTimerRef.current) {
+      precheckTimerRef.current = window.setInterval(() => {
+        setPrecheckPct((p) => (p >= 95 ? 95 : p + 1));
+      }, 220);
+    }
+    return () => {
+      stopPrecheckTimer();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [flow.phase, precheckLoading]);
 
   // ✅ PROCESSING үед “хиймэл” progress + систем мессежийг ажиллуулна
   useEffect(() => {
@@ -396,6 +443,10 @@ export function UploadScreen() {
     if (mode === "MANUAL" && (!splitValid.ok || splitMbToSend == null)) return;
 
     setStep("RUN");
+    processingStartedAtRef.current = Date.now();
+    precheckEstimateAtStartRef.current =
+      typeof precheck?.estimatedCpuMin === "number" ? precheck.estimatedCpuMin : null;
+    calibrationAppliedForRunRef.current = false;
 
     // PROCESSING эхлэхэд fake-ийг шинэчлэх
     setProcFakePct(1);
@@ -403,7 +454,7 @@ export function UploadScreen() {
     setStableRunPct(0);
     setStageCounter(0);
     setStageMsgIdx(0);
-    stageActivityRef.current = "ANALYZE";
+    stageActivityRef.current = "PREP";
     setStickyRows(
       PIPELINE_STEPS.map((s) => ({ ...s, state: "pending" as StepState, pct: 0 })),
     );
@@ -416,10 +467,29 @@ export function UploadScreen() {
       await flow.startProcessing({
         mode: mode === "SYSTEM" ? ("SYSTEM" as any) : ("MANUAL" as any),
         splitMb: splitMbToSend as number,
+        precheckMode: precheck?.mode,
       });
 
     } catch {}
   };
+
+  useEffect(() => {
+    if (flow.phase !== "READY") return;
+    if (calibrationAppliedForRunRef.current) return;
+    const startedAt = processingStartedAtRef.current;
+    const estimated = precheckEstimateAtStartRef.current;
+    if (!startedAt || !estimated || estimated <= 0) return;
+
+    const actualMin = Math.max(0.2, (Date.now() - startedAt) / 60_000);
+    const ratio = Math.max(0.65, Math.min(2.2, actualMin / estimated));
+    try {
+      const prev = Number(localStorage.getItem(LS_PRECHECK_CALIBRATION) || "1");
+      const safePrev = Number.isFinite(prev) ? Math.max(0.65, Math.min(2.2, prev)) : 1;
+      const next = Math.max(0.65, Math.min(2.2, safePrev * 0.75 + ratio * 0.25));
+      localStorage.setItem(LS_PRECHECK_CALIBRATION, String(next));
+    } catch {}
+    calibrationAppliedForRunRef.current = true;
+  }, [flow.phase]);
 
   const startDownloadAndPrepare = async () => {
     if (!flow.jobId) return;
@@ -591,7 +661,7 @@ export function UploadScreen() {
       return;
     }
     if (!stageTickerRef.current) {
-      const key = stageActivityRef.current || "ANALYZE";
+      const key = stageActivityRef.current || "PREP";
       startStageTicker(STAGE_TICK_MS[key] || 120);
     }
     return () => {
@@ -612,7 +682,7 @@ export function UploadScreen() {
       }
     }
   }, [activeStage, flow.phase]);
-  const stageMsgs = STAGE_MESSAGES[activeStage] || STAGE_MESSAGES.ANALYZE;
+  const stageMsgs = STAGE_MESSAGES[activeStage] || STAGE_MESSAGES.PREP;
   const liveStageLine = stageMsgs[stageMsgIdx % stageMsgs.length] || uiLine;
 
 
@@ -679,7 +749,16 @@ export function UploadScreen() {
                 <div className="grid gap-3">
                   <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-3">
                     {precheckLoading ? (
-                      <div className="text-sm text-zinc-600">Analyzing file complexity...</div>
+                      <div className="grid gap-2">
+                        <div className="flex items-center justify-between text-sm">
+                          <div className="font-semibold text-zinc-900">Preparing start check</div>
+                          <div className="text-zinc-600">{clampPct(precheckPct)}%</div>
+                        </div>
+                        <Progress value={clampPct(precheckPct)} />
+                        <div className="text-xs text-zinc-600">
+                          Checking file complexity, token usage and ETA...
+                        </div>
+                      </div>
                     ) : precheck ? (
                       <div className="grid gap-2">
                         <div className="flex items-center justify-between gap-3 text-sm">
@@ -691,6 +770,27 @@ export function UploadScreen() {
                         <div className="text-xs text-zinc-700">
                           Mode: <b>{precheck.mode}</b> • Time: <b>~{precheck.etaMinLow}-{precheck.etaMinHigh} min</b>
                         </div>
+                        <div>
+                          {(() => {
+                            const c = confidenceBadge(precheck.confidence);
+                            return (
+                              <span className={`inline-flex rounded-full px-2 py-0.5 text-[11px] font-semibold ${c.cls}`}>
+                                {c.label}
+                              </span>
+                            );
+                          })()}
+                        </div>
+                        {typeof precheck.estimatedCpuMin === "number" ? (
+                          <div className="text-xs text-zinc-700">
+                            Estimated CPU: <b>~{precheck.estimatedCpuMin} min</b>
+                          </div>
+                        ) : null}
+                        {precheck.confidenceNote ? (
+                          <div className="text-[11px] text-zinc-600">{precheck.confidenceNote}</div>
+                        ) : null}
+                        {precheck.recommendation ? (
+                          <div className="text-xs text-zinc-700">{precheck.recommendation}</div>
+                        ) : null}
                         <div className="text-xs text-zinc-600">
                           {precheck.reason.join(" • ")}
                         </div>
@@ -934,7 +1034,7 @@ export function UploadScreen() {
                     <div className="font-semibold text-zinc-900">Ready ✅</div>
 
                     <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-2 text-xs text-emerald-800">
-                      Analyze 100% ✓
+                      Processing 100% ✓
                     </div>
 
 {flow.warning ? (

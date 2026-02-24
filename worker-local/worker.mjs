@@ -55,6 +55,9 @@ const SEVEN_Z_EXE = resolve7zExe();
 // ----------------------
 const WORKER_ID =
   process.env.WORKER_ID || `worker_${crypto.randomBytes(3).toString("hex")}`;
+const WORKER_PROFILE = String(process.env.WORKER_PROFILE || "normal").toLowerCase();
+const IS_HEAVY_PROFILE = WORKER_PROFILE === "heavy";
+const QUEUE_STAGE = IS_HEAVY_PROFILE ? "QUEUE_HEAVY" : "QUEUE";
 
 const SUPABASE_URL =
   process.env.SUPABASE_ADMIN_URL ||
@@ -132,7 +135,10 @@ const TIMEOUT_7Z_MS = Math.max(
 );
 
 // UX cap (best-effort)
-const UX_CAP_MS = Math.max(60_000, Number(process.env.UX_CAP_MS || 180_000)); // default 3min
+const UX_CAP_MS = Math.max(
+  60_000,
+  Number(process.env.UX_CAP_MS || (IS_HEAVY_PROFILE ? 420_000 : 180_000)),
+); // normal ~3min, heavy ~7min default cap
 const UX_SOFTSTOP_MS = Math.max(
   50_000,
   Math.min(UX_CAP_MS - 10_000, Number(process.env.UX_SOFTSTOP_MS || 150_000)),
@@ -165,6 +171,14 @@ const SYSTEM_FORCE_5_FROM_MB = Math.max(
 const SYSTEM_MIN_PARTS = Math.max(
   1,
   Math.min(SYSTEM_MAX_PARTS, Number(process.env.SYSTEM_MIN_PARTS || 2)),
+);
+const HEAVY_TARGET_MARGIN = Math.max(
+  0.94,
+  Math.min(0.99, Number(process.env.HEAVY_TARGET_MARGIN || 0.975)),
+);
+const HEAVY_EXTRA_SHRINK_PASSES = Math.max(
+  1,
+  Math.min(6, Number(process.env.HEAVY_EXTRA_SHRINK_PASSES || 4)),
 );
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -333,6 +347,7 @@ async function fetchQueue(limit = 1) {
       "id,status,stage,created_at,input_path,claimed_by,split_mb,ttl_minutes,expires_at,delete_at",
     )
     .eq("status", "QUEUED")
+    .eq("stage", QUEUE_STAGE)
     .is("claimed_by", null)
     .order("created_at", { ascending: true })
     .limit(limit);
@@ -371,12 +386,13 @@ async function fetchQueue(limit = 1) {
 }
 
 async function claimJob(jobId) {
+  const claimOwner = `${WORKER_PROFILE}:${WORKER_ID}`;
   const patch = {
     status: "PROCESSING",
-    stage: "QUEUE",
+    stage: QUEUE_STAGE,
     progress: 1,
     split_progress: 0,
-    claimed_by: WORKER_ID,
+    claimed_by: claimOwner,
     claimed_at: nowIso(),
     error_text: null,
     error_code: null,
@@ -401,7 +417,7 @@ async function heartbeatJob(jobId, stage = "PROCESSING") {
     await updateJob(jobId, {
       status: "PROCESSING",
       stage,
-      claimed_by: WORKER_ID,
+      claimed_by: `${WORKER_PROFILE}:${WORKER_ID}`,
       updated_at: nowIso(),
     });
   } catch {}
@@ -421,11 +437,15 @@ async function requeueStaleProcessingJobs() {
   let recovered = 0;
   for (const r of rows) {
     try {
+      const claimedBy = String(r?.claimed_by || "").toLowerCase();
+      const queueStageForRecover = claimedBy.startsWith("heavy:")
+        ? "QUEUE_HEAVY"
+        : "QUEUE";
       const { data: ok } = await supabase
         .from("jobs")
         .update({
           status: "QUEUED",
-          stage: "QUEUE",
+          stage: queueStageForRecover,
           progress: 1,
           split_progress: 0,
           claimed_by: null,
@@ -1192,6 +1212,15 @@ function buildHardFitPassPlan({ bytes, pages, forceFast }) {
   ];
 }
 
+function heavyTailPasses() {
+  // Extra ladder for QUEUE_HEAVY jobs (controlled quality drop).
+  return [
+    { dpi: 60, jpegQ: 24, pdfSettings: "/screen" },
+    { dpi: 52, jpegQ: 20, pdfSettings: "/screen" },
+    { dpi: 46, jpegQ: 16, pdfSettings: "/screen" },
+  ];
+}
+
 // ----------------------
 // Processors
 // ----------------------
@@ -1251,9 +1280,12 @@ async function processDefaultFast({
       pages: prePages,
       forceFast,
     });
-    for (let i = 0; i < passPlan.length; i++) {
+    const plannedPasses = IS_HEAVY_PROFILE
+      ? [...passPlan, ...heavyTailPasses()]
+      : passPlan;
+    for (let i = 0; i < plannedPasses.length; i++) {
       if (softStop()) break;
-      const pass = passPlan[i];
+      const pass = plannedPasses[i];
       const outPdf = path.join(wd, `.__hardfit_${i + 1}_${rand6()}.pdf`);
       const ok = await gsCompressOnce({
         inPdf: workPdf,
@@ -1314,7 +1346,9 @@ async function processDefaultFast({
     updated_at: nowIso(),
   });
 
-  const targetBytes = Math.floor(SYSTEM_PART_BYTES * 0.985); // keep slight safety margin under 9MB
+  const targetBytes = Math.floor(
+    SYSTEM_PART_BYTES * (IS_HEAVY_PROFILE ? HEAVY_TARGET_MARGIN : 0.985),
+  ); // heavy queue uses a tighter margin under 9MB
   const maxParts = SYSTEM_MAX_PARTS;
   const minPartsPolicy = Math.max(
     1,
@@ -1397,7 +1431,7 @@ async function processDefaultFast({
       res,
       targetBytes,
       expiresAtIso,
-      maxPasses: 2,
+      maxPasses: IS_HEAVY_PROFILE ? HEAVY_EXTRA_SHRINK_PASSES : 2,
       onProgress: async ({ pass, passCount, done, total, maxPartBytes: mpb }) => {
         const localPct = total > 0 ? done / total : 0;
         const pct = Math.round(68 + ((pass - 1 + localPct) / passCount) * 18);
@@ -1431,7 +1465,7 @@ async function processDefaultFast({
         res,
         targetBytes,
         expiresAtIso,
-        maxPasses: 2,
+        maxPasses: IS_HEAVY_PROFILE ? HEAVY_EXTRA_SHRINK_PASSES : 2,
       });
     }
   }
@@ -1682,6 +1716,8 @@ async function processOneJob(job) {
 async function main() {
   console.log("goodpdf worker started", {
     WORKER_ID,
+    WORKER_PROFILE,
+    QUEUE_STAGE,
     POLL_MS,
     CONCURRENCY,
     QUEUE_FETCH_LIMIT,
@@ -1703,6 +1739,8 @@ async function main() {
     SYSTEM_TURBO_TRIGGER_MB,
     SYSTEM_TURBO_PAGE_TRIGGER,
     SYSTEM_FORCE_5_FROM_MB,
+    HEAVY_TARGET_MARGIN,
+    HEAVY_EXTRA_SHRINK_PASSES,
   });
 
   // Print critical env sanity (never print secrets)
