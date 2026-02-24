@@ -102,6 +102,22 @@ const CLEANUP_EVERY_MS = Math.max(
   10_000,
   Number(process.env.CLEANUP_EVERY_MS || 30_000),
 );
+const STALE_RECOVERY_EVERY_MS = Math.max(
+  10_000,
+  Number(process.env.STALE_RECOVERY_EVERY_MS || 20_000),
+);
+const CLAIM_STALE_MS = Math.max(
+  60_000,
+  Number(process.env.CLAIM_STALE_MS || 6 * 60_000),
+);
+const HEARTBEAT_MS = Math.max(5_000, Number(process.env.HEARTBEAT_MS || 8_000));
+const MAX_STALE_RECOVERY_BATCH = Math.max(
+  1,
+  Number(process.env.MAX_STALE_RECOVERY_BATCH || 20),
+);
+const ENABLE_LOCAL_INGEST_FAST_PATH =
+  String(process.env.ENABLE_LOCAL_INGEST_FAST_PATH || "false").toLowerCase() ===
+  "true";
 
 // Binaries
 const GS_EXE = process.env.GS_EXE || "gs";
@@ -378,6 +394,54 @@ async function claimJob(jobId) {
 
   if (error) return false;
   return !!data;
+}
+
+async function heartbeatJob(jobId, stage = "PROCESSING") {
+  try {
+    await updateJob(jobId, {
+      status: "PROCESSING",
+      stage,
+      claimed_by: WORKER_ID,
+      updated_at: nowIso(),
+    });
+  } catch {}
+}
+
+async function requeueStaleProcessingJobs() {
+  const staleIso = new Date(Date.now() - CLAIM_STALE_MS).toISOString();
+  const { data: rows, error } = await supabase
+    .from("jobs")
+    .select("id,updated_at,claimed_by,status")
+    .eq("status", "PROCESSING")
+    .lt("updated_at", staleIso)
+    .limit(MAX_STALE_RECOVERY_BATCH);
+
+  if (error || !rows?.length) return 0;
+
+  let recovered = 0;
+  for (const r of rows) {
+    try {
+      const { data: ok } = await supabase
+        .from("jobs")
+        .update({
+          status: "QUEUED",
+          stage: "QUEUE",
+          progress: 1,
+          split_progress: 0,
+          claimed_by: null,
+          claimed_at: null,
+          error_code: "RECOVERED_STALE",
+          error_text: null,
+          updated_at: nowIso(),
+        })
+        .eq("id", r.id)
+        .eq("status", "PROCESSING")
+        .select("id")
+        .maybeSingle();
+      if (ok?.id) recovered += 1;
+    } catch {}
+  }
+  return recovered;
 }
 
 // ----------------------
@@ -1390,6 +1454,10 @@ function tmpDir(jobId) {
   return d;
 }
 
+function ingestCachePath(jobId) {
+  return path.join(os.tmpdir(), "goodpdf_ingest", String(jobId || ""), "input.pdf");
+}
+
 async function processOneJob(job) {
   const jobId = job.id;
   const jobStartMs = Date.now();
@@ -1414,6 +1482,7 @@ async function processOneJob(job) {
 
   const startedAtMs = Date.now();
   const wd = tmpDir(jobId);
+  let hbTimer = null;
 
   const inPdf = path.join(wd, "input.pdf");
   const partsDir = path.join(wd, "parts");
@@ -1431,8 +1500,12 @@ async function processOneJob(job) {
     new Date(Date.now() + ttlMinutes * 60_000).toISOString();
 
   try {
+    hbTimer = setInterval(() => {
+      heartbeatJob(jobId, "PROCESSING").catch(() => {});
+    }, HEARTBEAT_MS);
+
     await updateJob(jobId, {
-      stage: "DOWNLOAD",
+      stage: "ANALYZE",
       progress: 5,
       split_progress: 0,
       expires_at: expiresAtIso,
@@ -1440,7 +1513,16 @@ async function processOneJob(job) {
       updated_at: nowIso(),
     });
     const tDownload = Date.now();
-    await downloadFromR2(inputKey, inPdf);
+    const cachedIn = ingestCachePath(jobId);
+    if (ENABLE_LOCAL_INGEST_FAST_PATH && safeExists(cachedIn)) {
+      try {
+        fs.copyFileSync(cachedIn, inPdf);
+      } catch {
+        await downloadFromR2(inputKey, inPdf);
+      }
+    } else {
+      await downloadFromR2(inputKey, inPdf);
+    }
     timing.download_ms = Date.now() - tDownload;
 
     const inBytes = safeStatSize(inPdf) ?? 0;
@@ -1565,6 +1647,8 @@ async function processOneJob(job) {
       warning_text: warningText,
       error_text: null,
       error_code: null,
+      claimed_by: null,
+      claimed_at: null,
       updated_at: nowIso(),
     });
     timing.finalize_ms = Date.now() - tFinalize;
@@ -1595,9 +1679,22 @@ async function processOneJob(job) {
       split_progress: 100,
       error_code: e?.code ? String(e.code) : "WORKER_ERROR",
       error_text: msg.slice(0, 800),
+      claimed_by: null,
+      claimed_at: null,
       updated_at: nowIso(),
     });
   } finally {
+    if (hbTimer) {
+      try {
+        clearInterval(hbTimer);
+      } catch {}
+      hbTimer = null;
+    }
+    try {
+      if (ENABLE_LOCAL_INGEST_FAST_PATH) {
+        safeRm(path.dirname(ingestCachePath(jobId)));
+      }
+    } catch {}
     safeRm(wd);
   }
 }
@@ -1617,6 +1714,11 @@ async function main() {
     DEFAULT_TTL_MINUTES,
     DO_CLEANUP,
     CLEANUP_EVERY_MS,
+    STALE_RECOVERY_EVERY_MS,
+    CLAIM_STALE_MS,
+    HEARTBEAT_MS,
+    MAX_STALE_RECOVERY_BATCH,
+    ENABLE_LOCAL_INGEST_FAST_PATH,
     UX_CAP_MS,
     UX_SOFTSTOP_MS,
     SYSTEM_PART_MB,
@@ -1635,6 +1737,7 @@ async function main() {
   console.log("[ENV] R2_ENDPOINT present =", !!R2_ENDPOINT);
 
   let lastCleanupAt = 0;
+  let lastStaleRecoveryAt = 0;
   let pollTick = 0;
   let lastIdlePollLogAt = 0;
 
@@ -1646,6 +1749,16 @@ async function main() {
         cleanupExpiredOutputs().catch((err) => {
           console.error("[cleanup] failed:", err?.message || err);
         });
+      }
+      if (now - lastStaleRecoveryAt >= STALE_RECOVERY_EVERY_MS) {
+        lastStaleRecoveryAt = now;
+        requeueStaleProcessingJobs()
+          .then((n) => {
+            if (n > 0) console.log("[stale-recovery] requeued =", n);
+          })
+          .catch((err) => {
+            console.error("[stale-recovery] failed:", err?.message || err);
+          });
       }
 
       const jobs = await fetchQueue(QUEUE_FETCH_LIMIT);

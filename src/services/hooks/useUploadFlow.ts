@@ -8,6 +8,9 @@ import { JobService } from "@/services/JobService";
 const DEV_USER_ID = "00000000-0000-0000-0000-000000000001";
 const LS_JOB_ID = "goodpdf_last_job_id";
 const LS_OWNER_TOKEN = "goodpdf_last_owner_token";
+const PREFER_DIRECT_UPLOAD =
+  String(process.env.NEXT_PUBLIC_PREFER_DIRECT_UPLOAD || "false").toLowerCase() ===
+  "true";
 
 /**
  * Pricing / Plans (LOCKED)
@@ -120,7 +123,7 @@ function stageToLabel(stage?: string | null) {
   const s = String(stage || "").toUpperCase();
   if (!s) return "Working";
   if (s === "QUEUE") return "Queued";
-  if (s === "DOWNLOAD") return "Downloading";
+  if (s === "DOWNLOAD") return "Analyzing pages";
   if (s === "ANALYZE") return "Analyzing pages";
   if (s === "PREFLIGHT") return "Preparing plan";
   if (s === "DEFAULT") return "System optimization";
@@ -157,7 +160,7 @@ function nextPollDelayMs(phase: Phase, stageLabel: string, backoffStep: number) 
 
   const st = (stageLabel || "").toLowerCase();
   if (st.includes("queued")) ms = 1100;
-  if (st.includes("downloading")) ms = 1200;
+  if (st.includes("finishing")) ms = 1200;
   if (st.includes("optimizing")) ms = 1400;
   if (st.includes("splitting")) ms = 1100;
   if (st.includes("creating zip") || st.includes("uploading zip")) ms = 1600;
@@ -207,6 +210,7 @@ export function useUploadFlow() {
   const phaseRef = useRef<Phase>("IDLE");
   const stageRef = useRef<string>("");
   const partsCountRef = useRef<number | null>(null);
+  const processingStartedRef = useRef(false);
 
   useEffect(() => {
     phaseRef.current = phase;
@@ -252,6 +256,7 @@ export function useUploadFlow() {
     setWarning(null);
     setResult(null);
     setDownloadUrl(null);
+    processingStartedRef.current = false;
   }, [stopPolling]);
 
   // Resume last jobId (best effort). Do NOT auto-start processing.
@@ -293,13 +298,23 @@ export function useUploadFlow() {
     async (jid: string) => {
       const st = await JobService.status(jid);
 
-      const nextPhase = statusToPhase(st.status);
+      let nextPhase = statusToPhase(st.status);
+      // Prevent transient phase regressions that cause UI flicker.
+      if (
+        processingStartedRef.current &&
+        (nextPhase === "UPLOADED" || nextPhase === "IDLE")
+      ) {
+        nextPhase = "PROCESSING";
+      }
       setPhase(nextPhase);
 
       const rawStage = String(st.stage || "").toUpperCase();
       const nextProgress = clampPct((st as any).progressPct ?? st.progress);
-      setProgressPct(nextProgress);
-      setStageCode(rawStage);
+      setProgressPct((prev) => {
+        if (nextPhase === "PROCESSING") return Math.max(prev, nextProgress);
+        return nextProgress;
+      });
+      setStageCode((prev) => rawStage || prev);
       setStageLabel(stageToLabel(rawStage));
       setMessageLine(String((st as any).message || ""));
 
@@ -312,6 +327,7 @@ export function useUploadFlow() {
       setWarning((st as any).warningText ?? null);
 
       if (nextPhase === "READY") {
+        processingStartedRef.current = false;
         setDownloadUrl(st.downloadUrl || JobService.downloadUrl(jid));
         setBusy(false);
         stopPolling();
@@ -319,6 +335,7 @@ export function useUploadFlow() {
       }
 
       if (nextPhase === "ERROR") {
+        processingStartedRef.current = false;
         setBusy(false);
         stopPolling();
         setError(st.errorText || "Failed");
@@ -426,11 +443,24 @@ export function useUploadFlow() {
           }
         } catch {}
 
-        await JobService.uploadToR2(created.uploadUrl, file, (pct) => {
-          setUploadPct(clampPct(pct));
-        });
-
-        await JobService.markUploaded(created.jobId);
+        // Default path stays presigned PUT (fast for internet uploads).
+        // Optional direct path can be enabled via env for single-node ingest optimization.
+        if (PREFER_DIRECT_UPLOAD) {
+          try {
+            await JobService.uploadFileDirect(created.jobId, file);
+            setUploadPct(100);
+          } catch {
+            await JobService.uploadToR2(created.uploadUrl, file, (pct) => {
+              setUploadPct(clampPct(pct));
+            });
+            await JobService.markUploaded(created.jobId);
+          }
+        } else {
+          await JobService.uploadToR2(created.uploadUrl, file, (pct) => {
+            setUploadPct(clampPct(pct));
+          });
+          await JobService.markUploaded(created.jobId);
+        }
 
         setBusy(false);
         setPhase("UPLOADED");
@@ -481,6 +511,7 @@ export function useUploadFlow() {
       setPhase("PROCESSING");
       setProgressPct(0);
       setStageLabel("Queued");
+      processingStartedRef.current = true;
 
       try {
         await JobService.start(jid, splitMb);
@@ -490,6 +521,7 @@ export function useUploadFlow() {
 
         startPolling(jid);
       } catch (e: any) {
+        processingStartedRef.current = false;
         setBusy(false);
         setPhase("ERROR");
         setError(e?.message || "Start failed");

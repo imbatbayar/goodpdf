@@ -2,6 +2,9 @@ import { NextResponse } from "next/server";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { supabaseServer } from "@/lib/supabase/server";
 import { checkRateLimit, rateLimitResponse } from "@/lib/rate-limit";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -11,11 +14,18 @@ function json(ok: boolean, data?: any, error?: string, status = 200) {
   return NextResponse.json({ ok, data, error }, { status });
 }
 
+function localIngestDir(jobId: string) {
+  return path.join(os.tmpdir(), "goodpdf_ingest", jobId);
+}
+
 const R2_ENDPOINT = process.env.R2_ENDPOINT!;
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID!;
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY!;
 const R2_BUCKET_IN = process.env.R2_BUCKET_IN || "goodpdf-in";
 const MAX_UPLOAD_BYTES = 500 * 1024 * 1024;
+const ENABLE_LOCAL_INGEST_FAST_PATH =
+  String(process.env.ENABLE_LOCAL_INGEST_FAST_PATH || "false").toLowerCase() ===
+  "true";
 
 if (!R2_ENDPOINT || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY) {
   throw new Error("Missing R2 env vars");
@@ -75,6 +85,8 @@ export async function POST(req: Request) {
 
     // bytes -> Buffer
     const buf = Buffer.from(await file.arrayBuffer());
+    const sig = buf.subarray(0, 5).toString("ascii");
+    if (sig !== "%PDF-") return json(false, null, "Invalid PDF file", 400);
 
     const key = `${jobId}/input.pdf`;
 
@@ -88,6 +100,17 @@ export async function POST(req: Request) {
       })
     );
 
+    // Local ingest cache (same machine as worker-local) to avoid worker re-download.
+    if (ENABLE_LOCAL_INGEST_FAST_PATH) {
+      try {
+        const dir = localIngestDir(jobId);
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, "input.pdf"), buf);
+      } catch {
+        // Non-fatal: worker will fallback to R2 download
+      }
+    }
+
     // Mark job as uploaded
     const { error } = await supabaseServer
       .from("jobs")
@@ -96,6 +119,7 @@ export async function POST(req: Request) {
         progress: 10,
         uploaded_at: new Date().toISOString(),
         input_path: key,
+        stage: "UPLOAD",
         error_text: null,
       })
       .eq("id", jobId);

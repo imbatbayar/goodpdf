@@ -158,6 +158,23 @@ export class JobService {
   }
 
   /**
+   * 2b) Direct upload via API (server uploads to R2 + local ingest cache)
+   *    - No client-side progress callback (fetch multipart limitation)
+   */
+  static async uploadFileDirect(jobId: string, file: File) {
+    const form = new FormData();
+    form.append("file", file);
+
+    const res = await fetch(`/api/jobs/upload-file?jobId=${encodeURIComponent(jobId)}`, {
+      method: "POST",
+      headers: ownerHeaders(),
+      body: form,
+    }).then((r) => readJson<{ jobId: string; key: string }>(r));
+
+    assertOk(res, "Direct upload failed");
+  }
+
+  /**
    * 2.5) Mark uploaded (server knows inputKey & can move job stage)
    */
   static async markUploaded(jobId: string) {
