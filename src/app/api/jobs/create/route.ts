@@ -13,7 +13,7 @@ export const revalidate = 0;
 const LOCKED_TTL_MINUTES = 10;
 const MAX_UPLOAD_BYTES = 500 * 1024 * 1024;
 const UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function json(ok: boolean, data?: any, error?: string, status = 200) {
   return NextResponse.json(

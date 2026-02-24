@@ -52,10 +52,13 @@ export async function POST(req: Request) {
       .update({
         status: "UPLOADED",
         stage: "UPLOAD",
+        progress: 0,
         progress_pct: 0,
         uploaded_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
         error: null,
+        error_text: null,
+        error_code: null,
       })
       .eq("id", jobId)
       .eq("owner_token", ownerToken);
