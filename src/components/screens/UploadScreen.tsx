@@ -508,14 +508,18 @@ export function UploadScreen() {
               nextPct = Math.min(softCap, row.pct + 1);
               rowHeartbeatAtRef.current[i] = now;
             }
-          } else if (bridgeKick) {
-            // If previous stage finished, pre-warm next stage at 3-5%.
-            nextPct = Math.max(row.pct, kickoffPctForIndex(i));
-            rowHeartbeatAtRef.current[i] = Date.now();
           }
+          const nextState: StepState =
+            flow.phase === "READY"
+              ? "done"
+              : target.state === "done"
+                ? "done"
+                : isStageActive
+                  ? "active"
+                  : target.state;
           return {
             ...row,
-            state: bridgeKick ? "active" : target.state,
+            state: nextState,
             pct: Math.max(0, Math.min(100, Math.round(nextPct))),
           };
         }),
