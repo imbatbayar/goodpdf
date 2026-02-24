@@ -29,6 +29,9 @@ type PrecheckInfo = {
 };
 
 const LS_PRECHECK_CALIBRATION = "goodpdf_precheck_calibration_v1";
+const ENABLE_PRECHECK_CALIBRATION =
+  String(process.env.NEXT_PUBLIC_ENABLE_PRECHECK_CALIBRATION || "false").toLowerCase() ===
+  "true";
 
 const SYSTEM_TICK_MESSAGES = [
   "Scanning pages…",
@@ -474,6 +477,7 @@ export function UploadScreen() {
   };
 
   useEffect(() => {
+    if (!ENABLE_PRECHECK_CALIBRATION) return;
     if (flow.phase !== "READY") return;
     if (calibrationAppliedForRunRef.current) return;
     const startedAt = processingStartedAtRef.current;
@@ -689,11 +693,7 @@ export function UploadScreen() {
   return (
     <ScreenShell
       title="Split PDF by Size"
-      subtitle={
-        mode === "SYSTEM"
-          ? "System-fit: maximize compatibility (≤9MB each, ≤5 files). Visual quality may be reduced."
-          : "Preserve quality while splitting your PDF into parts up to your target size."
-      }
+      subtitle=""
     >
       <div className="mx-auto w-full max-w-2xl px-4 pb-10">
         <div className="mt-1 flex justify-center">
@@ -768,7 +768,7 @@ export function UploadScreen() {
                           </div>
                         </div>
                         <div className="text-xs text-zinc-700">
-                          Mode: <b>{precheck.mode}</b> • Time: <b>~{precheck.etaMinLow}-{precheck.etaMinHigh} min</b>
+                          Time: <b>~{precheck.etaMinLow}-{precheck.etaMinHigh} min</b>
                         </div>
                         <div>
                           {(() => {
@@ -779,24 +779,6 @@ export function UploadScreen() {
                               </span>
                             );
                           })()}
-                        </div>
-                        {typeof precheck.estimatedCpuMin === "number" ? (
-                          <div className="text-xs text-zinc-700">
-                            Estimated CPU: <b>~{precheck.estimatedCpuMin} min</b>
-                          </div>
-                        ) : null}
-                        {precheck.confidenceNote ? (
-                          <div className="text-[11px] text-zinc-600">{precheck.confidenceNote}</div>
-                        ) : null}
-                        {precheck.recommendation ? (
-                          <div className="text-xs text-zinc-700">{precheck.recommendation}</div>
-                        ) : null}
-                        <div className="text-xs text-zinc-600">
-                          {precheck.reason.join(" • ")}
-                        </div>
-                        <div className="text-[11px] text-zinc-500">
-                          {precheck.pages != null ? `Pages: ${precheck.pages}` : "Pages: —"} • Avg/page:{" "}
-                          {precheck.avgMbPerPage != null ? `${precheck.avgMbPerPage}MB` : "—"}
                         </div>
                       </div>
                     ) : (

@@ -99,6 +99,10 @@ function ownerHeaders(extra?: Record<string, string>) {
 }
 
 function readPrecheckCalibrationFactor() {
+  const enableCal =
+    String(process.env.NEXT_PUBLIC_ENABLE_PRECHECK_CALIBRATION || "false").toLowerCase() ===
+    "true";
+  if (!enableCal) return 1;
   try {
     const raw = Number(localStorage.getItem(LS_PRECHECK_CALIBRATION) || "1");
     if (!Number.isFinite(raw)) return 1;

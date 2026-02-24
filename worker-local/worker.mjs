@@ -57,7 +57,14 @@ const WORKER_ID =
   process.env.WORKER_ID || `worker_${crypto.randomBytes(3).toString("hex")}`;
 const WORKER_PROFILE = String(process.env.WORKER_PROFILE || "normal").toLowerCase();
 const IS_HEAVY_PROFILE = WORKER_PROFILE === "heavy";
+const NORMAL_CAN_PROCESS_HEAVY =
+  String(process.env.NORMAL_CAN_PROCESS_HEAVY || "true").toLowerCase() !== "false";
 const QUEUE_STAGE = IS_HEAVY_PROFILE ? "QUEUE_HEAVY" : "QUEUE";
+const ACCEPTED_QUEUE_STAGES = IS_HEAVY_PROFILE
+  ? ["QUEUE_HEAVY"]
+  : NORMAL_CAN_PROCESS_HEAVY
+    ? ["QUEUE", "QUEUE_HEAVY"]
+    : ["QUEUE"];
 
 const SUPABASE_URL =
   process.env.SUPABASE_ADMIN_URL ||
@@ -79,7 +86,7 @@ const CPU_CORES = Math.max(1, Number(os.cpus()?.length || 1));
 const CONCURRENCY = Math.max(
   1,
   Math.min(
-    Number(process.env.CONCURRENCY || 1),
+    Number(process.env.CONCURRENCY || 2),
     Math.max(1, Number(process.env.MAX_WORKER_CONCURRENCY || CPU_CORES - 1)),
   ),
 );
@@ -94,6 +101,8 @@ const QUEUE_FETCH_LIMIT = Math.max(
   1,
   Math.min(CONCURRENCY, Number(process.env.QUEUE_FETCH_LIMIT || CONCURRENCY)),
 );
+const QUEUE_NEWEST_FIRST =
+  String(process.env.QUEUE_NEWEST_FIRST || "true").toLowerCase() !== "false";
 const DEFAULT_TTL_MINUTES = Math.max(
   5,
   Number(process.env.DEFAULT_TTL_MINUTES || 10),
@@ -344,12 +353,11 @@ async function fetchQueue(limit = 1) {
   const query = supabase
     .from("jobs")
     .select(
-      "id,status,stage,created_at,input_path,claimed_by,split_mb,ttl_minutes,expires_at,delete_at",
+      "id,status,stage,error_code,created_at,input_path,claimed_by,split_mb,ttl_minutes,expires_at,delete_at",
     )
     .eq("status", "QUEUED")
-    .eq("stage", QUEUE_STAGE)
     .is("claimed_by", null)
-    .order("created_at", { ascending: true })
+    .order("created_at", { ascending: !QUEUE_NEWEST_FIRST })
     .limit(limit);
 
   // 12s hard timeout to surface network/SDK hangs
@@ -385,11 +393,14 @@ async function fetchQueue(limit = 1) {
   return rows;
 }
 
-async function claimJob(jobId) {
+async function claimJob(jobId, queueStage = "QUEUE") {
   const claimOwner = `${WORKER_PROFILE}:${WORKER_ID}`;
+  const safeQueueStage = String(queueStage || "QUEUE").toUpperCase() === "QUEUE_HEAVY"
+    ? "QUEUE_HEAVY"
+    : "QUEUE";
   const patch = {
     status: "PROCESSING",
-    stage: QUEUE_STAGE,
+    stage: safeQueueStage,
     progress: 1,
     split_progress: 0,
     claimed_by: claimOwner,
@@ -1230,9 +1241,13 @@ async function processDefaultFast({
   wd,
   expiresAtIso,
   startedAtMs,
+  heavyLane = false,
 }) {
+  const effectiveSoftStopMs = heavyLane
+    ? Math.max(UX_SOFTSTOP_MS, 300_000)
+    : UX_SOFTSTOP_MS;
   const elapsed = () => Date.now() - startedAtMs;
-  const softStop = () => elapsed() >= UX_SOFTSTOP_MS;
+  const softStop = () => elapsed() >= effectiveSoftStopMs;
 
   const partsDir = path.join(wd, "parts");
   fs.mkdirSync(partsDir, { recursive: true });
@@ -1280,7 +1295,7 @@ async function processDefaultFast({
       pages: prePages,
       forceFast,
     });
-    const plannedPasses = IS_HEAVY_PROFILE
+    const plannedPasses = heavyLane
       ? [...passPlan, ...heavyTailPasses()]
       : passPlan;
     for (let i = 0; i < plannedPasses.length; i++) {
@@ -1347,7 +1362,7 @@ async function processDefaultFast({
   });
 
   const targetBytes = Math.floor(
-    SYSTEM_PART_BYTES * (IS_HEAVY_PROFILE ? HEAVY_TARGET_MARGIN : 0.985),
+    SYSTEM_PART_BYTES * (heavyLane ? HEAVY_TARGET_MARGIN : 0.985),
   ); // heavy queue uses a tighter margin under 9MB
   const maxParts = SYSTEM_MAX_PARTS;
   const minPartsPolicy = Math.max(
@@ -1431,7 +1446,7 @@ async function processDefaultFast({
       res,
       targetBytes,
       expiresAtIso,
-      maxPasses: IS_HEAVY_PROFILE ? HEAVY_EXTRA_SHRINK_PASSES : 2,
+      maxPasses: heavyLane ? HEAVY_EXTRA_SHRINK_PASSES : 2,
       onProgress: async ({ pass, passCount, done, total, maxPartBytes: mpb }) => {
         const localPct = total > 0 ? done / total : 0;
         const pct = Math.round(68 + ((pass - 1 + localPct) / passCount) * 18);
@@ -1465,7 +1480,7 @@ async function processDefaultFast({
         res,
         targetBytes,
         expiresAtIso,
-        maxPasses: IS_HEAVY_PROFILE ? HEAVY_EXTRA_SHRINK_PASSES : 2,
+        maxPasses: heavyLane ? HEAVY_EXTRA_SHRINK_PASSES : 2,
       });
     }
   }
@@ -1510,7 +1525,10 @@ async function processOneJob(job) {
   };
 
   const tClaim = Date.now();
-  const claimed = await claimJob(jobId);
+  const queuedStage = String(job?.stage || "QUEUE").toUpperCase();
+  const heavyHint = String(job?.error_code || "").toUpperCase() === "HEAVY_HINT";
+  const claimStage = queuedStage === "QUEUE_HEAVY" ? "QUEUE_HEAVY" : "QUEUE";
+  const claimed = await claimJob(jobId, claimStage);
   timing.claim_ms = Date.now() - tClaim;
   if (!claimed) return;
 
@@ -1589,12 +1607,14 @@ async function processOneJob(job) {
       split_progress: 1,
       updated_at: nowIso(),
     });
+    const heavyLane = heavyHint || queuedStage === "QUEUE_HEAVY" || IS_HEAVY_PROFILE;
     res = await processDefaultFast({
       jobId,
       inPdf,
       wd,
       expiresAtIso,
       startedAtMs,
+      heavyLane,
     });
     timing.process_ms = Date.now() - tProcess;
 
@@ -1718,9 +1738,12 @@ async function main() {
     WORKER_ID,
     WORKER_PROFILE,
     QUEUE_STAGE,
+    ACCEPTED_QUEUE_STAGES,
+    NORMAL_CAN_PROCESS_HEAVY,
     POLL_MS,
     CONCURRENCY,
     QUEUE_FETCH_LIMIT,
+    QUEUE_NEWEST_FIRST,
     SPLIT_PAR,
     R2_BUCKET_IN,
     R2_BUCKET_OUT,

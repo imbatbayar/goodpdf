@@ -195,6 +195,13 @@ function estimateProfile(
     etaMinLow = Math.max(etaMinLow, 5);
     etaMinHigh = Math.max(etaMinHigh, 9);
   }
+  if (fileSizeMb <= 30 && pages != null && pages >= 25 && avgMbPerPage != null && avgMbPerPage <= 1.2) {
+    // Small/medium files with moderate page density should stay affordable by default.
+    tokenCost = Math.min(tokenCost, 1) as 1 | 2 | 3;
+    mode = "NORMAL";
+    etaMinLow = Math.min(etaMinLow, 4);
+    etaMinHigh = Math.min(etaMinHigh, 8);
+  }
   if (
     etaMinHigh >= 12 ||
     (avgMbPerPage != null &&
