@@ -24,7 +24,7 @@ import {
   PutObjectCommand,
   DeleteObjectCommand,
 } from "@aws-sdk/client-s3";
-import { classifyScanJob, estimatePartsForTarget } from "./tools/scan_engine.mjs";
+import { estimatePartsForTarget } from "./tools/scan_engine.mjs";
 
 // ----------------------
 // 7z resolve
@@ -109,17 +109,17 @@ const QPDF_EXE = process.env.QPDF_EXE || "qpdf";
 
 // Timeouts (bounded by expires_at too)
 const TIMEOUT_QPDF_MS = Math.max(10_000, Number(process.env.TIMEOUT_QPDF_MS || 120_000));
-const TIMEOUT_GS_MS = Math.max(10_000, Number(process.env.TIMEOUT_GS_MS || 120_000));
+const TIMEOUT_GS_MS = Math.max(10_000, Number(process.env.TIMEOUT_GS_MS || 75_000));
 const TIMEOUT_7Z_MS = Math.max(
   10_000,
   Number(process.env.TIMEOUT_7Z_MS || 120_000),
 );
 
 // UX cap (best-effort)
-const UX_CAP_MS = Math.max(60_000, Number(process.env.UX_CAP_MS || 120_000)); // default 2min
+const UX_CAP_MS = Math.max(60_000, Number(process.env.UX_CAP_MS || 180_000)); // default 3min
 const UX_SOFTSTOP_MS = Math.max(
   50_000,
-  Math.min(UX_CAP_MS - 10_000, Number(process.env.UX_SOFTSTOP_MS || 105_000)),
+  Math.min(UX_CAP_MS - 10_000, Number(process.env.UX_SOFTSTOP_MS || 150_000)),
 );
 
 // DEFAULT system-fit policy
@@ -129,6 +129,11 @@ const SYSTEM_PART_BYTES = Math.floor(SYSTEM_PART_MB * 1024 * 1024);
 const SYSTEM_TOTAL_CAP_BYTES = Math.floor(
   SYSTEM_PART_BYTES * SYSTEM_MAX_PARTS - 512 * 1024, // headroom
 );
+const SYSTEM_TOTAL_FLOOR_MB = Math.max(
+  10,
+  Math.min(SYSTEM_PART_MB * SYSTEM_MAX_PARTS, Number(process.env.SYSTEM_TOTAL_FLOOR_MB || 40)),
+);
+const SYSTEM_TOTAL_FLOOR_BYTES = Math.floor(SYSTEM_TOTAL_FLOOR_MB * 1024 * 1024);
 const SYSTEM_TURBO_TRIGGER_MB = Math.max(
   20,
   Number(process.env.SYSTEM_TURBO_TRIGGER_MB || 80),
@@ -140,6 +145,10 @@ const SYSTEM_TURBO_PAGE_TRIGGER = Math.max(
 const SYSTEM_FORCE_5_FROM_MB = Math.max(
   30,
   Number(process.env.SYSTEM_FORCE_5_FROM_MB || 100),
+);
+const SYSTEM_MIN_PARTS = Math.max(
+  1,
+  Math.min(SYSTEM_MAX_PARTS, Number(process.env.SYSTEM_MIN_PARTS || 2)),
 );
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -200,9 +209,6 @@ function safeStatSize(p) {
 }
 function bytesToMb(n) {
   return n / (1024 * 1024);
-}
-function mbToBytes(mb) {
-  return Math.floor(Number(mb) * 1024 * 1024);
 }
 function rand6() {
   return crypto.randomBytes(3).toString("hex");
@@ -291,63 +297,6 @@ function runCmd(cmd, args, timeoutMs, spawnOpts = {}, okCodes = [0]) {
 // ----------------------
 // Python helper (Selective recompression)
 // ----------------------
-function resolvePythonExe() {
-  const envPy = (process.env.PYTHON_EXE || "").trim();
-  const candidates = [
-    envPy || null,
-    path.join(process.cwd(), "venv", "Scripts", "python.exe"), // local dev (Windows)
-    "python",
-    "py",
-  ].filter(Boolean);
-
-  for (const c of candidates) {
-    if (c === "python" || c === "py") return c;
-    try {
-      if (c.toLowerCase().endsWith(".exe") && fs.existsSync(c)) return c;
-    } catch {}
-  }
-  return "python";
-}
-const PYTHON_EXE = resolvePythonExe();
-
-async function runPython(scriptRelPath, args = [], timeoutMs = 10 * 60 * 1000) {
-  const scriptPath = path.isAbsolute(scriptRelPath)
-    ? scriptRelPath
-    : path.join(process.cwd(), scriptRelPath);
-
-  const { out, err } = await runCmd(
-    PYTHON_EXE,
-    [scriptPath, ...args],
-    timeoutMs,
-    {},
-    [0],
-  );
-
-  const s = String(out || "").trim();
-  if (!s) {
-    const e = new Error(`PYTHON_NO_STDOUT\n${String(err || "").trim()}`);
-    e.code = "PYTHON_NO_STDOUT";
-    throw e;
-  }
-  return s;
-}
-
-async function selectiveRecompress45({ inPdf, outPdf, expiresAtIso }) {
-  // Aim: bring PDF down to <= SYSTEM_TOTAL_CAP_BYTES (~45MB) as fast as possible.
-  const tPY = boundedTimeout(TIMEOUT_GS_MS, expiresAtIso, 20_000, 90_000); // reuse GS timeout budget
-  const script = path.join("tools", "selective_recompress.py");
-
-  // Script itself targets 45MB; we still keep SYSTEM_TOTAL_CAP_BYTES for system-fit semantics.
-  const raw = await runPython(script, [inPdf, outPdf], tPY);
-  let report = null;
-  try {
-    report = JSON.parse(raw);
-  } catch {}
-
-  const outBytes = safeStatSize(outPdf) ?? 0;
-  return { ok: outBytes > 0, outBytes, report };
-}
-
 // ----------------------
 // Supabase helpers
 // ----------------------
@@ -788,42 +737,6 @@ async function recompressPdfInPlace({
   return safeStatSize(pdfPath) ?? 0;
 }
 
-async function shrinkOversizeParts({
-  res,
-  targetBytes,
-  expiresAtIso,
-}) {
-  const fileByName = new Map(
-    (res.partFiles || []).map((p) => [path.basename(p), p]),
-  );
-  const passes = [
-    { dpi: 66, jpegQ: 26 },
-    { dpi: 58, jpegQ: 22 },
-  ];
-
-  for (const pass of passes) {
-    let touched = 0;
-    for (const meta of res.partMeta || []) {
-      const b = Number(meta?.bytes || 0);
-      if (b <= targetBytes) continue;
-      const filePath = fileByName.get(meta.name);
-      if (!filePath) continue;
-      const nb = await recompressPdfInPlace({
-        pdfPath: filePath,
-        expiresAtIso,
-        dpi: pass.dpi,
-        jpegQ: pass.jpegQ,
-        pdfSettings: "/screen",
-      });
-      meta.bytes = nb;
-      meta.sizeMb = Math.round(bytesToMb(nb) * 10) / 10;
-      touched++;
-    }
-    if (touched === 0 || maxPartBytes(res.partMeta) <= targetBytes) break;
-  }
-  return res;
-}
-
 async function shrinkOversizePartsAggressive({
   res,
   targetBytes,
@@ -837,6 +750,7 @@ async function shrinkOversizePartsAggressive({
   const passes = [
     { dpi: 42, jpegQ: 14 },
     { dpi: 36, jpegQ: 10 },
+    { dpi: 30, jpegQ: 8 },
   ];
 
   const passCount = Math.max(1, Math.min(maxPasses, passes.length));
@@ -907,58 +821,6 @@ async function qpdfConcatSinglePages({ pagePdfs, outPdf, expiresAtIso }) {
   await runCmd(QPDF_EXE, args, tQ);
   const b = safeStatSize(outPdf) ?? 0;
   return b;
-}
-
-async function gsRenderPagesToJpeg({
-  inPdf,
-  outDir,
-  dpi,
-  jpegQ,
-  expiresAtIso,
-}) {
-  fs.mkdirSync(outDir, { recursive: true });
-  const tGS = boundedTimeout(TIMEOUT_GS_MS, expiresAtIso, 20_000, 60_000);
-  const args = [
-    "-q",
-    "-dSAFER",
-    "-dBATCH",
-    "-dNOPAUSE",
-    "-sDEVICE=jpeg",
-    `-r${Math.max(50, Number(dpi) || 90)}`,
-    `-dJPEGQ=${Math.max(18, Math.min(70, Number(jpegQ) || 35))}`,
-    `-sOutputFile=${path.join(outDir, "p%05d.jpg")}`,
-    inPdf,
-  ];
-  await runCmd(GS_EXE, args, tGS);
-}
-
-async function scanFirstRebuildPdf({ inPdf, outPdf, wd, expiresAtIso }) {
-  const pages = await qpdfPages(inPdf, expiresAtIso);
-  const inBytes = safeStatSize(inPdf) ?? 0;
-  const bpp = inBytes / Math.max(1, pages);
-
-  // Very aggressive profile for huge scan-like jobs.
-  const dpi = bpp > 900 * 1024 ? 72 : 85;
-  const jpegQ = bpp > 900 * 1024 ? 24 : 30;
-
-  const jpgDir = path.join(wd, `.__scanjpg_${rand6()}`);
-  safeRm(jpgDir);
-  fs.mkdirSync(jpgDir, { recursive: true });
-
-  await gsRenderPagesToJpeg({
-    inPdf,
-    outDir: jpgDir,
-    dpi,
-    jpegQ,
-    expiresAtIso,
-  });
-
-  // Build a brand-new compact PDF from JPEG pages.
-  const tPY = boundedTimeout(TIMEOUT_GS_MS, expiresAtIso, 20_000, 60_000);
-  await runPython(path.join("tools", "images_to_pdf.py"), [jpgDir, outPdf], tPY);
-  safeRm(jpgDir);
-
-  return safeStatSize(outPdf) ?? 0;
 }
 
 async function splitOversizeSafe({
@@ -1145,12 +1007,12 @@ function gsArgsStrongFast({
 }
 
 function gsArgsNuclear({ inPdf, outPdf }) {
-  // Must-fit mode for scan-heavy / very large PDFs
+  // Must-fit mode for hard cap enforcement.
   return gsArgsStrongFast({
     inPdf,
     outPdf,
-    dpi: 80,
-    jpegQ: 40,
+    dpi: 42,
+    jpegQ: 12,
     pdfSettings: "/screen",
   });
 }
@@ -1221,29 +1083,49 @@ async function zipParts(partsDir, outZipPath, expiresAtIso) {
 // Mode decide
 // ----------------------
 
-function getManualQuality(job) {
-  // Accept multiple possible UI column names (safe).
-  const q =
-    (job &&
-      (job.quality || job.quality_mode || job.qualityMode || job.preset)) ??
-    null;
-  const s = String(q || "high")
-    .trim()
-    .toLowerCase();
-  if (["original", "org", "orig", "o"].includes(s)) return "original";
-  if (["medium", "med", "m"].includes(s)) return "medium";
-  return "high";
+function choosePartCountBySize({
+  bytes,
+  pages,
+  targetBytes,
+  minParts = 2,
+  maxParts = 5,
+}) {
+  const b = Math.max(0, Number(bytes || 0));
+  const p = Math.max(1, Number(pages || 1));
+  const t = Math.max(256 * 1024, Number(targetBytes || SYSTEM_PART_BYTES));
+  const maxP = Math.max(1, Math.min(Number(maxParts || 5), p));
+  const minP = Math.max(1, Math.min(Number(minParts || 1), maxP));
+
+  // Keep each part close to 9MB, but never drop below min part policy.
+  const ideal = Math.ceil(b / Math.floor(t * 0.98));
+  return Math.max(minP, Math.min(maxP, Math.max(1, ideal)));
 }
 
-function isSystemFit(job) {
-  // Your existing UI flag: split_mb >= 490 means DEFAULT(system-fit)
-  const raw = Number(job.split_mb || 0);
-  return Number.isFinite(raw) && raw >= 490;
-}
-function getManualTargetMb(job) {
-  const mb = Number(job.split_mb);
-  if (!Number.isFinite(mb) || mb <= 0) return 9;
-  return Math.max(1, Math.min(2000, mb));
+function buildHardFitPassPlan({ bytes, pages, forceFast }) {
+  const b = Math.max(0, Number(bytes || 0));
+  const p = Math.max(1, Number(pages || 1));
+  const bpp = b / p;
+  const hugeImageLikely =
+    bytesToMb(b) >= 80 || p >= 120 || bpp >= 700 * 1024 || !!forceFast;
+
+  if (hugeImageLikely) {
+    // 3-minute SLA priority lane (few strong passes).
+    return [
+      { dpi: 120, jpegQ: 54, pdfSettings: "/ebook" },
+      { dpi: 102, jpegQ: 46, pdfSettings: "/ebook" },
+      { dpi: 88, jpegQ: 40, pdfSettings: "/screen" },
+      { dpi: 76, jpegQ: 32, pdfSettings: "/screen" },
+      { dpi: 66, jpegQ: 26, pdfSettings: "/screen" },
+    ];
+  }
+
+  return [
+    { dpi: 132, jpegQ: 58, pdfSettings: "/ebook" },
+    { dpi: 116, jpegQ: 52, pdfSettings: "/ebook" },
+    { dpi: 100, jpegQ: 46, pdfSettings: "/ebook" },
+    { dpi: 86, jpegQ: 38, pdfSettings: "/screen" },
+    { dpi: 72, jpegQ: 30, pdfSettings: "/screen" },
+  ];
 }
 
 // ----------------------
@@ -1262,7 +1144,7 @@ async function processDefaultFast({
   const partsDir = path.join(wd, "parts");
   fs.mkdirSync(partsDir, { recursive: true });
   const preInBytes = safeStatSize(inPdf) ?? 0;
-  const forceFiveAggressive = bytesToMb(preInBytes) >= SYSTEM_FORCE_5_FROM_MB;
+  const forceFast = bytesToMb(preInBytes) >= SYSTEM_FORCE_5_FROM_MB;
 
   await updateJob(jobId, {
     stage: "PREFLIGHT",
@@ -1271,136 +1153,94 @@ async function processDefaultFast({
     updated_at: nowIso(),
   });
 
-  // qpdf pre-normalize helps quality/size tradeoff, but for force-fast mode we skip it.
+  // qpdf pre-normalize is cheap and helps size stability.
   let workPdf = inPdf;
-  if (!forceFiveAggressive) {
-    const qpdfPdf = path.join(wd, `.__qpdf_${rand6()}.pdf`);
-    try {
-      const okQ = await qpdfFastRecompress({
-        inPdf,
-        outPdf: qpdfPdf,
-        expiresAtIso,
-      });
-      if (okQ) workPdf = qpdfPdf;
-    } catch {}
-  }
+  const qpdfPdf = path.join(wd, `.__qpdf_${rand6()}.pdf`);
+  try {
+    const okQ = await qpdfFastRecompress({
+      inPdf,
+      outPdf: qpdfPdf,
+      expiresAtIso,
+    });
+    if (okQ) workPdf = qpdfPdf;
+  } catch {}
 
   const prePages = await qpdfPages(workPdf, expiresAtIso);
   const preBytes = safeStatSize(workPdf) ?? safeStatSize(inPdf) ?? 0;
-  const profile = classifyScanJob({ bytes: preBytes, pages: prePages });
   const targetTotalBytes = SYSTEM_TOTAL_CAP_BYTES;
-  const useTurboPath =
-    bytesToMb(preBytes) >= SYSTEM_TURBO_TRIGGER_MB ||
-    prePages >= SYSTEM_TURBO_PAGE_TRIGGER;
+  const floorTotalBytes = Math.min(targetTotalBytes, SYSTEM_TOTAL_FLOOR_BYTES);
+  let afterCompressBytes = preBytes;
+  let bestFitPdf = null;
+  let bestFitBytes = 0;
 
-  // Hard speed path for very large files:
-  // - no scan rebuild
-  // - no multi-branch quality logic
-  // - strongest compression, then force split to 5
-  if (forceFiveAggressive && !softStop()) {
+  // Hard law: total output must fit <= 44MB.
+  if (afterCompressBytes > targetTotalBytes && !softStop()) {
     await updateJob(jobId, {
-      stage: "COMPRESS_FORCE5_MAX",
-      progress: 24,
+      stage: "COMPRESS_HARDFIT",
+      progress: 22,
       split_progress: 12,
       updated_at: nowIso(),
     });
-    const forceA = path.join(wd, `.__force5a_${rand6()}.pdf`);
-    const okA = await gsCompressOnce({
-      inPdf: workPdf,
-      outPdf: forceA,
-      mode: "PRESET",
-      dpi: 44,
-      jpegQ: 14,
-      pdfSettings: "/screen",
-      expiresAtIso,
-    });
-    if (okA) workPdf = forceA;
 
-    const forceBytes = safeStatSize(workPdf) ?? preBytes;
-    if (!softStop() && forceBytes > Math.floor(targetTotalBytes * 1.15)) {
-      await updateJob(jobId, {
-        stage: "COMPRESS_FORCE5_LAST",
-        progress: 36,
-        split_progress: 20,
-        updated_at: nowIso(),
-      });
-      const forceB = path.join(wd, `.__force5b_${rand6()}.pdf`);
-      const okB = await gsCompressOnce({
+    const passPlan = buildHardFitPassPlan({
+      bytes: preBytes,
+      pages: prePages,
+      forceFast,
+    });
+    for (let i = 0; i < passPlan.length; i++) {
+      if (softStop()) break;
+      const pass = passPlan[i];
+      const outPdf = path.join(wd, `.__hardfit_${i + 1}_${rand6()}.pdf`);
+      const ok = await gsCompressOnce({
         inPdf: workPdf,
-        outPdf: forceB,
+        outPdf,
         mode: "PRESET",
-        dpi: 38,
-        jpegQ: 11,
-        pdfSettings: "/screen",
+        dpi: pass.dpi,
+        jpegQ: pass.jpegQ,
+        pdfSettings: pass.pdfSettings || "/screen",
         expiresAtIso,
       });
-      if (okB) workPdf = forceB;
+      if (!ok) continue;
+      const outBytes = safeStatSize(outPdf) ?? 0;
+      if (outBytes <= 0) continue;
+
+      workPdf = outPdf;
+      afterCompressBytes = outBytes;
+
+      // Keep the largest candidate that still satisfies <=44MB.
+      if (outBytes <= targetTotalBytes && outBytes > bestFitBytes) {
+        bestFitPdf = outPdf;
+        bestFitBytes = outBytes;
+      }
+
+      // Stop when we are inside the target quality band [40MB..44MB].
+      if (outBytes <= targetTotalBytes && outBytes >= floorTotalBytes) break;
+    }
+
+    if (bestFitPdf && bestFitBytes > 0) {
+      workPdf = bestFitPdf;
+      afterCompressBytes = bestFitBytes;
     }
   }
 
-  // Big image-heavy PDFs: skip scan-rebuild (too slow) and do direct turbo GS first.
-  // This is the main speed path for 2-minute SLA.
-  if (!forceFiveAggressive && useTurboPath && !softStop()) {
+  if (afterCompressBytes > targetTotalBytes && !softStop()) {
     await updateJob(jobId, {
-      stage: "COMPRESS_TURBO_PRIMARY",
-      progress: 20,
-      split_progress: 10,
+      stage: "COMPRESS_HARDFIT_NUCLEAR",
+      progress: 38,
+      split_progress: 24,
       updated_at: nowIso(),
     });
-    const turboPdf = path.join(wd, `.__turbo_${rand6()}.pdf`);
-    const okTurbo = await gsCompressOnce({
+    const pN = path.join(wd, `.__hardfit_nuclear_${rand6()}.pdf`);
+    const okN = await gsCompressOnce({
       inPdf: workPdf,
-      outPdf: turboPdf,
-      mode: "PRESET",
-      dpi: 62,
-      jpegQ: 24,
-      pdfSettings: "/screen",
+      outPdf: pN,
+      mode: "NUCLEAR",
       expiresAtIso,
     });
-    if (okTurbo) workPdf = turboPdf;
-  } else if (!forceFiveAggressive && !softStop()) {
-    // Smaller jobs can still benefit from scan rebuild quality/size tradeoff.
-    await updateJob(jobId, {
-      stage: "SCAN_REBUILD",
-      progress: 18,
-      split_progress: 8,
-      updated_at: nowIso(),
-    });
-
-    const rebuiltPdf = path.join(wd, `.__scan_rebuild_${rand6()}.pdf`);
-    try {
-      const rebuiltBytes = await scanFirstRebuildPdf({
-        inPdf: workPdf,
-        outPdf: rebuiltPdf,
-        wd,
-        expiresAtIso,
-      });
-      if (rebuiltBytes > 0) workPdf = rebuiltPdf;
-    } catch {
-      // keep workPdf as-is
+    if (okN) {
+      workPdf = pN;
+      afterCompressBytes = safeStatSize(workPdf) ?? afterCompressBytes;
     }
-  }
-
-  const afterRebuildBytes = safeStatSize(workPdf) ?? preBytes;
-  if (!forceFiveAggressive && !softStop() && afterRebuildBytes > targetTotalBytes) {
-    await updateJob(jobId, {
-      stage: "COMPRESS_DEFAULT_ULTRA",
-      progress: 30,
-      split_progress: 14,
-      updated_at: nowIso(),
-    });
-
-    const p2 = path.join(wd, `.__fast_ultra_${rand6()}.pdf`);
-    const ok2 = await gsCompressOnce({
-      inPdf: workPdf,
-      outPdf: p2,
-      mode: "PRESET",
-      dpi: useTurboPath ? 58 : profile.pass2.dpi,
-      jpegQ: useTurboPath ? 22 : profile.pass2.jpegQ,
-      pdfSettings: profile.pass2.pdfSettings,
-      expiresAtIso,
-    });
-    if (ok2) workPdf = p2;
   }
 
   await updateJob(jobId, {
@@ -1411,7 +1251,11 @@ async function processDefaultFast({
   });
 
   const targetBytes = Math.floor(SYSTEM_PART_BYTES * 0.985); // keep slight safety margin under 9MB
-  const maxParts = 5;
+  const maxParts = SYSTEM_MAX_PARTS;
+  const minPartsPolicy = Math.max(
+    1,
+    Math.min(maxParts, SYSTEM_MIN_PARTS, Math.max(1, prePages)),
+  );
 
   const wipePartsDir = () => {
     try {
@@ -1424,32 +1268,36 @@ async function processDefaultFast({
     } catch {}
   };
 
-  // Try minimal part count first and increase up to 5 only if needed.
+  // Keep parts in [2..5] and near 9MB each.
   const splitForSystem = async (pdfPath) => {
     wipePartsDir();
     const pages0 = await qpdfPages(pdfPath, expiresAtIso);
-    if (forceFiveAggressive) {
-      const forcedParts = Math.min(maxParts, pages0);
-      const forcedRanges = buildEqualRanges(pages0, forcedParts);
-      const forcedRes = await splitSinglePass({
-        inPdf: pdfPath,
-        partsDir,
-        ranges: forcedRanges,
-        expiresAtIso,
-      });
-      return { ...forcedRes, _fit: maxPartBytes(forcedRes.partMeta) <= targetBytes, _parts: forcedParts };
-    }
-
+    const maxPartsForFile = Math.min(maxParts, pages0);
+    const minPartsForFile = Math.min(
+      maxPartsForFile,
+      pages0 >= 2 ? Math.max(2, minPartsPolicy) : 1,
+    );
     const bytes0 = safeStatSize(pdfPath) ?? 0;
-    const minParts = estimatePartsForTarget({
+    const desiredParts = choosePartCountBySize({
       bytes: bytes0,
-      targetBytes,
-      maxParts: Math.min(maxParts, pages0),
       pages: pages0,
+      targetBytes,
+      minParts: minPartsForFile,
+      maxParts: maxPartsForFile,
     });
 
+    const minParts = Math.max(
+      desiredParts,
+      estimatePartsForTarget({
+        bytes: bytes0,
+        targetBytes,
+        maxParts: maxPartsForFile,
+        pages: pages0,
+      }),
+    );
+
     let best = null;
-    for (let parts = minParts; parts <= Math.min(maxParts, pages0); parts++) {
+    for (let parts = minParts; parts <= maxPartsForFile; parts++) {
       wipePartsDir();
       const ranges = buildEqualRanges(pages0, parts);
       const res = await splitSinglePass({
@@ -1471,198 +1319,63 @@ async function processDefaultFast({
     };
   };
 
-  // If still far from 5x9MB, run one more aggressive pass before splitting.
-  let afterCompressBytes = safeStatSize(workPdf) ?? preBytes;
-  if (
-    !forceFiveAggressive &&
-    !softStop() &&
-    afterCompressBytes > Math.floor(targetTotalBytes * 1.35)
-  ) {
-    await updateJob(jobId, {
-      stage: "COMPRESS_DEFAULT_LASTMILE",
-      progress: 42,
-      split_progress: 22,
-      updated_at: nowIso(),
-    });
-    const p3 = path.join(wd, `.__lastmile_${rand6()}.pdf`);
-    const ok3 = await gsCompressOnce({
-      inPdf: workPdf,
-      outPdf: p3,
-      mode: "PRESET",
-      dpi: Math.max(54, Number(profile.pass2.dpi || 62) - 6),
-      jpegQ: Math.max(18, Number(profile.pass2.jpegQ || 24) - 4),
-      pdfSettings: "/screen",
-      expiresAtIso,
-    });
-    if (ok3) workPdf = p3;
-    afterCompressBytes = safeStatSize(workPdf) ?? afterCompressBytes;
-  }
-
   let res = await splitForSystem(workPdf);
 
-  // Keep hard max parts=5 and push oversized parts closer to 9MB.
+  // Push oversized parts down to <=9MB aggressively.
   if (maxPartBytes(res.partMeta) > targetBytes) {
     await updateJob(jobId, {
-      stage: forceFiveAggressive ? "PART_FIT_9MB_FAST" : "PART_SURGERY",
+      stage: "PART_FIT_9MB",
       progress: 68,
       split_progress: 52,
       updated_at: nowIso(),
     });
-    if (forceFiveAggressive) {
-      res = await shrinkOversizePartsAggressive({
-        res,
-        targetBytes,
-        expiresAtIso,
-        maxPasses: 2,
-        onProgress: async ({ pass, passCount, done, total, maxPartBytes: mpb }) => {
-          const localPct = total > 0 ? done / total : 0;
-          const pct = Math.round(68 + ((pass - 1 + localPct) / passCount) * 18);
-          await updateJob(jobId, {
-            stage: "PART_FIT_9MB_FAST",
-            progress: Math.min(95, Math.max(68, pct)),
-            split_progress: Math.min(95, Math.max(52, pct)),
-            max_part_mb: Math.round(bytesToMb(mpb) * 100) / 100,
-            updated_at: nowIso(),
-          });
-        },
-      });
-    } else {
-      res = await shrinkOversizeParts({
-        res,
-        targetBytes,
-        expiresAtIso,
-      });
-    }
+    res = await shrinkOversizePartsAggressive({
+      res,
+      targetBytes,
+      expiresAtIso,
+      maxPasses: 2,
+      onProgress: async ({ pass, passCount, done, total, maxPartBytes: mpb }) => {
+        const localPct = total > 0 ? done / total : 0;
+        const pct = Math.round(68 + ((pass - 1 + localPct) / passCount) * 18);
+        await updateJob(jobId, {
+          stage: "PART_FIT_9MB",
+          progress: Math.min(95, Math.max(68, pct)),
+          split_progress: Math.min(95, Math.max(52, pct)),
+          max_part_mb: Math.round(bytesToMb(mpb) * 100) / 100,
+          updated_at: nowIso(),
+        });
+      },
+    });
   }
 
-  if (maxPartBytes(res.partMeta) > targetBytes) {
-    console.warn(
-      "[system-fit] best-effort output: some parts exceed 9MB to keep <=5 parts",
-    );
-  }
-
-  return res;
-}
-
-async function processManualFast({
-  job,
-  jobId,
-  inPdf,
-  wd,
-  expiresAtIso,
-  startedAtMs,
-  targetMb,
-}) {
-  const elapsed = () => Date.now() - startedAtMs;
-  const softStop = () => elapsed() >= UX_SOFTSTOP_MS;
-
-  const partsDir = path.join(wd, "parts");
-  fs.mkdirSync(partsDir, { recursive: true });
-
-  await updateJob(jobId, {
-    stage: "PREFLIGHT",
-    progress: 8,
-    split_progress: 2,
-    updated_at: nowIso(),
-  });
-
-  // Always qpdf fast recompress first (cheap)
-  let workPdf = inPdf;
-  const qpdfPdf = path.join(wd, `.__qpdf_${rand6()}.pdf`);
-  try {
-    const okQ = await qpdfFastRecompress({
-      inPdf,
-      outPdf: qpdfPdf,
-      expiresAtIso,
-    });
-    if (okQ) workPdf = qpdfPdf;
-  } catch {}
-
-  // Manual quality preset (1 pass, or none for Original)
-  const quality = getManualQuality(job);
-
-  await updateJob(jobId, {
-    stage: quality === "original" ? "ORIGINAL" : "COMPRESS_MANUAL",
-    progress: 18,
-    split_progress: 6,
-    updated_at: nowIso(),
-  });
-
-  if (!softStop() && quality !== "original") {
-    const isHigh = quality === "high";
-    const dpi = isHigh ? 110 : 100;
-    const jpegQ = isHigh ? 50 : 45;
-
-    const p1 = path.join(wd, `.__m1_${rand6()}.pdf`);
-    const ok1 = await gsCompressOnce({
-      inPdf: workPdf,
-      outPdf: p1,
-      mode: "PRESET",
-      dpi,
-      jpegQ,
-      pdfSettings: "/ebook",
-      expiresAtIso,
-    });
-    if (ok1) workPdf = p1;
-  }
-
-  await updateJob(jobId, {
-    stage: "SPLIT",
-    progress: 55,
-    split_progress: 40,
-    updated_at: nowIso(),
-  });
-
-  const bytes = safeStatSize(workPdf) ?? safeStatSize(inPdf) ?? 0;
-
-  // Split by user's target MB (single pass, no split loop).
-  const targetBytes = mbToBytes(targetMb);
-
-  const wipePartsDir = () => {
-    try {
-      for (const f of fs.readdirSync(partsDir)) {
-        if (f.toLowerCase().endsWith(".pdf"))
-          safeUnlink(path.join(partsDir, f));
-      }
-    } catch {}
-  };
-
-  const splitOnce = async (pdfPath) => {
-    wipePartsDir();
-    const pages = await qpdfPages(pdfPath, expiresAtIso);
-    const fileBytes = safeStatSize(pdfPath) ?? bytes;
-    const parts = Math.max(
-      1,
-      Math.min(
-        pages,
-        Math.ceil(fileBytes / Math.max(256 * 1024, Math.floor(targetBytes * 0.92))),
-      ),
-    );
-    return await splitSinglePass({
-      inPdf: pdfPath,
-      partsDir,
-      ranges: buildEqualRanges(pages, parts),
-      expiresAtIso,
-    });
-  };
-
-  let res = await splitOnce(workPdf);
-
-  if (maxPartBytes(res.partMeta) > targetBytes) {
+  // Fallback: page-level pack for highly uneven PDFs.
+  if (maxPartBytes(res.partMeta) > targetBytes && !softStop()) {
     await updateJob(jobId, {
       stage: "OVERSIZE_SAFE_SPLIT",
-      progress: 70,
-      split_progress: 55,
+      progress: 86,
+      split_progress: 78,
       updated_at: nowIso(),
     });
-
-    // Deliver best-effort instead of failing.
     res = await splitOversizeSafe({
       inPdf: workPdf,
       partsDir,
       targetBytes,
       expiresAtIso,
     });
+    if (maxPartBytes(res.partMeta) > targetBytes) {
+      res = await shrinkOversizePartsAggressive({
+        res,
+        targetBytes,
+        expiresAtIso,
+        maxPasses: 2,
+      });
+    }
+  }
+
+  if (maxPartBytes(res.partMeta) > targetBytes) {
+    console.warn(
+      "[system-fit] hard-fit warning: some parts still exceed 9MB after aggressive fallback",
+    );
   }
 
   return res;
@@ -1773,42 +1486,23 @@ async function processOneJob(job) {
       analyze_ms: analyzeMs,
     });
 
-    const systemFit = isSystemFit(job);
+    const systemFit = true;
 
     let res;
     const tProcess = Date.now();
-    if (systemFit) {
-      await updateJob(jobId, {
-        stage: "DEFAULT",
-        progress: 6,
-        split_progress: 1,
-        updated_at: nowIso(),
-      });
-      res = await processDefaultFast({
-        jobId,
-        inPdf,
-        wd,
-        expiresAtIso,
-        startedAtMs,
-      });
-    } else {
-      const targetMb = getManualTargetMb(job);
-      await updateJob(jobId, {
-        stage: "MANUAL",
-        progress: 6,
-        split_progress: 1,
-        updated_at: nowIso(),
-      });
-      res = await processManualFast({
-        job,
-        jobId,
-        inPdf,
-        wd,
-        expiresAtIso,
-        startedAtMs,
-        targetMb,
-      });
-    }
+    await updateJob(jobId, {
+      stage: "DEFAULT",
+      progress: 6,
+      split_progress: 1,
+      updated_at: nowIso(),
+    });
+    res = await processDefaultFast({
+      jobId,
+      inPdf,
+      wd,
+      expiresAtIso,
+      startedAtMs,
+    });
     timing.process_ms = Date.now() - tProcess;
 
     // ZIP
@@ -1863,7 +1557,7 @@ async function processOneJob(job) {
       parts_json: res.partMeta || null,
       total_parts_bytes: totalPartsBytes,
       output_zip_bytes: outZipBytes,
-      target_mb: systemFit ? SYSTEM_PART_MB : Number(job.split_mb || null),
+      target_mb: SYSTEM_PART_MB,
       max_part_mb:
         typeof maxPartB === "number"
           ? Math.round(bytesToMb(maxPartB) * 100) / 100
