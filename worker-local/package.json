@@ -3,7 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node worker.mjs"
+    "start": "node worker.normal.mjs",
+    "start:normal": "node worker.normal.mjs",
+    "start:heavy": "node worker.heavy.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.600.0",
