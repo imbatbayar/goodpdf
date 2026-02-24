@@ -5,7 +5,7 @@ import { supabase } from "@/lib/supabase/client";
 
 export function useAccountSummary() {
   const [loading, setLoading] = useState(true);
-  const [remainingUses, setRemainingUses] = useState(0);
+  const [remainingFiles, setRemainingFiles] = useState(0);
   const [daysLeft, setDaysLeft] = useState(0);
 
   useEffect(() => {
@@ -18,21 +18,21 @@ export function useAccountSummary() {
       if (error) {
         console.error(error);
         // холболт алдаатай бол эндээс мэдэгдэнэ
-        setRemainingUses(-1);
+        setRemainingFiles(-1);
         setDaysLeft(-1);
         setLoading(false);
         return;
       }
 
-      // session байвал days/uses-г дараа нь entitlement-аас авна
+      // session байвал days/files/cpu-г дараа нь entitlement-аас авна
       // одоогоор зөвхөн "connect OK" гэдгийг харуулахын тулд mock тоо
       const hasSession = !!data.session;
-      setRemainingUses(hasSession ? 25 : 0);
-      setDaysLeft(hasSession ? 10 : 0);
+      setRemainingFiles(hasSession ? 30 : 0);
+      setDaysLeft(hasSession ? 30 : 0);
 
       setLoading(false);
     })();
   }, []);
 
-  return { loading, remainingUses, daysLeft };
+  return { loading, remainingFiles, daysLeft };
 }

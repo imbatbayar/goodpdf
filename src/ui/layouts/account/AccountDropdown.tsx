@@ -10,7 +10,7 @@ type Props = {
   anchorRef: React.RefObject<HTMLElement | null>;
   country: string;
   email: string;
-  planLabel?: string; // e.g. FREE
+  planLabel?: string; // e.g. BASIC
 };
 
 type Pos = { top: number; right: number };
@@ -21,7 +21,7 @@ export function AccountDropdown({
   anchorRef,
   country,
   email,
-  planLabel = "FREE",
+  planLabel = "BASIC",
 }: Props) {
   const panelRef = useRef<HTMLDivElement | null>(null);
   const [pos, setPos] = useState<Pos>({ top: 0, right: 0 });

@@ -17,7 +17,7 @@ export function AccountScreen() {
               <div style={{ color: "var(--muted)" }}>Loading…</div>
             ) : (
               <div style={{ color: "var(--muted)" }}>
-                {a.remainingUses} uses · {a.daysLeft} days left
+                {a.remainingFiles} files left · {a.daysLeft} days left
               </div>
             )}
           </div>

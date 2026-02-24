@@ -81,12 +81,15 @@ function ProgressBar({ used, total }: { used: number; total: number }) {
 
 export function UsagePage() {
   // UI-only placeholder — will be real in PHASE D
-  const freeTotal = 3;
-  const freeUsed = 0; // placeholder
-  const freeRemaining = Math.max(0, freeTotal - freeUsed);
+  const basicFileTotal = 30;
+  const basicFileUsed = 0; // placeholder
+  const basicFileRemaining = Math.max(0, basicFileTotal - basicFileUsed);
+  const basicCpuTotal = 60;
+  const basicCpuUsed = 0; // placeholder
+  const basicCpuRemaining = Math.max(0, basicCpuTotal - basicCpuUsed);
 
-  const freeLimit = "Up to 100 MB";
-  const proLimit = "Up to 500 MB";
+  const fileLimit = "Up to 500 MB / file";
+  const planWindow = "30-day window";
 
   return (
     <div className="mx-auto w-full max-w-5xl px-4 py-6">
@@ -98,19 +101,22 @@ export function UsagePage() {
 
       {/* Quick stats */}
       <div className="grid gap-4 md:grid-cols-3">
-        <StatPill label="Free uses left" value={`${freeRemaining}`} />
-        <StatPill label="Free file size" value={freeLimit} />
-        <StatPill label="Pro file size" value={proLimit} />
+        <StatPill label="Files left (Basic)" value={`${basicFileRemaining}`} />
+        <StatPill label="CPU min left (Basic)" value={`${basicCpuRemaining}`} />
+        <StatPill label="Plan window" value={planWindow} />
       </div>
 
       {/* Main cards */}
       <div className="mt-6 grid gap-4 md:grid-cols-2">
-        <Card title="Free usage" subtitle="Demo values for now.">
-          <ProgressBar used={freeUsed} total={freeTotal} />
+        <Card title="Basic usage" subtitle="Demo values for now.">
+          <ProgressBar used={basicFileUsed} total={basicFileTotal} />
 
           <div className="mt-4 rounded-xl border border-zinc-200 bg-zinc-50 p-4 text-sm text-zinc-700">
-            <div className="font-semibold text-zinc-900">What counts as 1 use?</div>
-            <div className="mt-1 text-zinc-600">Each split + download counts as 1 use.</div>
+            <div className="font-semibold text-zinc-900">How limits work</div>
+            <div className="mt-1 text-zinc-600">
+              1 successfully started file consumes 1 file quota. Heavy workloads also consume CPU minutes.
+            </div>
+            <div className="mt-1 text-zinc-600">{fileLimit}</div>
           </div>
         </Card>
 
@@ -118,7 +124,7 @@ export function UsagePage() {
           <div className="rounded-xl border border-zinc-200 bg-white p-4">
             <div className="text-sm font-semibold text-zinc-900">How it works</div>
             <div className="mt-2 text-sm text-zinc-600">
-              Paid plans use credits. Credits are added after payment.
+              Upgrade from Basic to Pro/Business for more file quota and CPU minutes.
             </div>
           </div>
 
@@ -144,7 +150,7 @@ export function UsagePage() {
               </span>
 
               <span className="text-amber-200 drop-shadow-[0_1px_0_rgba(0,0,0,0.25)]">
-                Upgrade to Pro
+                View Plans
               </span>
 
               <span

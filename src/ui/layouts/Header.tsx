@@ -27,14 +27,14 @@ export function Header() {
           <Tooltip
             content={
               <span>
-                Free upload — max 100MB (3 uses)
+                BASIC plan — 30 files, 60 CPU minutes, 30 days
                 <br />
                 After Confirm, files auto-delete in 10 minutes
               </span>
             }
           >
             <span className={styles.pill}>
-              Free 3 <span aria-hidden>💰</span>
+              BASIC <span aria-hidden>💰</span>
             </span>
           </Tooltip>
 
@@ -61,7 +61,7 @@ export function Header() {
             anchorRef={anchorRef}
             country={country}
             email="you@example.com"
-            planLabel="FREE"
+            planLabel="BASIC"
           />
         </div>
       </div>
