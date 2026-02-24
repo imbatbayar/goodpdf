@@ -528,6 +528,21 @@ export function UploadScreen() {
     return () => window.clearInterval(timer);
   }, [step, stickyRows, flow.phase, pipelineProgress]);
 
+  // Hard heartbeat: if backend is silent, active stage still advances +1% every 2s.
+  useEffect(() => {
+    if (step !== "RUN" || flow.phase !== "PROCESSING" || flow.error) return;
+    const timer = window.setInterval(() => {
+      setDisplayRows((prev) =>
+        prev.map((row) => {
+          if (row.state !== "active") return row;
+          if (row.pct >= 95) return row;
+          return { ...row, pct: Math.min(95, row.pct + 1) };
+        }),
+      );
+    }, 2_000);
+    return () => window.clearInterval(timer);
+  }, [step, flow.phase, flow.error]);
+
   useEffect(() => {
     if (step !== "RUN" || flow.phase !== "PROCESSING" || flow.error) {
       stopStageTicker();
