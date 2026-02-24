@@ -49,6 +49,17 @@ export type StatusResp = {
   warningText?: string | null;
 };
 
+export type PrecheckResp = {
+  tokenCost: 1 | 2 | 3;
+  mode: "NORMAL" | "HEAVY" | "EXTREME";
+  etaMinLow: number;
+  etaMinHigh: number;
+  fileSizeMb: number;
+  pages: number | null;
+  avgMbPerPage: number | null;
+  reason: string[];
+};
+
 type CreateArgs = {
   file: File;
 
@@ -198,6 +209,19 @@ export class JobService {
     }).then((r) => readJson<StartJobResp>(r));
 
     return assertOk(res, "Start failed");
+  }
+
+  /**
+   * 3.5) Precheck before start (token + ETA hint)
+   */
+  static async precheck(jobId: string): Promise<PrecheckResp> {
+    const res = await fetch("/api/jobs/precheck", {
+      method: "POST",
+      headers: ownerHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ jobId }),
+    }).then((r) => readJson<PrecheckResp>(r));
+
+    return assertOk(res, "Precheck failed");
   }
 
   /**

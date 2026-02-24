@@ -13,6 +13,16 @@ type DownloadUX = "IDLE" | "PREPARE" | "SUCCESS";
 type Step = "PICK" | "SETTINGS" | "RUN";
 type StepState = "pending" | "active" | "done";
 type PipelineRow = { key: string; label: string; stages: string[]; state: StepState; pct: number };
+type PrecheckInfo = {
+  tokenCost: 1 | 2 | 3;
+  mode: "NORMAL" | "HEAVY" | "EXTREME";
+  etaMinLow: number;
+  etaMinHigh: number;
+  fileSizeMb: number;
+  pages: number | null;
+  avgMbPerPage: number | null;
+  reason: string[];
+};
 
 const SYSTEM_TICK_MESSAGES = [
   "Scanning pages…",
@@ -190,6 +200,9 @@ export function UploadScreen() {
 
   const [dlUx, setDlUx] = useState<DownloadUX>("IDLE");
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [precheck, setPrecheck] = useState<PrecheckInfo | null>(null);
+  const [precheckLoading, setPrecheckLoading] = useState(false);
+  const [precheckError, setPrecheckError] = useState<string | null>(null);
 
   // PROCESSING үеийн “хиймэл” progress + нэг мөр систем мессеж
   const [procFakePct, setProcFakePct] = useState(1);
@@ -246,6 +259,8 @@ export function UploadScreen() {
     !!file &&
     !flow.busy &&
     flow.phase === "UPLOADED" &&
+    !!precheck &&
+    !precheckLoading &&
     (mode === "SYSTEM" || splitValid.ok);
 
   const canDownload = !flow.busy && flow.phase === "READY";
@@ -286,6 +301,9 @@ export function UploadScreen() {
 
     setDlUx("IDLE");
     setDownloadError(null);
+    setPrecheck(null);
+    setPrecheckLoading(false);
+    setPrecheckError(null);
 
     // processing fake-ийг цэвэрлэнэ
     setProcFakePct(1);
@@ -306,6 +324,30 @@ export function UploadScreen() {
 
     flow.resetAll();
   };
+
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      if (flow.phase !== "UPLOADED" || !flow.jobId) return;
+      setPrecheckLoading(true);
+      setPrecheckError(null);
+      try {
+        const info = (await JobService.precheck(flow.jobId)) as PrecheckInfo;
+        if (cancelled) return;
+        setPrecheck(info);
+      } catch (e: any) {
+        if (cancelled) return;
+        setPrecheck(null);
+        setPrecheckError(e?.message || "Precheck failed");
+      } finally {
+        if (!cancelled) setPrecheckLoading(false);
+      }
+    };
+    run();
+    return () => {
+      cancelled = true;
+    };
+  }, [flow.phase, flow.jobId]);
 
   // ✅ PROCESSING үед “хиймэл” progress + систем мессежийг ажиллуулна
   useEffect(() => {
@@ -635,6 +677,42 @@ export function UploadScreen() {
 
               <Card>
                 <div className="grid gap-3">
+                  <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-3">
+                    {precheckLoading ? (
+                      <div className="text-sm text-zinc-600">Analyzing file complexity...</div>
+                    ) : precheck ? (
+                      <div className="grid gap-2">
+                        <div className="flex items-center justify-between gap-3 text-sm">
+                          <div className="font-semibold text-zinc-900">Estimated processing</div>
+                          <div className="rounded-full bg-zinc-900 px-2.5 py-1 text-xs font-semibold text-white">
+                            {precheck.tokenCost} token{precheck.tokenCost > 1 ? "s" : ""}
+                          </div>
+                        </div>
+                        <div className="text-xs text-zinc-700">
+                          Mode: <b>{precheck.mode}</b> • Time: <b>~{precheck.etaMinLow}-{precheck.etaMinHigh} min</b>
+                        </div>
+                        <div className="text-xs text-zinc-600">
+                          {precheck.reason.join(" • ")}
+                        </div>
+                        <div className="text-[11px] text-zinc-500">
+                          {precheck.pages != null ? `Pages: ${precheck.pages}` : "Pages: —"} • Avg/page:{" "}
+                          {precheck.avgMbPerPage != null ? `${precheck.avgMbPerPage}MB` : "—"}
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="grid gap-2">
+                        <div className="text-sm text-amber-700">
+                          Could not estimate token/time yet.
+                        </div>
+                        {precheckError ? (
+                          <div className="text-xs text-amber-700">{precheckError}</div>
+                        ) : null}
+                        <div className="text-xs text-zinc-600">
+                          Please retry in a few seconds.
+                        </div>
+                      </div>
+                    )}
+                  </div>
                   <div className="flex items-center justify-between gap-3">
                     <div className="font-semibold text-zinc-900">
                       {mode === "SYSTEM" ? "System-fit" : "Target size per part"}
@@ -760,7 +838,7 @@ export function UploadScreen() {
 
               <div className="flex flex-wrap gap-2.5">
                 <Button disabled={!canStart} onClick={doStart}>
-                  Start
+                  {precheckLoading ? "Preparing..." : "Start"}
                 </Button>
 
                 <Button

@@ -13,27 +13,26 @@ const PREFER_DIRECT_UPLOAD =
   "true";
 
 /**
- * Pricing / Plans (LOCKED)
- * - 90 days:  25 jobs —  7,000₮
- * - 180 days: 100 jobs — 29,000₮
- * - 365 days: 250 jobs — 59,000₮
- *
- * Rule: 1 job = Start (processing) success.
+ * Pricing / Plans (canonical)
+ * Rule: 1 successfully started file = 1 usage.
  */
-type PlanTier = "P90" | "P180" | "P365";
+type PlanTier = "BASIC" | "PRO" | "BUSINESS";
 type Plan = {
   tier: PlanTier;
-  days: 90 | 180 | 365;
-  quotaJobs: number; // 25 / 100 / 250
-  priceMnt: number; // 7000 / 29000 / 59000
+  name: "Basic" | "Pro" | "Business";
+  expiryDays: 30 | 60 | 90;
+  fileLimit: number; // 30 / 100 / 300
+  cpuMinutesLimit: number; // 60 / 240 / 720
+  priceMnt: number; // 5900 / 9900 / 19900
   activatedAt: number; // epoch ms (window anchor)
 };
 
 type Usage = {
   used: number;
   remaining: number;
-  quota: number;
-  windowDays: number;
+  fileLimit: number;
+  expiryDays: number;
+  cpuMinutesLimit: number;
 };
 
 const LS_PLAN = "goodpdf_plan_v1";
@@ -66,7 +65,17 @@ function readPlan(): Plan | null {
   try {
     const p = safeJsonParse<Plan>(localStorage.getItem(LS_PLAN));
     if (!p) return null;
-    if (!p.tier || !p.days || !p.quotaJobs || !p.priceMnt || !p.activatedAt) return null;
+    if (
+      !p.tier ||
+      !p.name ||
+      !p.expiryDays ||
+      !p.fileLimit ||
+      !p.cpuMinutesLimit ||
+      !p.priceMnt ||
+      !p.activatedAt
+    ) {
+      return null;
+    }
     return p;
   } catch {
     return null;
@@ -96,11 +105,17 @@ function planWindowMs(days: number) {
 function computeUsage(plan: Plan | null): Usage | null {
   if (!plan) return null;
 
-  const cutoff = nowMs() - planWindowMs(plan.days);
+  const cutoff = nowMs() - planWindowMs(plan.expiryDays);
   const used = readJobEvents().filter((t) => t >= cutoff).length;
-  const remaining = Math.max(0, plan.quotaJobs - used);
+  const remaining = Math.max(0, plan.fileLimit - used);
 
-  return { used, remaining, quota: plan.quotaJobs, windowDays: plan.days };
+  return {
+    used,
+    remaining,
+    fileLimit: plan.fileLimit,
+    expiryDays: plan.expiryDays,
+    cpuMinutesLimit: plan.cpuMinutesLimit,
+  };
 }
 
 /**
@@ -123,7 +138,7 @@ function stageToLabel(stage?: string | null) {
   const s = String(stage || "").toUpperCase();
   if (!s) return "Working";
   if (s === "QUEUE") return "Queued";
-  if (s === "DOWNLOAD") return "Analyzing pages";
+  if (s === "DOWNLOAD") return "Preparing input";
   if (s === "ANALYZE") return "Analyzing pages";
   if (s === "PREFLIGHT") return "Preparing plan";
   if (s === "DEFAULT") return "System optimization";
@@ -289,7 +304,7 @@ export function useUploadFlow() {
 
     if (u.remaining <= 0) {
       throw new Error(
-        `Quota reached (${u.used}/${u.quota}). Please upgrade or wait for your ${u.windowDays}-day window to refresh.`
+        `File limit reached (${u.used}/${u.fileLimit}) for ${u.expiryDays} days. Please upgrade your plan.`
       );
     }
   }, []);
@@ -596,9 +611,30 @@ export function useUploadFlow() {
 
 export function setActivePlan(tier: PlanTier) {
   const map: Record<PlanTier, Omit<Plan, "activatedAt">> = {
-    P90: { tier: "P90", days: 90, quotaJobs: 25, priceMnt: 7000 },
-    P180: { tier: "P180", days: 180, quotaJobs: 100, priceMnt: 29000 },
-    P365: { tier: "P365", days: 365, quotaJobs: 250, priceMnt: 59000 },
+    BASIC: {
+      tier: "BASIC",
+      name: "Basic",
+      expiryDays: 30,
+      fileLimit: 30,
+      cpuMinutesLimit: 60,
+      priceMnt: 5900,
+    },
+    PRO: {
+      tier: "PRO",
+      name: "Pro",
+      expiryDays: 60,
+      fileLimit: 100,
+      cpuMinutesLimit: 240,
+      priceMnt: 9900,
+    },
+    BUSINESS: {
+      tier: "BUSINESS",
+      name: "Business",
+      expiryDays: 90,
+      fileLimit: 300,
+      cpuMinutesLimit: 720,
+      priceMnt: 19900,
+    },
   };
 
   const p = map[tier];

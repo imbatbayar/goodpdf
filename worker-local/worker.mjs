@@ -1505,7 +1505,7 @@ async function processOneJob(job) {
     }, HEARTBEAT_MS);
 
     await updateJob(jobId, {
-      stage: "ANALYZE",
+      stage: "DOWNLOAD",
       progress: 5,
       split_progress: 0,
       expires_at: expiresAtIso,
@@ -1544,29 +1544,6 @@ async function processOneJob(job) {
       e.code = "INVALID_PDF_SIGNATURE";
       throw e;
     }
-
-    await updateJob(jobId, {
-      stage: "ANALYZE",
-      progress: 7,
-      split_progress: 1,
-      updated_at: nowIso(),
-    });
-    const tAnalyze = Date.now();
-    let analyzedPages = null;
-    try {
-      analyzedPages = await qpdfPages(inPdf, expiresAtIso);
-    } catch {}
-    const analyzeMs = Date.now() - tAnalyze;
-    console.log("[JOB_ANALYZE]", {
-      jobId,
-      in_mb: Math.round(bytesToMb(inBytes) * 100) / 100,
-      pages: analyzedPages,
-      mb_per_page:
-        analyzedPages && analyzedPages > 0
-          ? Math.round((bytesToMb(inBytes) / analyzedPages) * 100) / 100
-          : null,
-      analyze_ms: analyzeMs,
-    });
 
     const systemFit = true;
 
