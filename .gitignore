@@ -1,8 +1,18 @@
 # deps
 node_modules/
-worker-local/node_modules/
+**/node_modules/
+venv/
+**/venv/
+.venv/
+**/.venv/
 
-# next build
+# Python cache
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Next build
 .next/
 out/
 
@@ -11,6 +21,17 @@ out/
 .env.local
 worker-local/.env
 
-# misc
-.DS_Store
+# logs
 *.log
+logs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# worker / build artifacts
+tmp/
+dist/
+build/
