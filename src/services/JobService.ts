@@ -300,6 +300,18 @@ export class JobService {
     return `/api/jobs/download?jobId=${encodeURIComponent(jobId)}`;
   }
 
+  /**
+   * SSE stream URL for job status (EventSource). Owner token in query (no custom headers).
+   */
+  static streamUrl(jobId: string): string {
+    const token = getOwnerToken();
+    const params = new URLSearchParams({
+      jobId,
+      ...(token ? { ownerToken: token } : {}),
+    });
+    return `/api/jobs/stream?${params.toString()}`;
+  }
+
   static async downloadZip(jobId: string) {
     const r = await fetch(this.downloadUrl(jobId), {
       method: "GET",

@@ -653,7 +653,7 @@ function killProcessTree(child) {
 }
 
 // very fast, stable recompress/normalize (good before GS)
-// Returns { promise, child }: promise resolves true/false; child is the process handle (for timeout kill).
+// Returns { promise, child }: promise resolves true/false; never rejects on nonzero exit (fallback to inPdf).
 function qpdfFastRecompress({ inPdf, outPdf }) {
   const args = [
     "--stream-data=compress",
@@ -668,13 +668,29 @@ function qpdfFastRecompress({ inPdf, outPdf }) {
   const child = spawn(QPDF_EXE, args, {
     stdio: ["ignore", "pipe", "pipe"],
   });
+  let errText = "";
+  child.stderr.on("data", (d) => (errText += d.toString()));
+
   const promise = new Promise((resolve, reject) => {
     child.on("close", (code) => {
-      if (code !== 0) {
-        return reject(new Error(`qpdf failed code=${code}`));
-      }
       const outBytes = safeStatSize(outPdf) ?? 0;
-      resolve(outBytes > 0);
+
+      if (code === 0) {
+        resolve(outBytes > 0);
+        return;
+      }
+
+      if (outBytes > 0) {
+        const errSnippet = (errText || "").slice(0, 200).replace(/\s+/g, " ").trim();
+        console.warn("[QPDF_WARN] nonzero exit but output produced", {
+          code,
+          errSnippet: errSnippet || "(no stderr)",
+        });
+        resolve(true);
+        return;
+      }
+
+      resolve(false);
     });
     child.on("error", (err) => reject(err));
   });

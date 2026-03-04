@@ -207,7 +207,8 @@ export function useUploadFlow() {
 
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
 
-  // Polling refs (NO overlap, setTimeout-based)
+  // SSE (primary) and polling (fallback)
+  const eventSourceRef = useRef<EventSource | null>(null);
   const pollTimer = useRef<number | null>(null);
   const pollInFlight = useRef(false);
   const pollingJobId = useRef<string | null>(null);
@@ -231,14 +232,22 @@ export function useUploadFlow() {
     partsCountRef.current = result?.partsCount ?? null;
   }, [result?.partsCount]);
 
+  const closeEventSource = useCallback(() => {
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+  }, []);
+
   const stopPolling = useCallback(() => {
+    closeEventSource();
     if (pollTimer.current) {
       window.clearTimeout(pollTimer.current);
       pollTimer.current = null;
     }
     pollInFlight.current = false;
     pollingJobId.current = null;
-  }, []);
+  }, [closeEventSource]);
 
   const resetAll = useCallback(() => {
     stopPolling();
@@ -301,12 +310,10 @@ export function useUploadFlow() {
     }
   }, []);
 
-  const pollOnce = useCallback(
-    async (jid: string) => {
-      const st = await JobService.status(jid);
-
+  const applyStatusToState = useCallback(
+    (data: any, jid: string) => {
+      const st = data || {};
       let nextPhase = statusToPhase(st.status);
-      // Prevent transient phase regressions that cause UI flicker.
       if (
         processingStartedRef.current &&
         (nextPhase === "UPLOADED" || nextPhase === "IDLE")
@@ -316,42 +323,61 @@ export function useUploadFlow() {
       setPhase(nextPhase);
 
       const rawStage = String(st.stage || "").toUpperCase();
-      const nextProgress = clampPct((st as any).progressPct ?? st.progress);
+      const nextProgress = clampPct(st.progressPct ?? st.progress ?? 0);
       setProgressPct((prev) => {
         if (nextPhase === "PROCESSING") return Math.max(prev, nextProgress);
         return nextProgress;
       });
       setStageCode((prev) => rawStage || prev);
       setStageLabel(stageToLabel(rawStage));
-      setMessageLine(String((st as any).message || ""));
+      setMessageLine(String(st.message || ""));
 
       setResult({
         partsCount: st.partsCount ?? null,
         maxPartMb: st.maxPartMb ?? null,
         targetMb: st.targetMb ?? null,
       });
-
-      setWarning((st as any).warningText ?? null);
+      setWarning(st.warningText ?? null);
 
       if (nextPhase === "READY") {
         processingStartedRef.current = false;
-        setDownloadUrl(st.downloadUrl || JobService.downloadUrl(jid));
+        setDownloadUrl(JobService.downloadUrl(jid));
         setBusy(false);
+        closeEventSource();
         stopPolling();
         return;
       }
-
       if (nextPhase === "ERROR") {
         processingStartedRef.current = false;
         setBusy(false);
+        closeEventSource();
         stopPolling();
         setError(st.errorText || "Failed");
         return;
       }
-
       setBusy(true);
     },
-    [stopPolling]
+    [closeEventSource, stopPolling]
+  );
+
+  const pollOnce = useCallback(
+    async (jid: string) => {
+      const st = await JobService.status(jid);
+      applyStatusToState(
+        {
+          status: st.status,
+          stage: st.stage,
+          progressPct: (st as any).progressPct ?? st.progress,
+          partsCount: st.partsCount,
+          maxPartMb: st.maxPartMb,
+          targetMb: st.targetMb,
+          errorText: st.errorText,
+          warningText: (st as any).warningText,
+        },
+        jid
+      );
+    },
+    [applyStatusToState]
   );
 
   const scheduleNextPoll = useCallback(
@@ -415,6 +441,43 @@ export function useUploadFlow() {
         });
     },
     [pollOnce, scheduleNextPoll, stopPolling]
+  );
+
+  const startStatusStream = useCallback(
+    (jid: string) => {
+      if (pollingJobId.current === jid || eventSourceRef.current) return;
+      stopPolling();
+      pollingJobId.current = jid;
+
+      const streamUrl = JobService.streamUrl(jid);
+      if (!streamUrl.includes("ownerToken=")) {
+        startPolling(jid);
+        return;
+      }
+      try {
+        const evt = new EventSource(streamUrl);
+        eventSourceRef.current = evt;
+        evt.onmessage = (e) => {
+          try {
+            const data = JSON.parse(e.data);
+            applyStatusToState(data, jid);
+            const status = String(data?.status || "").toUpperCase();
+            if (status === "DONE" || status === "FAILED") {
+              closeEventSource();
+            }
+          } catch (_) {}
+        };
+        evt.onerror = () => {
+          closeEventSource();
+          if (phaseRef.current === "PROCESSING" && pollingJobId.current === jid) {
+            startPolling(jid);
+          }
+        };
+      } catch (_) {
+        startPolling(jid);
+      }
+    },
+    [applyStatusToState, closeEventSource, startPolling, stopPolling]
   );
 
   /**
@@ -538,7 +601,7 @@ export function useUploadFlow() {
         // ✅ COUNT 1 JOB only after Start succeeded
         recordJobEvent(nowMs());
 
-        startPolling(jid);
+        startStatusStream(jid);
       } catch (e: any) {
         processingStartedRef.current = false;
         setBusy(false);
@@ -546,7 +609,7 @@ export function useUploadFlow() {
         setError(e?.message || "Start failed");
       }
     },
-    [assertJobQuotaOrThrow, jobId, startPolling]
+    [assertJobQuotaOrThrow, jobId, startStatusStream]
   );
 
   /**
@@ -575,15 +638,19 @@ export function useUploadFlow() {
       }
       if (document.visibilityState === "visible" && jobId && phaseRef.current === "PROCESSING") {
         if (pollingJobId.current !== jobId) {
-          startPolling(jobId);
+          startStatusStream(jobId);
         } else {
-          scheduleNextPoll(jobId);
+          if (eventSourceRef.current) {
+            startStatusStream(jobId);
+          } else {
+            scheduleNextPoll(jobId);
+          }
         }
       }
     };
     document.addEventListener("visibilitychange", onVis);
     return () => document.removeEventListener("visibilitychange", onVis);
-  }, [jobId, startPolling, scheduleNextPoll, stopPolling]);
+  }, [jobId, startStatusStream, scheduleNextPoll, stopPolling]);
 
   const isReady = useMemo(() => phase === "READY", [phase]);
 
