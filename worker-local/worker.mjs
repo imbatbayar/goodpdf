@@ -82,6 +82,8 @@ const R2_BUCKET_OUT =
   process.env.R2_BUCKET_OUT || process.env.R2_BUCKET || "goodpdf-out";
 
 const POLL_MS = Number(process.env.POLL_MS || 2000);
+const POLL_IDLE_MAX_MS = 60_000; // cap for idle backoff
+const POLL_IDLE_LOG_THROTTLE_MS = 30_000; // log idle at most once per 30s or when backoff changes
 const CPU_CORES = Math.max(1, Number(os.cpus()?.length || 1));
 const CONCURRENCY = Math.max(
   1,
@@ -1914,6 +1916,8 @@ async function main() {
   let lastStaleRecoveryAt = 0;
   let pollTick = 0;
   let lastIdlePollLogAt = 0;
+  let lastLoggedIdleSleepMs = 0;
+  let idleSleepMs = POLL_MS; // backoff: POLL_MS, 2x, 4x, 8x… cap 60s
 
   while (true) {
     try {
@@ -1940,14 +1944,26 @@ async function main() {
 
       if (!jobs.length) {
         const nowMs = Date.now();
-        if (nowMs - lastIdlePollLogAt >= 30_000) {
+        const throttleOk = nowMs - lastIdlePollLogAt >= POLL_IDLE_LOG_THROTTLE_MS;
+        const backoffChanged = idleSleepMs !== lastLoggedIdleSleepMs;
+        if (throttleOk || backoffChanged) {
           lastIdlePollLogAt = nowMs;
-          console.log("[POLL] idle tick =", pollTick, "jobs = 0");
+          lastLoggedIdleSleepMs = idleSleepMs;
+          console.log(
+            "[POLL] idle tick =",
+            pollTick,
+            "jobs = 0",
+            "next poll in",
+            idleSleepMs,
+            "ms",
+          );
         }
-        await sleep(POLL_MS);
+        await sleep(idleSleepMs);
+        idleSleepMs = Math.min(idleSleepMs * 2, POLL_IDLE_MAX_MS);
         continue;
       }
 
+      idleSleepMs = POLL_MS;
       console.log(
         "[POLL] taking first job =",
         jobs[0]?.id,
