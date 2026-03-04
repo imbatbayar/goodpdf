@@ -167,28 +167,18 @@ function statusToPhase(status?: string | null): Phase {
   return "PROCESSING";
 }
 
+const JITTER_MS = 200;
+
 /**
- * Adaptive polling delay (production-safe)
+ * Polling delay: 2s base, 3s after 30s, 5s cap after 90s; jitter ±200ms.
+ * Only used while phase === PROCESSING; terminal states stop polling.
  */
-function nextPollDelayMs(phase: Phase, stageLabel: string, backoffStep: number) {
-  let ms = 900;
-  if (phase !== "PROCESSING") ms = 1200;
-
-  const st = (stageLabel || "").toLowerCase();
-  if (st.includes("queued")) ms = 1100;
-  if (st.includes("finishing")) ms = 1200;
-  if (st.includes("optimizing")) ms = 1400;
-  if (st.includes("splitting")) ms = 1100;
-  if (st.includes("creating zip") || st.includes("uploading zip")) ms = 1600;
-
-  ms += Math.min(1200, Math.max(0, backoffStep) * 200);
-
-  if (typeof document !== "undefined" && document.visibilityState === "hidden") {
-    ms = Math.max(ms, 2500);
-  }
-
-  ms += Math.floor(Math.random() * 181);
-  return ms;
+function nextPollDelayMs(processingElapsedMs: number) {
+  let base = 2000;
+  if (processingElapsedMs >= 90_000) base = 5000;
+  else if (processingElapsedMs >= 30_000) base = 3000;
+  const jitter = (Math.random() * 2 - 1) * JITTER_MS;
+  return Math.max(500, base + jitter);
 }
 
 function maxBackoffSteps(partsCount?: number | null) {
@@ -220,7 +210,8 @@ export function useUploadFlow() {
   // Polling refs (NO overlap, setTimeout-based)
   const pollTimer = useRef<number | null>(null);
   const pollInFlight = useRef(false);
-  const pollBackoff = useRef(0);
+  const pollingJobId = useRef<string | null>(null);
+  const processingStartedAtRef = useRef<number>(0);
 
   // Latest-state refs for timers (avoid stale closures)
   const phaseRef = useRef<Phase>("IDLE");
@@ -246,7 +237,7 @@ export function useUploadFlow() {
       pollTimer.current = null;
     }
     pollInFlight.current = false;
-    pollBackoff.current = 0;
+    pollingJobId.current = null;
   }, []);
 
   const resetAll = useCallback(() => {
@@ -365,12 +356,15 @@ export function useUploadFlow() {
 
   const scheduleNextPoll = useCallback(
     (jid: string) => {
-      if (phaseRef.current !== "PROCESSING") return;
+      if (phaseRef.current !== "PROCESSING" || pollingJobId.current !== jid) return;
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
 
-      const delay = nextPollDelayMs(phaseRef.current, stageRef.current, pollBackoff.current);
+      const elapsed = Date.now() - processingStartedAtRef.current;
+      const delay = nextPollDelayMs(elapsed);
 
       pollTimer.current = window.setTimeout(async () => {
-        if (phaseRef.current !== "PROCESSING") return;
+        if (phaseRef.current !== "PROCESSING" || pollingJobId.current !== jid) return;
+        if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
 
         if (pollInFlight.current) {
           scheduleNextPoll(jid);
@@ -381,9 +375,7 @@ export function useUploadFlow() {
         try {
           await pollOnce(jid);
 
-          if (phaseRef.current === "PROCESSING") {
-            const cap = maxBackoffSteps(partsCountRef.current);
-            pollBackoff.current = Math.min(cap, pollBackoff.current + 1);
+          if (phaseRef.current === "PROCESSING" && pollingJobId.current === jid) {
             scheduleNextPoll(jid);
           }
         } catch (e: any) {
@@ -401,14 +393,16 @@ export function useUploadFlow() {
 
   const startPolling = useCallback(
     (jid: string) => {
+      if (pollingJobId.current === jid) return;
       stopPolling();
-      pollBackoff.current = 0;
+      pollingJobId.current = jid;
 
       pollInFlight.current = true;
       pollOnce(jid)
         .then(() => {
-          pollBackoff.current = 0;
-          if (phaseRef.current === "PROCESSING") scheduleNextPoll(jid);
+          if (phaseRef.current === "PROCESSING" && pollingJobId.current === jid) {
+            scheduleNextPoll(jid);
+          }
         })
         .catch((e: any) => {
           setBusy(false);
@@ -536,6 +530,7 @@ export function useUploadFlow() {
       setProgressPct(0);
       setStageLabel("Queued");
       processingStartedRef.current = true;
+      processingStartedAtRef.current = Date.now();
 
       try {
         await JobService.start(jid, splitMb, precheckMode);
@@ -574,15 +569,21 @@ export function useUploadFlow() {
 
   useEffect(() => {
     const onVis = () => {
-      if (document.visibilityState === "visible") {
-        if (jobId && phaseRef.current === "PROCESSING") {
+      if (document.visibilityState === "hidden") {
+        stopPolling();
+        return;
+      }
+      if (document.visibilityState === "visible" && jobId && phaseRef.current === "PROCESSING") {
+        if (pollingJobId.current !== jobId) {
           startPolling(jobId);
+        } else {
+          scheduleNextPoll(jobId);
         }
       }
     };
     document.addEventListener("visibilitychange", onVis);
     return () => document.removeEventListener("visibilitychange", onVis);
-  }, [jobId, startPolling]);
+  }, [jobId, startPolling, scheduleNextPoll, stopPolling]);
 
   const isReady = useMemo(() => phase === "READY", [phase]);
 

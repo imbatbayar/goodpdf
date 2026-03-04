@@ -82,8 +82,14 @@ const R2_BUCKET_OUT =
   process.env.R2_BUCKET_OUT || process.env.R2_BUCKET || "goodpdf-out";
 
 const POLL_MS = Number(process.env.POLL_MS || 2000);
-const POLL_IDLE_MAX_MS = 60_000; // cap for idle backoff
-const POLL_IDLE_LOG_THROTTLE_MS = 30_000; // log idle at most once per 30s or when backoff changes
+const POLL_IDLE_MAX_MS = Math.max(
+  60_000,
+  Number(process.env.POLL_IDLE_MAX_MS) || 60_000,
+);
+const POLL_IDLE_LOG_EVERY_MS = Math.max(
+  5_000,
+  Number(process.env.POLL_IDLE_LOG_EVERY_MS) || 30_000,
+);
 const CPU_CORES = Math.max(1, Number(os.cpus()?.length || 1));
 const CONCURRENCY = Math.max(
   1,
@@ -181,7 +187,7 @@ const SYSTEM_FORCE_5_FROM_MB = Math.max(
 );
 const SYSTEM_MIN_PARTS = Math.max(
   1,
-  Math.min(SYSTEM_MAX_PARTS, Number(process.env.SYSTEM_MIN_PARTS || 2)),
+  Math.min(SYSTEM_MAX_PARTS, Number(process.env.SYSTEM_MIN_PARTS || 1)),
 );
 const QPDF_PRE_NORMALIZE_MAX_BYTES = 25 * 1024 * 1024; // skip qpdf pre-normalize above 25MB
 const QPDF_PRE_NORMALIZE_TIMEOUT_MS = 12_000; // hard timeout; fall back to inPdf on timeout
@@ -1294,18 +1300,16 @@ function choosePartCountBySize({
   bytes,
   pages,
   targetBytes,
-  minParts = 2,
+  minParts = 1,
   maxParts = 5,
 }) {
   const b = Math.max(0, Number(bytes || 0));
   const p = Math.max(1, Number(pages || 1));
   const t = Math.max(256 * 1024, Number(targetBytes || SYSTEM_PART_BYTES));
   const maxP = Math.max(1, Math.min(Number(maxParts || 5), p));
-  const minP = Math.max(1, Math.min(Number(minParts || 1), maxP));
 
-  // Keep each part close to 9MB, but never drop below min part policy.
-  const ideal = Math.ceil(b / Math.floor(t * 0.98));
-  return Math.max(minP, Math.min(maxP, Math.max(1, ideal)));
+  const ideal = Math.ceil(b / t);
+  return Math.max(1, Math.min(maxP, ideal));
 }
 
 // Max 2 Ghostscript passes: normal (quality-first), rescue (if needed). No multi-pass loops.
@@ -1392,8 +1396,8 @@ async function processDefaultFast({
   const targetTotalBytes = SYSTEM_PART_BYTES * SYSTEM_MAX_PARTS; // e.g. 9MB * 5 = 45MB
   let afterCompressBytes = preBytes;
 
-  // Max 2 GS passes: 1 normal, then 1 rescue only if still too large or predicted parts > 5.
-  if (afterCompressBytes > targetTotalBytes && !softStop()) {
+  // Only compress when file exceeds one-part size; do not degrade quality to force multiple parts.
+  if (afterCompressBytes > SYSTEM_PART_BYTES && !softStop()) {
     await updateJob(jobId, {
       stage: "COMPRESS_HARDFIT",
       progress: 22,
@@ -1431,7 +1435,6 @@ async function processDefaultFast({
     tmark(T, "gs1");
 
     const idealParts = Math.ceil(afterCompressBytes / SYSTEM_PART_BYTES);
-    // Rescue only when >5 parts predicted (do not chase 9MB with extra GS).
     const needRescue = idealParts > SYSTEM_MAX_PARTS;
 
     if (needRescue && !softStop() && rescuePass) {
@@ -1478,10 +1481,6 @@ async function processDefaultFast({
   if (maxPartsForSplit > MAX_PARTS_HARD_CEIL) maxPartsForSplit = MAX_PARTS_HARD_CEIL;
 
   const maxParts = SYSTEM_MAX_PARTS;
-  const minPartsPolicy = Math.max(
-    1,
-    Math.min(maxParts, SYSTEM_MIN_PARTS, Math.max(1, prePages)),
-  );
 
   const wipePartsDir = () => {
     try {
@@ -1494,23 +1493,41 @@ async function processDefaultFast({
     } catch {}
   };
 
-  // HARD: each part <= 9MB. SOFT: try <=5 parts; allow more up to maxPartsForSplit.
+  // HARD: each part <= 9MB. Parts = max(1, ceil(bytes/partBytes)), cap SYSTEM_MAX_PARTS for auto.
   const splitForSystem = async (pdfPath, opts = {}) => {
     const partBytes = opts.targetBytes ?? targetBytes;
     const effectiveMaxParts = opts.maxParts ?? maxParts;
     wipePartsDir();
     const pages0 = await qpdfPages(pdfPath, expiresAtIso);
-    const maxPartsForFile = Math.min(effectiveMaxParts, pages0);
-    const minPartsForFile = Math.min(
-      maxPartsForFile,
-      pages0 >= 2 ? Math.max(2, minPartsPolicy) : 1,
-    );
     const bytes0 = safeStatSize(pdfPath) ?? 0;
+
+    if (bytes0 <= partBytes) {
+      const singleName = "goodPDF-1(1).pdf";
+      const singlePath = path.join(partsDir, singleName);
+      fs.copyFileSync(pdfPath, singlePath);
+      const b = safeStatSize(singlePath) ?? 0;
+      return {
+        partFiles: [singlePath],
+        partMeta: [
+          {
+            name: singleName,
+            bytes: b,
+            sizeMb: Math.round(bytesToMb(b) * 10) / 10,
+            startPageIndex: 1,
+            endPageIndex: pages0,
+          },
+        ],
+        _fit: true,
+        _parts: 1,
+      };
+    }
+
+    const maxPartsForFile = Math.min(effectiveMaxParts, pages0);
     const desiredParts = choosePartCountBySize({
       bytes: bytes0,
       pages: pages0,
       targetBytes: partBytes,
-      minParts: minPartsForFile,
+      minParts: 1,
       maxParts: maxPartsForFile,
     });
 
@@ -1916,8 +1933,9 @@ async function main() {
   let lastStaleRecoveryAt = 0;
   let pollTick = 0;
   let lastIdlePollLogAt = 0;
+  let lastErrorLogAt = 0;
   let lastLoggedIdleSleepMs = 0;
-  let idleSleepMs = POLL_MS; // backoff: POLL_MS, 2x, 4x, 8x… cap 60s
+  let idleSleepMs = POLL_MS;
 
   while (true) {
     try {
@@ -1944,7 +1962,8 @@ async function main() {
 
       if (!jobs.length) {
         const nowMs = Date.now();
-        const throttleOk = nowMs - lastIdlePollLogAt >= POLL_IDLE_LOG_THROTTLE_MS;
+        const throttleOk =
+          nowMs - lastIdlePollLogAt >= POLL_IDLE_LOG_EVERY_MS;
         const backoffChanged = idleSleepMs !== lastLoggedIdleSleepMs;
         if (throttleOk || backoffChanged) {
           lastIdlePollLogAt = nowMs;
@@ -1979,8 +1998,13 @@ async function main() {
         ),
       );
     } catch (e) {
-      console.error("Loop error:", e?.message || e);
-      await sleep(POLL_MS);
+      const nowMs = Date.now();
+      if (nowMs - lastErrorLogAt >= POLL_IDLE_LOG_EVERY_MS) {
+        lastErrorLogAt = nowMs;
+        console.error("[POLL] loop error:", e?.message || e);
+      }
+      await sleep(idleSleepMs);
+      idleSleepMs = Math.min(idleSleepMs * 2, POLL_IDLE_MAX_MS);
     }
   }
 }

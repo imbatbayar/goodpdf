@@ -17,6 +17,16 @@
 - **`.DS_Store`**, **`Thumbs.db`**, **`.idea/`**, **`.vscode/`** — OS/editor cruft.
 - **`tmp/`**, **`dist/`**, **`build/`** — Worker/build artifacts.
 
+## Worker poll loop (env)
+
+When running the worker (`worker-local/worker.mjs`), these env vars control polling and idle backoff (defaults in parentheses):
+
+- **`POLL_MS`** (2000) — Base interval in ms between queue fetches.
+- **`POLL_IDLE_MAX_MS`** (60000, min 60000) — When the queue is empty, the worker backs off exponentially; this is the cap in ms.
+- **`POLL_IDLE_LOG_EVERY_MS`** (30000, min 5000) — Idle and loop-error logs are throttled to at most once per this many ms.
+
+Backoff resets to `POLL_MS` as soon as a fetch returns one or more jobs (or a job is claimed). No new dependencies.
+
 ## After clone
 
 1. `npm install` (at repo root).

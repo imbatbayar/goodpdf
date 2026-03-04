@@ -32,7 +32,9 @@ docker run --rm \
 
 ### ENV (optional)
 - `CONCURRENCY` (default=1)
-- `POLL_MS` (default=2000)
+- `POLL_MS` (default=2000) — base poll interval (ms)
+- `POLL_IDLE_MAX_MS` (default=60000, min 60000) — max idle backoff (ms); when queue is empty, sleep doubles up to this cap
+- `POLL_IDLE_LOG_EVERY_MS` (default=30000, min 5000) — throttle idle/error logs (ms)
 - `BUCKET_IN` (default=job-input)
 - `BUCKET_OUT` (default=jobs-output)
 - `GS_EXE` (default=gs)

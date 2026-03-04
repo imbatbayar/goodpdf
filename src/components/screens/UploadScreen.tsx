@@ -1028,9 +1028,11 @@ export function UploadScreen() {
 
                     <div className="grid gap-2 text-sm">
                       <div>
-                        <span className="text-zinc-500">Split into:</span>{" "}
+                        <span className="text-zinc-500">Parts:</span>{" "}
                         {flow.result?.partsCount != null
-                          ? `${flow.result.partsCount} parts`
+                          ? flow.result.partsCount === 1
+                            ? "1 part"
+                            : `${flow.result.partsCount} parts`
                           : "—"}
                       </div>
 
@@ -1042,12 +1044,7 @@ export function UploadScreen() {
                       </div>
 
                       <div className="text-xs text-zinc-500">
-                        Target size:{" "}
-                        <b>
-                          {mode === "SYSTEM"
-                            ? `${SYSTEM_MAX_PART_MB}MB`
-                            : `${splitMbText || "—"}MB`}
-                        </b>
+                        Up to <b>{mode === "SYSTEM" ? `${SYSTEM_MAX_PART_MB}MB` : `${splitMbText || "—"}MB`} per part</b>
                       </div>
                     </div>
 
