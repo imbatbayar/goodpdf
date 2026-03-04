@@ -31,7 +31,16 @@ Thumbs.db
 .idea/
 .vscode/
 
-# worker / build artifacts
+# archive artifacts
+*.zip
+*.7z
+*.tar
+*.gz
+*.rar
+
+# temporary / build artifacts
 tmp/
+temp/
+artifacts/
 dist/
 build/
