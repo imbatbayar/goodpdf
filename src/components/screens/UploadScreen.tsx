@@ -364,7 +364,11 @@ export function UploadScreen() {
       setPrecheckLoading(true);
       setPrecheckError(null);
       try {
-        const info = (await JobService.precheck(flow.jobId)) as PrecheckInfo;
+        const splitMbToPass = mode === "SYSTEM" ? SYSTEM_MAX_PART_MB : (splitValid.ok && splitMb != null ? splitMb : SYSTEM_MAX_PART_MB);
+        const info = (await JobService.precheck(flow.jobId, {
+          mode,
+          splitMb: splitMbToPass,
+        })) as PrecheckInfo;
         if (cancelled) return;
         setPrecheck(info);
         setPrecheckPct(100);
@@ -381,7 +385,7 @@ export function UploadScreen() {
     return () => {
       cancelled = true;
     };
-  }, [flow.phase, flow.jobId]);
+  }, [flow.phase, flow.jobId, mode, splitMb, splitValid.ok]);
 
   useEffect(() => {
     if (flow.phase !== "UPLOADED" || !precheckLoading) {
@@ -948,7 +952,7 @@ export function UploadScreen() {
                   <div className="grid gap-3">
                     <div className="font-semibold text-zinc-900 flex items-center justify-between">
                       <span>Processing...</span>
-                      <span>{stableRunPct}%</span>
+                      <span>{flow.phase === "READY" ? stableRunPct : Math.min(stableRunPct, 99)}%</span>
                     </div>
                     <div className="text-xs text-zinc-500">
                       Working {stageWorkingLabel(activeStage)}{" "}
@@ -981,6 +985,20 @@ export function UploadScreen() {
                         </div>
                       ))}
                     </div>
+
+                    {flow.phase === "PROCESSING" &&
+                    flow.progressPct >= 95 &&
+                    (Date.now() - (processingStartedAtRef.current || 0)) > 120_000 ? (
+                      <div className="pt-2">
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          onClick={() => flow.refreshStatus()}
+                        >
+                          Refresh status
+                        </Button>
+                      </div>
+                    ) : null}
                   </div>
                 </Card>
               ) : null}

@@ -65,6 +65,10 @@ export type PrecheckResp = {
   confidenceNote?: string;
   recommendation?: string;
   reason: string[];
+  /** Target-aware debug (optional) */
+  expectedParts?: number;
+  effectiveSplitMb?: number;
+  modeUsedForEstimate?: "SYSTEM" | "MANUAL";
 };
 
 type CreateArgs = {
@@ -239,8 +243,12 @@ export class JobService {
 
   /**
    * 3.5) Precheck before start (token + ETA hint)
+   * Pass mode + splitMb so ETA and HEAVY_HINT routing are target-aware.
    */
-  static async precheck(jobId: string): Promise<PrecheckResp> {
+  static async precheck(
+    jobId: string,
+    opts?: { mode?: "SYSTEM" | "MANUAL"; splitMb?: number }
+  ): Promise<PrecheckResp> {
     const calibrationFactor = readPrecheckCalibrationFactor();
     const res = await fetch("/api/jobs/precheck", {
       method: "POST",
@@ -248,7 +256,11 @@ export class JobService {
         "content-type": "application/json",
         "x-precheck-calibration": String(calibrationFactor),
       }),
-      body: JSON.stringify({ jobId }),
+      body: JSON.stringify({
+        jobId,
+        mode: opts?.mode,
+        splitMb: opts?.splitMb,
+      }),
     }).then((r) => readJson<PrecheckResp>(r));
 
     return assertOk(res, "Precheck failed");

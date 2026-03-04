@@ -128,12 +128,18 @@ function clampNum(n: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, n));
 }
 
-function estimateProfile(
-  fileSizeMb: number,
-  pages: number | null,
-  sig: PdfSignals,
-  calibrationFactor: number
-) {
+type EstimateParams = {
+  fileSizeMb: number;
+  pages: number | null;
+  sig: PdfSignals;
+  calibrationFactor: number;
+  expectedParts: number;
+  effectiveSplitMb: number;
+  modeUsedForEstimate: "SYSTEM" | "MANUAL";
+};
+
+function estimateProfile(params: EstimateParams) {
+  const { fileSizeMb, pages, sig, calibrationFactor, expectedParts, effectiveSplitMb, modeUsedForEstimate } = params;
   const avgMbPerPage =
     typeof pages === "number" && pages > 0
       ? Math.round((fileSizeMb / pages) * 100) / 100
@@ -156,10 +162,13 @@ function estimateProfile(
     jpxDensityScore * 0.12 +
     pageScore * 0.06;
 
-  const estimatedCpuMinRaw = Math.max(
+  let estimatedCpuMinRaw = Math.max(
     1,
     Math.round((0.9 + complexity * 0.95 + Math.max(0, sig.softMaskRefs - 4) * 0.08) * 10) / 10
   );
+  // Use expectedParts as an additional factor: more parts = more work.
+  const partsFactor = Math.min(2.5, Math.max(1, 0.7 + expectedParts * 0.15));
+  estimatedCpuMinRaw = Math.round(estimatedCpuMinRaw * partsFactor * 10) / 10;
   const estimatedCpuMin = Math.max(1, Math.round(estimatedCpuMinRaw * calibrationFactor * 10) / 10);
 
   let tokenCost: 1 | 2 | 3 = 1;
@@ -167,6 +176,17 @@ function estimateProfile(
   let etaMinLow = Math.max(2, Math.floor(estimatedCpuMin * 0.9));
   let etaMinHigh = Math.max(3, Math.ceil(estimatedCpuMin * 1.6));
   const reason: string[] = [];
+
+  // Guardrails: if expectedParts >= 2 and (image density or avgMbPerPage high), bump to HEAVY.
+  if (
+    expectedParts >= 2 &&
+    (imgPerSampleMb >= 2.0 || (avgMbPerPage != null && avgMbPerPage >= 1.0))
+  ) {
+    tokenCost = Math.max(tokenCost, 2) as 1 | 2 | 3;
+    mode = "HEAVY";
+    etaMinLow = Math.max(etaMinLow, 5);
+    etaMinHigh = Math.max(etaMinHigh, 9);
+  }
 
   if (estimatedCpuMin >= 6) {
     tokenCost = 2;
@@ -214,8 +234,17 @@ function estimateProfile(
     etaMinHigh = Math.max(etaMinHigh, 14);
   }
 
+  // Allow EXTREME when expectedParts >= 4 or file very large.
+  if (expectedParts >= 4 || fileSizeMb >= 80) {
+    tokenCost = Math.max(tokenCost, 3) as 1 | 2 | 3;
+    mode = "EXTREME";
+    etaMinLow = Math.max(etaMinLow, 8);
+    etaMinHigh = Math.max(etaMinHigh, 14);
+  }
+
   if (tokenCost === 1) reason.push("Fast path: low complexity (cost-saving)");
   if (fileSizeMb >= 45) reason.push("Large input file");
+  if (expectedParts >= 2) reason.push(`${expectedParts} parts expected`);
   if (avgMbPerPage != null && avgMbPerPage >= 0.9) reason.push("High MB per page");
   if (imgPerSampleMb >= 2.5) reason.push("Image-heavy page content");
   if (sig.jpxRefs >= 2) reason.push("High-cost image codec detected");
@@ -260,6 +289,9 @@ function estimateProfile(
     confidenceNote,
     recommendation,
     reason,
+    expectedParts,
+    effectiveSplitMb,
+    modeUsedForEstimate,
   };
 }
 
@@ -278,6 +310,16 @@ export async function POST(req: Request) {
     const body = await req.json().catch(() => null);
     const jobId = String(body?.jobId || "").trim();
     const ownerToken = String(req.headers.get("x-owner-token") || "").trim();
+    const modeRaw = String(body?.mode || "SYSTEM").toUpperCase();
+    const modeUsedForEstimate: "SYSTEM" | "MANUAL" =
+      modeRaw === "MANUAL" ? "MANUAL" : "SYSTEM";
+    const splitMbRaw = Number(body?.splitMb);
+    const effectiveSplitMb =
+      modeUsedForEstimate === "SYSTEM"
+        ? 9
+        : Number.isFinite(splitMbRaw) && splitMbRaw > 0
+          ? Math.min(500, Math.max(1, Math.round(splitMbRaw * 100) / 100))
+          : 9;
     const calibrationRaw = Number(req.headers.get("x-precheck-calibration") || "1");
     const calibrationFactor = Number.isFinite(calibrationRaw)
       ? clampNum(calibrationRaw, 0.65, 2.2)
@@ -304,6 +346,7 @@ export async function POST(req: Request) {
 
     const sizeBytes = Number(job.file_size_bytes || 0);
     const fileSizeMb = Math.max(0, Math.round((sizeBytes / (1024 * 1024)) * 100) / 100);
+    const expectedParts = Math.max(1, Math.ceil(fileSizeMb / Math.max(0.1, effectiveSplitMb)));
 
     const downloaded = await downloadInputToTemp(inputKey);
     tmpRoot = downloaded.tmpRoot;
@@ -312,7 +355,15 @@ export async function POST(req: Request) {
       samplePdfSignals(downloaded.tmpFile),
     ]);
 
-    const p = estimateProfile(fileSizeMb, pages, sig, calibrationFactor);
+    const p = estimateProfile({
+      fileSizeMb,
+      pages,
+      sig,
+      calibrationFactor,
+      expectedParts,
+      effectiveSplitMb,
+      modeUsedForEstimate,
+    });
     return json(true, {
       tokenCost: p.tokenCost,
       mode: p.mode,
@@ -328,6 +379,9 @@ export async function POST(req: Request) {
       confidenceNote: p.confidenceNote,
       recommendation: p.recommendation,
       reason: p.reason,
+      expectedParts: p.expectedParts,
+      effectiveSplitMb: p.effectiveSplitMb,
+      modeUsedForEstimate: p.modeUsedForEstimate,
     });
   } catch {
     return json(false, null, "Precheck failed", 500);

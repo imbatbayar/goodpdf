@@ -323,7 +323,8 @@ export function useUploadFlow() {
       setPhase(nextPhase);
 
       const rawStage = String(st.stage || "").toUpperCase();
-      const nextProgress = clampPct(st.progressPct ?? st.progress ?? 0);
+      let nextProgress = clampPct(st.progressPct ?? st.progress ?? 0);
+      if (nextPhase === "PROCESSING") nextProgress = Math.min(99, nextProgress);
       setProgressPct((prev) => {
         if (nextPhase === "PROCESSING") return Math.max(prev, nextProgress);
         return nextProgress;
@@ -630,6 +631,14 @@ export function useUploadFlow() {
     resetAll();
   }, [resetAll]);
 
+  const refreshStatus = useCallback(async () => {
+    const jid = jobId;
+    if (!jid || phaseRef.current !== "PROCESSING") return;
+    try {
+      await pollOnce(jid);
+    } catch (_) {}
+  }, [jobId, pollOnce]);
+
   useEffect(() => {
     const onVis = () => {
       if (document.visibilityState === "hidden") {
@@ -679,6 +688,7 @@ export function useUploadFlow() {
     confirmDone,
     newFile,
     resetAll,
+    refreshStatus,
   };
 }
 
