@@ -163,7 +163,7 @@ function statusToPhase(status?: string | null): Phase {
   if (s === "FAILED") return "ERROR";
   if (s === "UPLOADED") return "UPLOADED";
   if (s === "QUEUED" || s === "PROCESSING") return "PROCESSING";
-  if (s === "CLEANED") return "IDLE";
+  if (s === "CLEANED" || s === "CANCELED") return "IDLE";
   return "PROCESSING";
 }
 

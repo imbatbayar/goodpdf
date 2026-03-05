@@ -46,6 +46,12 @@ function buildStatusPayload(job: any) {
   };
 }
 
+/** Terminal states: send final event, close stream, stop polling. */
+function isTerminalStatus(status: string): boolean {
+  const s = status.toUpperCase();
+  return s === "DONE" || s === "FAILED" || s === "CLEANED" || s === "CANCELED";
+}
+
 /** Returns true if we should keep polling. Only QUEUED and PROCESSING continue. */
 function shouldContinuePolling(status: string): boolean {
   return status === "QUEUED" || status === "PROCESSING";
@@ -148,7 +154,7 @@ export async function GET(req: Request) {
             send(payload);
 
             const status = normStatus(job.status);
-            if (!shouldContinuePolling(status)) break;
+            if (isTerminalStatus(status) || !shouldContinuePolling(status)) break;
 
             await sleepAbortable(STREAM_POLL_MS, signal);
           }

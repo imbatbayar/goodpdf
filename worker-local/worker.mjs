@@ -90,6 +90,11 @@ const POLL_IDLE_LOG_EVERY_MS = Math.max(
   5_000,
   Number(process.env.POLL_IDLE_LOG_EVERY_MS) || 30_000,
 );
+const MAX_IDLE_BACKOFF_MS = Math.max(
+  60_000,
+  Math.min(120_000, Number(process.env.POLL_IDLE_MAX_MS) || 60_000),
+);
+const WORKER_IDLE_EXIT_MS = Math.max(0, Number(process.env.WORKER_IDLE_EXIT_MS || 0));
 const CPU_CORES = Math.max(1, Number(os.cpus()?.length || 1));
 const CONCURRENCY = Math.max(
   1,
@@ -311,6 +316,7 @@ function streamToFile(stream, outPath) {
   });
 }
 
+// Exit handling for qpdf: 0 = success, 3 = success_with_warning (stderr → warning_text), other = fail.
 function runCmd(cmd, args, timeoutMs, spawnOpts = {}, okCodes = [0]) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, {
@@ -344,7 +350,7 @@ function runCmd(cmd, args, timeoutMs, spawnOpts = {}, okCodes = [0]) {
         e.exitCode = code;
         return reject(e);
       }
-      resolve({ out, err });
+      resolve({ out, err, exitCode: code });
     });
   });
 }
@@ -614,13 +620,16 @@ async function cleanupExpiredOutputs() {
 // ----------------------
 // qpdf helpers
 // ----------------------
-async function qpdfPages(inPdf, expiresAtIso) {
+async function qpdfPages(inPdf, expiresAtIso, warnings = null) {
   const tQ = Math.min(
     boundedTimeout(TIMEOUT_QPDF_MS, expiresAtIso, 10_000, 60_000),
     25_000,
   );
-  const { out } = await runCmd(QPDF_EXE, ["--show-npages", inPdf], tQ);
-  const pages = Number(String(out).trim());
+  const result = await runCmd(QPDF_EXE, ["--show-npages", inPdf], tQ, {}, [0, 3]);
+  if (result.exitCode === 3 && Array.isArray(warnings)) {
+    warnings.push((result.err || "").trim().slice(0, 1000));
+  }
+  const pages = Number(String(result.out).trim());
   if (!Number.isFinite(pages) || pages <= 0) {
     const e = new Error("NPAGES_FAILED");
     e.code = "NPAGES_FAILED";
@@ -676,21 +685,17 @@ function qpdfFastRecompress({ inPdf, outPdf }) {
       const outBytes = safeStatSize(outPdf) ?? 0;
 
       if (code === 0) {
-        resolve(outBytes > 0);
+        resolve({ ok: outBytes > 0 });
+        return;
+      }
+      if (code === 3) {
+        // qpdf exit 3 = success_with_warning; capture stderr for warning_text
+        resolve({ ok: outBytes > 0, warning: (errText || "").trim().slice(0, 1000) });
         return;
       }
 
-      if (outBytes > 0) {
-        const errSnippet = (errText || "").slice(0, 200).replace(/\s+/g, " ").trim();
-        console.warn("[QPDF_WARN] nonzero exit but output produced", {
-          code,
-          errSnippet: errSnippet || "(no stderr)",
-        });
-        resolve(true);
-        return;
-      }
-
-      resolve(false);
+      // any other non-zero → fail (do not treat as success even if output exists)
+      resolve({ ok: false });
     });
     child.on("error", (err) => reject(err));
   });
@@ -723,7 +728,7 @@ async function estimatePageBytes({
   pages,
   probeDir,
   expiresAtIso,
-}) {
+}, warnings = null) {
   safeRm(probeDir);
   fs.mkdirSync(probeDir, { recursive: true });
   const pageNums = [];
@@ -736,7 +741,7 @@ async function estimatePageBytes({
       pageNum: p,
       outPdf: onePath,
       expiresAtIso,
-    });
+    }, warnings);
     return { p, bytes: b };
   });
 
@@ -799,7 +804,7 @@ function buildRangesNearTarget({
   return ranges;
 }
 
-async function splitSinglePass({ inPdf, partsDir, ranges, expiresAtIso }) {
+async function splitSinglePass({ inPdf, partsDir, ranges, expiresAtIso }, warnings = null) {
   fs.mkdirSync(partsDir, { recursive: true });
 
   const tEach = boundedTimeout(TIMEOUT_QPDF_MS, expiresAtIso, 15_000, 60_000);
@@ -811,11 +816,16 @@ async function splitSinglePass({ inPdf, partsDir, ranges, expiresAtIso }) {
 
   const results = await asyncPool(SPLIT_PAR, ranges, async (r, i) => {
     const outPath = tmpName(i, r.start, r.end);
-    await runCmd(
+    const result = await runCmd(
       QPDF_EXE,
       ["--empty", "--pages", inPdf, `${r.start}-${r.end}`, "--", outPath],
       tEach,
+      {},
+      [0, 3],
     );
+    if (result.exitCode === 3 && Array.isArray(warnings)) {
+      warnings.push((result.err || "").trim().slice(0, 1000));
+    }
     const b = safeStatSize(outPath) ?? 0;
     return { tmpPath: outPath, start: r.start, end: r.end, bytes: b };
   });
@@ -962,24 +972,32 @@ async function shrinkOversizePartsAggressive({
 // ----------------------
 // qpdf page extract / concat helpers (oversize-safe split fallback)
 // ----------------------
-async function qpdfExtractPage({ inPdf, pageNum, outPdf, expiresAtIso }) {
+async function qpdfExtractPage({ inPdf, pageNum, outPdf, expiresAtIso }, warnings = null) {
   const tQ = boundedTimeout(TIMEOUT_QPDF_MS, expiresAtIso, 15_000, 60_000);
-  await runCmd(
+  const result = await runCmd(
     QPDF_EXE,
     ["--empty", "--pages", inPdf, `${pageNum}-${pageNum}`, "--", outPdf],
     tQ,
+    {},
+    [0, 3],
   );
+  if (result.exitCode === 3 && Array.isArray(warnings)) {
+    warnings.push((result.err || "").trim().slice(0, 1000));
+  }
   const b = safeStatSize(outPdf) ?? 0;
   return b;
 }
 
-async function qpdfConcatSinglePages({ pagePdfs, outPdf, expiresAtIso }) {
+async function qpdfConcatSinglePages({ pagePdfs, outPdf, expiresAtIso }, warnings = null) {
   // Each file in pagePdfs is a 1-page PDF. We stitch them into one multi-page PDF.
   const tQ = boundedTimeout(TIMEOUT_QPDF_MS, expiresAtIso, 20_000, 60_000);
   const args = ["--empty", "--pages"];
   for (const p of pagePdfs) args.push(p, "1");
   args.push("--", outPdf);
-  await runCmd(QPDF_EXE, args, tQ);
+  const result = await runCmd(QPDF_EXE, args, tQ, {}, [0, 3]);
+  if (result.exitCode === 3 && Array.isArray(warnings)) {
+    warnings.push((result.err || "").trim().slice(0, 1000));
+  }
   const b = safeStatSize(outPdf) ?? 0;
   return b;
 }
@@ -989,7 +1007,7 @@ async function splitOversizeSafe({
   partsDir,
   targetBytes,
   expiresAtIso,
-}) {
+}, warnings = null) {
   // Fallback mode when normal range-split can't enforce <=targetBytes due to huge single pages.
   // Strategy:
   //  1) Extract every page as its own PDF.
@@ -997,7 +1015,7 @@ async function splitOversizeSafe({
   //  3) Remaining pages are greedily packed into parts by concatenating single-page PDFs.
   fs.mkdirSync(partsDir, { recursive: true });
 
-  const pages = await qpdfPages(inPdf, expiresAtIso);
+  const pages = await qpdfPages(inPdf, expiresAtIso, warnings);
 
   const oneDir = path.join(partsDir, ".__single_pages");
   safeRm(oneDir);
@@ -1012,7 +1030,7 @@ async function splitOversizeSafe({
       pageNum: p,
       outPdf: onePath,
       expiresAtIso,
-    });
+    }, warnings);
     return { p, path: onePath, bytes: b };
   });
   single.sort((a, b) => a.p - b.p);
@@ -1063,7 +1081,7 @@ async function splitOversizeSafe({
       pagePdfs: pack.map((x) => x.path),
       outPdf: outPath,
       expiresAtIso,
-    });
+    }, warnings);
     const b = safeStatSize(outPath) ?? 0;
     partFiles.push(outPath);
     partMeta.push({
@@ -1368,6 +1386,7 @@ async function processDefaultFast({
   const preInBytes = safeStatSize(inPdf) ?? 0;
   const T = {};
   tmark(T, "start");
+  const qpdfWarnings = [];
 
   await updateJob(jobId, {
     stage: "PREFLIGHT",
@@ -1397,8 +1416,9 @@ async function processDefaultFast({
       }, QPDF_PRE_NORMALIZE_TIMEOUT_MS);
     });
     try {
-      const okQ = await Promise.race([promise, timeoutPromise]);
-      if (okQ) workPdf = qpdfPdf;
+      const result = await Promise.race([promise, timeoutPromise]);
+      if (result?.ok) workPdf = qpdfPdf;
+      if (result?.warning) qpdfWarnings.push(result.warning);
     } catch (e) {
       // workPdf stays inPdf on timeout or qpdf failure; pipeline continues
     } finally {
@@ -1407,7 +1427,7 @@ async function processDefaultFast({
   }
   tmark(T, "qpdf");
 
-  const prePages = await qpdfPages(workPdf, expiresAtIso);
+  const prePages = await qpdfPages(workPdf, expiresAtIso, qpdfWarnings);
   const preBytes = safeStatSize(workPdf) ?? safeStatSize(inPdf) ?? 0;
   const targetTotalBytes = SYSTEM_PART_BYTES * SYSTEM_MAX_PARTS; // e.g. 9MB * 5 = 45MB
   let afterCompressBytes = preBytes;
@@ -1514,7 +1534,7 @@ async function processDefaultFast({
     const partBytes = opts.targetBytes ?? targetBytes;
     const effectiveMaxParts = opts.maxParts ?? maxParts;
     wipePartsDir();
-    const pages0 = await qpdfPages(pdfPath, expiresAtIso);
+    const pages0 = await qpdfPages(pdfPath, expiresAtIso, qpdfWarnings);
     const bytes0 = safeStatSize(pdfPath) ?? 0;
 
     if (bytes0 <= partBytes) {
@@ -1566,7 +1586,7 @@ async function processDefaultFast({
         partsDir,
         ranges,
         expiresAtIso,
-      });
+      }, qpdfWarnings);
 
       const peak = maxPartBytes(res.partMeta);
       if (!best || peak < best.peak) best = { res, peak, parts };
@@ -1589,6 +1609,10 @@ async function processDefaultFast({
   const partsCount = (res.partMeta && res.partMeta.length) || 0;
   if (partsCount > SYSTEM_MAX_PARTS) {
     res.warningMessage = `Best effort: required ${partsCount} files to keep each file <=9MB for this PDF.`;
+  }
+  if (qpdfWarnings.length) {
+    const qpdfMsg = qpdfWarnings.join("\n").slice(0, 2000).trim();
+    res.warningMessage = res.warningMessage ? `${res.warningMessage}\n${qpdfMsg}` : qpdfMsg;
   }
 
   // Push oversized parts down to <=9MB (hard rule).
@@ -1630,7 +1654,7 @@ async function processDefaultFast({
       partsDir,
       targetBytes,
       expiresAtIso,
-    });
+    }, qpdfWarnings);
     if (maxPartBytes(res.partMeta) > targetBytes) {
       res = await shrinkOversizePartsAggressive({
         res,
@@ -1978,6 +2002,11 @@ async function main() {
 
       if (!jobs.length) {
         const nowMs = Date.now();
+        if (idleSinceMs == null) idleSinceMs = nowMs;
+        if (WORKER_IDLE_EXIT_MS > 0 && nowMs - idleSinceMs >= WORKER_IDLE_EXIT_MS) {
+          console.log("[POLL] idle exit: no jobs for", WORKER_IDLE_EXIT_MS, "ms");
+          process.exit(0);
+        }
         const throttleOk =
           nowMs - lastIdlePollLogAt >= POLL_IDLE_LOG_EVERY_MS;
         const backoffChanged = idleSleepMs !== lastLoggedIdleSleepMs;
@@ -1993,11 +2022,14 @@ async function main() {
             "ms",
           );
         }
-        await sleep(idleSleepMs);
-        idleSleepMs = Math.min(idleSleepMs * 2, POLL_IDLE_MAX_MS);
+        const jitter = 0.9 + Math.random() * 0.2;
+        const sleepMs = Math.round(idleSleepMs * jitter);
+        await sleep(sleepMs);
+        idleSleepMs = Math.min(idleSleepMs * 2, MAX_IDLE_BACKOFF_MS);
         continue;
       }
 
+      idleSinceMs = null;
       idleSleepMs = POLL_MS;
       console.log(
         "[POLL] taking first job =",
