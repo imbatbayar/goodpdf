@@ -130,7 +130,7 @@ export async function GET(req: Request) {
 
         try {
           while (true) {
-            if (aborted || signal.aborted) break;
+            if (aborted || signal.aborted) break; // stop on client disconnect
 
             const { data: job, error } = await supabaseAdmin
               .from("jobs")

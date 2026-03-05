@@ -463,7 +463,7 @@ export function useUploadFlow() {
             const data = JSON.parse(e.data);
             applyStatusToState(data, jid);
             const status = String(data?.status || "").toUpperCase();
-            if (status === "DONE" || status === "FAILED") {
+            if (status === "DONE" || status === "FAILED" || status === "CLEANED" || status === "CANCELED") {
               closeEventSource();
             }
           } catch (_) {}
