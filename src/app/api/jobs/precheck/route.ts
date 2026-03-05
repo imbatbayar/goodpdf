@@ -166,8 +166,8 @@ function estimateProfile(params: EstimateParams) {
     1,
     Math.round((0.9 + complexity * 0.95 + Math.max(0, sig.softMaskRefs - 4) * 0.08) * 10) / 10
   );
-  // Use expectedParts as an additional factor: more parts = more work.
-  const partsFactor = Math.min(2.5, Math.max(1, 0.7 + expectedParts * 0.15));
+  // ETA scaling: sqrt growth so 5 vs 45 parts differ meaningfully; cap 2.5.
+  const partsFactor = Math.min(2.5, 1 + Math.sqrt(expectedParts) * 0.35);
   estimatedCpuMinRaw = Math.round(estimatedCpuMinRaw * partsFactor * 10) / 10;
   const estimatedCpuMin = Math.max(1, Math.round(estimatedCpuMinRaw * calibrationFactor * 10) / 10);
 
@@ -177,11 +177,13 @@ function estimateProfile(params: EstimateParams) {
   let etaMinHigh = Math.max(3, Math.ceil(estimatedCpuMin * 1.6));
   const reason: string[] = [];
 
-  // Guardrails: if expectedParts >= 2 and (image density or avgMbPerPage high), bump to HEAVY.
-  if (
-    expectedParts >= 2 &&
-    (imgPerSampleMb >= 2.0 || (avgMbPerPage != null && avgMbPerPage >= 1.0))
-  ) {
+  // HEAVY: expectedParts >= 3 always; expectedParts === 2 only if image/density signals.
+  const imageDensityHigh = imgPerSampleMb >= 2.0 || (avgMbPerPage != null && avgMbPerPage >= 1.0);
+  const twoPartHeavy =
+    imageDensityHigh ||
+    (avgMbPerPage != null && avgMbPerPage >= 0.6) ||
+    (sig.imageRefs >= 8);
+  if (expectedParts >= 3 || (expectedParts === 2 && twoPartHeavy)) {
     tokenCost = Math.max(tokenCost, 2) as 1 | 2 | 3;
     mode = "HEAVY";
     etaMinLow = Math.max(etaMinLow, 5);
@@ -277,11 +279,16 @@ function estimateProfile(params: EstimateParams) {
       ? "Medium confidence: estimate may shift with content mix."
       : "Low confidence: unusual PDF structure can vary processing time.";
 
+  const etaMinSec = Math.round(etaMinLow * 60);
+  const etaMaxSec = Math.round(etaMinHigh * 60);
+
   return {
     tokenCost,
     mode,
     etaMinLow,
     etaMinHigh,
+    etaMinSec,
+    etaMaxSec,
     estimatedCpuMinRaw,
     avgMbPerPage,
     estimatedCpuMin,
@@ -369,6 +376,8 @@ export async function POST(req: Request) {
       mode: p.mode,
       etaMinLow: p.etaMinLow,
       etaMinHigh: p.etaMinHigh,
+      etaMinSec: p.etaMinSec,
+      etaMaxSec: p.etaMaxSec,
       estimatedCpuMinRaw: p.estimatedCpuMinRaw,
       estimatedCpuMin: p.estimatedCpuMin,
       fileSizeMb,
