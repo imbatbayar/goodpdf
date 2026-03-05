@@ -19,6 +19,9 @@ const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID!;
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY!;
 const R2_BUCKET_IN = process.env.R2_BUCKET_IN || "goodpdf-in";
 
+const DEFAULT_MODE_QUALITY_WARNING =
+  "This file is very large. Compression may reduce quality.";
+
 const r2 = new S3Client({
   region: "auto",
   endpoint: R2_ENDPOINT,
@@ -370,6 +373,10 @@ export async function POST(req: Request) {
       expectedParts,
       effectiveSplitMb,
       modeUsedForEstimate,
+      defaultModeWarning:
+        modeUsedForEstimate === "SYSTEM"
+          ? DEFAULT_MODE_QUALITY_WARNING
+          : null,
     });
     return json(true, {
       tokenCost: p.tokenCost,

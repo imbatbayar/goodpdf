@@ -1,6 +1,6 @@
 // worker-local/worker.mjs — GOODPDF Worker (FAST v4.0)
 // Core goals (locked):
-//  - DEFAULT(Auto/System-Fit): try to shrink PDF to <= 5×9MB (≈45MB) FAST,
+//  - DEFAULT(Auto/System-Fit): try to shrink PDF to <= 5×9MB (≈43–44MB) FAST,
 //      using Selective Image Recompression (Python) first.
 //      If still too large, fallback to ONE Ghostscript pass (85 DPI / JPEG Q45).
 //      Then split with hard max 5 parts (best effort near 9MB each).
@@ -25,6 +25,8 @@ import {
   DeleteObjectCommand,
 } from "@aws-sdk/client-s3";
 import { estimatePartsForTarget } from "./tools/scan_engine.mjs";
+
+const __dirname = path.dirname(new URL(import.meta.url).pathname);
 
 // ----------------------
 // 7z resolve
@@ -183,9 +185,9 @@ const SYSTEM_PART_MB = Number(process.env.SYSTEM_PART_MB || 9);
 const SYSTEM_PART_BYTES = Math.floor(SYSTEM_PART_MB * 1024 * 1024);
 // Legacy compat cap (used for some env-driven knobs; Manual mode can override)
 const SYSTEM_MAX_PARTS = Number(process.env.SYSTEM_MAX_PARTS || 5);
-// DEFAULT ladder/goal: aim for ~5×9MB ≈ 45MB total
+// DEFAULT ladder/goal: aim for ~5×9MB ≈ 43–44MB total
 const SYSTEM_TARGET_PARTS_GOAL = 5;
-const SYSTEM_MAX_PARTS_DEFAULT = 10; // hard cap for DEFAULT; Manual can exceed this
+const SYSTEM_MAX_PARTS_DEFAULT = 5; // hard cap for DEFAULT; Manual can exceed this
 const SYSTEM_TARGET_TOTAL_BYTES = Math.floor(
   SYSTEM_TARGET_PARTS_GOAL * SYSTEM_PART_BYTES * 0.97,
 );
@@ -1444,9 +1446,9 @@ async function processDefaultFast({
   // Hard input cap: refuse only when raw PDF is over 500MB.
   if (preInBytes > SYSTEM_DEFAULT_MAX_INPUT_BYTES) {
     const err = new Error(
-      "File is over 500MB. Please use Compress tool or Manual split.",
+      "Over 500MB. Please use Compress tool or Manual split.",
     );
-    err.code = "REFUSED_OVER_500MB";
+    err.code = "REFUSED_TOO_LARGE";
     throw err;
   }
 
@@ -1486,30 +1488,78 @@ async function processDefaultFast({
   const preBytes = safeStatSize(workPdf) ?? safeStatSize(inPdf) ?? 0;
   let afterCompressBytes = preBytes;
 
-  // Optional Python-based image recompress lane (DEFAULT only, large PDFs).
-  if (preBytes >= 200 * 1024 * 1024) {
+  const estimateSystemParts = (totalBytes) =>
+    estimatePartsForTarget({
+      bytes: totalBytes,
+      targetBytes: SYSTEM_PART_BYTES,
+      maxParts: SYSTEM_MAX_PARTS_DEFAULT,
+      pages: prePages,
+    });
+  let estimatedParts = estimateSystemParts(afterCompressBytes);
+  console.log("[DEFAULT_FEASIBILITY]", {
+    jobId,
+    step: "initial",
+    estimatedParts,
+    targetPartBytes: SYSTEM_PART_BYTES,
+    maxPartsGoal: SYSTEM_TARGET_PARTS_GOAL,
+    bytes: afterCompressBytes,
+  });
+
+  // Python-based selective image recompress lane:
+  // Run whenever we're above the DEFAULT total-target, with softer args <200MB
+  // and stronger args for 200–500MB.
+  if (
+    preBytes > SYSTEM_TARGET_TOTAL_BYTES &&
+    preBytes <= SYSTEM_DEFAULT_MAX_INPUT_BYTES &&
+    !softStop()
+  ) {
     try {
       const tmpRe = path.join(wd, `.__pyre_${rand6()}.pdf`);
+      const targetMb = Math.max(
+        1,
+        Math.ceil(SYSTEM_TARGET_TOTAL_BYTES / (1024 * 1024)),
+      );
+      const isHeavyInput = preBytes >= 200 * 1024 * 1024;
       const pyArgs = [
         path.join(__dirname, "tools", "selective_recompress.py"),
         workPdf,
         tmpRe,
         "--target_mb",
-        "45",
-        "--top_k",
-        "220",
-        "--min_stream_kb",
-        "200",
-        "--max_side",
-        "1100",
-        "--jpeg_q",
-        "28",
-        "--passes",
-        "3",
-        "--force",
+        String(targetMb),
       ];
+      if (isHeavyInput) {
+        // Strong lane for 200–500MB
+        pyArgs.push(
+          "--top_k",
+          "220",
+          "--min_stream_kb",
+          "200",
+          "--max_side",
+          "1100",
+          "--jpeg_q",
+          "30",
+          "--passes",
+          "3",
+          "--force",
+        );
+      } else {
+        // Soft lane for <200MB
+        pyArgs.push(
+          "--top_k",
+          "120",
+          "--min_stream_kb",
+          "300",
+          "--max_side",
+          "1600",
+          "--jpeg_q",
+          "45",
+          "--passes",
+          "2",
+        );
+      }
       const tPy = boundedTimeout(180_000, expiresAtIso, 30_000, 180_000);
-      const pyRes = await runCmd("python", pyArgs, tPy, {}, [0]);
+      const pyExe = pickPythonExe();
+      const pyRes = await runCmd(pyExe, pyArgs, tPy, {}, [0]);
       let summary = null;
       try {
         summary = JSON.parse(pyRes.out.trim() || "{}");
@@ -1521,6 +1571,16 @@ async function processDefaultFast({
       if (afterB > 0 && afterB < beforeB) {
         fs.renameSync(tmpRe, workPdf);
         afterCompressBytes = afterB;
+        estimatedParts = estimateSystemParts(afterCompressBytes);
+        anyShrink = true;
+        console.log("[DEFAULT_FEASIBILITY]", {
+          jobId,
+          step: "python_recompress",
+          estimatedParts,
+          targetPartBytes: SYSTEM_PART_BYTES,
+          maxPartsGoal: SYSTEM_TARGET_PARTS_GOAL,
+          bytes: afterCompressBytes,
+        });
       } else {
         safeUnlink(tmpRe);
       }
@@ -1543,15 +1603,21 @@ async function processDefaultFast({
   const targetA = SYSTEM_TARGET_TOTAL_BYTES;
   const targetB = Math.floor(targetA * 1.6);
   const targetC = Math.floor(targetA * 2.5);
-  let achievedStage =
-    afterCompressBytes <= targetA
-      ? "A_TARGET_MET"
-      : afterCompressBytes <= targetB
-        ? "B_TARGET_RELAXED"
-        : afterCompressBytes <= targetC
-          ? "C_TARGET_RELAXED"
-          : "D_RESCUE_SPLIT_ONLY";
+  let achievedStage = "D_RESCUE_SPLIT_ONLY";
   let anyShrink = false;
+  const recomputeAchievedStage = () => {
+    if (afterCompressBytes <= targetA) {
+      achievedStage = "A_TARGET_MET";
+    } else if (anyShrink && afterCompressBytes <= targetB) {
+      achievedStage = "B_TARGET_RELAXED";
+    } else if (anyShrink && afterCompressBytes <= targetC) {
+      achievedStage = "C_TARGET_RELAXED";
+    } else if (anyShrink) {
+      achievedStage = "C_TARGET_RELAXED";
+    } else {
+      achievedStage = "D_RESCUE_SPLIT_ONLY";
+    }
+  };
   const aggressiveLane = preInBytes >= 200 * 1024 * 1024; // >=200MB input triggers AGGRESSIVE_DEFAULT_LANE
 
   // Ensure total size is improved toward the ladder targets before split; AGGRESSIVE_DEFAULT_LANE
@@ -1586,9 +1652,28 @@ async function processDefaultFast({
       ];
   const COMPRESS_PASS_TIMEOUT_MS = aggressiveLane ? 180_000 : 120_000;
 
-  if (afterCompressBytes > targetA && !softStop()) {
+  if (
+    (afterCompressBytes > targetA ||
+      estimatedParts > SYSTEM_TARGET_PARTS_GOAL) &&
+    !softStop()
+  ) {
     for (const pass of COMPRESS_PASSES) {
-      if (afterCompressBytes <= targetA || softStop()) break;
+      if (softStop()) break;
+      estimatedParts = estimateSystemParts(afterCompressBytes);
+      if (
+        estimatedParts <= SYSTEM_TARGET_PARTS_GOAL &&
+        afterCompressBytes <= targetA
+      ) {
+        break;
+      }
+      console.log("[DEFAULT_FEASIBILITY]", {
+        jobId,
+        step: `gs_pass_start_${pass.label}`,
+        estimatedParts,
+        targetPartBytes: SYSTEM_PART_BYTES,
+        maxPartsGoal: SYSTEM_TARGET_PARTS_GOAL,
+        bytes: afterCompressBytes,
+      });
       await updateJob(jobId, {
         stage: "COMPRESS_HARDFIT",
         progress: 22,
@@ -1620,25 +1705,73 @@ async function processDefaultFast({
           workPdf = outPath;
           afterCompressBytes = outBytes;
           anyShrink = true;
-          if (afterCompressBytes <= targetA) break;
+          estimatedParts = estimateSystemParts(afterCompressBytes);
+          console.log("[DEFAULT_FEASIBILITY]", {
+            jobId,
+            step: `gs_pass_done_${pass.label}`,
+            estimatedParts,
+            targetPartBytes: SYSTEM_PART_BYTES,
+            maxPartsGoal: SYSTEM_TARGET_PARTS_GOAL,
+            bytes: afterCompressBytes,
+          });
+          if (estimatedParts <= SYSTEM_TARGET_PARTS_GOAL) break;
+        } else {
+          safeUnlink(outPath);
         }
+      } else {
+        safeUnlink(outPath);
       }
-    }
-
-    if (afterCompressBytes <= targetA) {
-      achievedStage = "A_TARGET_MET";
-    } else if (anyShrink && afterCompressBytes <= targetB) {
-      achievedStage = "B_TARGET_RELAXED";
-    } else if (anyShrink && afterCompressBytes <= targetC) {
-      achievedStage = "C_TARGET_RELAXED";
-    } else if (anyShrink) {
-      achievedStage = "C_TARGET_RELAXED";
-    } else {
-      achievedStage = "D_RESCUE_SPLIT_ONLY";
     }
 
     tmark(T, "compress");
   }
+
+  // Last-resort nuclear pass if we still estimate >5 parts and we're above target.
+  if (
+    !softStop() &&
+    estimateSystemParts(afterCompressBytes) > SYSTEM_TARGET_PARTS_GOAL &&
+    afterCompressBytes > targetA
+  ) {
+    const nuclearOut = path.join(
+      wd,
+      `.__target_fit_NUCLEAR_${rand6()}.pdf`,
+    );
+    const okNuclear = await runGsWithHeartbeat({
+      jobId,
+      label: "compress: nuclear",
+      runFn: () =>
+        gsCompressOnce({
+          inPdf: workPdf,
+          outPdf: nuclearOut,
+          mode: "NUCLEAR",
+          expiresAtIso,
+          timeoutMs: COMPRESS_PASS_TIMEOUT_MS,
+        }),
+    });
+    if (okNuclear) {
+      const outBytes = safeStatSize(nuclearOut) ?? 0;
+      if (outBytes > 0 && outBytes < afterCompressBytes) {
+        workPdf = nuclearOut;
+        afterCompressBytes = outBytes;
+        anyShrink = true;
+        estimatedParts = estimateSystemParts(afterCompressBytes);
+        console.log("[DEFAULT_FEASIBILITY]", {
+          jobId,
+          step: "gs_nuclear_done",
+          estimatedParts,
+          targetPartBytes: SYSTEM_PART_BYTES,
+          maxPartsGoal: SYSTEM_TARGET_PARTS_GOAL,
+          bytes: afterCompressBytes,
+        });
+      } else {
+        safeUnlink(nuclearOut);
+      }
+    } else {
+      safeUnlink(nuclearOut);
+    }
+  }
+
+  recomputeAchievedStage();
 
   await updateJob(jobId, {
     stage: "SPLIT",
@@ -1648,21 +1781,10 @@ async function processDefaultFast({
   });
 
   // DEFAULT split sizing (best-effort, ≤ SYSTEM_MAX_PARTS_DEFAULT parts):
-  // Decide parts AFTER compression using the ladder:
-  // - If total <= SYSTEM_TARGET_TOTAL_BYTES: aim for ≤5 parts (goal), near 9MB each.
-  // - Otherwise: allow up to 10 parts, still near 9MB.
-  let parts = 1;
-  if (afterCompressBytes <= SYSTEM_TARGET_TOTAL_BYTES) {
-    const ideal = Math.ceil(afterCompressBytes / SYSTEM_PART_BYTES);
-    parts = Math.min(SYSTEM_TARGET_PARTS_GOAL, Math.max(1, ideal));
-  } else {
-    const ideal = Math.ceil(afterCompressBytes / SYSTEM_PART_BYTES);
-    parts = Math.min(SYSTEM_MAX_PARTS_DEFAULT, Math.max(1, ideal));
-  }
-
-  // targetBytes ~ equal chunks; clamp min to 4MB so we don't create tiny parts on small PDFs.
-  const targetBytes = Math.max(4 * 1024 * 1024, Math.ceil(afterCompressBytes / parts));
-  const maxPartsForSplit = parts;
+  // We enforce a fixed per-part goal (SYSTEM_PART_BYTES ~= 9MB) and never
+  // increase targetBytes to satisfy the 5-part cap.
+  const targetBytes = SYSTEM_PART_BYTES;
+  const maxPartsForSplit = SYSTEM_TARGET_PARTS_GOAL;
 
   const wipePartsDir = () => {
     try {
@@ -1675,10 +1797,10 @@ async function processDefaultFast({
     } catch {}
   };
 
-  // HARD: each part <= 9MB. Parts = max(1, ceil(bytes/partBytes)), cap SYSTEM_MAX_PARTS for auto.
+  // HARD: each part <= targetBytes (≈9MB).
   const splitForSystem = async (pdfPath, opts = {}) => {
     const partBytes = opts.targetBytes ?? targetBytes;
-    const effectiveMaxParts = opts.maxParts ?? maxParts;
+    const effectiveMaxParts = opts.maxParts ?? maxPartsForSplit;
     wipePartsDir();
     const pages0 = await qpdfPages(pdfPath, expiresAtIso, qpdfWarnings);
     const bytes0 = safeStatSize(pdfPath) ?? 0;
@@ -1745,14 +1867,52 @@ async function processDefaultFast({
     return {
       ...(best?.res || { partFiles: [], partMeta: [] }),
       _fit: false,
-      _parts: best?.parts ?? maxParts,
+      _parts: best?.parts ?? maxPartsForFile,
     };
   };
 
-  let res = await splitForSystem(workPdf, {
-    targetBytes: SYSTEM_PART_BYTES,
-    maxParts: maxPartsForSplit,
+  // Strict feasibility check: can we hit <=5 parts at 9MB target?
+  estimatedParts = estimateSystemParts(afterCompressBytes);
+  console.log("[DEFAULT_FEASIBILITY]", {
+    jobId,
+    step: "pre_split",
+    estimatedParts,
+    targetPartBytes: SYSTEM_PART_BYTES,
+    maxPartsGoal: SYSTEM_TARGET_PARTS_GOAL,
+    bytes: afterCompressBytes,
   });
+
+  let res;
+  let rescueSplitOnly = false;
+  let rescueReason = null;
+
+  if (estimatedParts <= SYSTEM_TARGET_PARTS_GOAL) {
+    // Feasible: split with fixed 9MB target and <=5 parts.
+    res = await splitForSystem(workPdf, {
+      targetBytes: SYSTEM_PART_BYTES,
+      maxParts: maxPartsForSplit,
+    });
+  } else {
+    // Infeasible even after compression ladder: RESCUE_SPLIT_ONLY.
+    rescueSplitOnly = true;
+    rescueReason = {
+      estimatedParts,
+      targetPartBytes: SYSTEM_PART_BYTES,
+      maxPartsGoal: SYSTEM_TARGET_PARTS_GOAL,
+      finalBytes: afterCompressBytes,
+    };
+    console.warn("[DEFAULT_FEASIBILITY]", {
+      jobId,
+      step: "rescue_split_only_triggered",
+      ...rescueReason,
+    });
+
+    // Optional split-only output that respects 9MB per part but may exceed 5 parts.
+    res = await splitForSystem(workPdf, {
+      targetBytes: SYSTEM_PART_BYTES,
+      maxParts: prePages, // upper bound: one part per page if needed
+    });
+  }
   tmark(T, "split");
 
   const partsCount = (res.partMeta && res.partMeta.length) || 0;
@@ -1764,14 +1924,14 @@ async function processDefaultFast({
   }
   if (preInBytes >= 200 * 1024 * 1024) {
     const qualityMsg =
-      "Large PDF: default mode may reduce quality to reach ~45MB. If not reachable, we split near 9MB with up to 10 parts.";
+      "Large PDF: default mode may reduce quality to reach ~43–44MB. If not reachable, we split near 9MB with up to 5 parts.";
     res.warningMessage = res.warningMessage
       ? `${qualityMsg}\n${res.warningMessage}`
       : qualityMsg;
   }
   if (partsCount >= SYSTEM_MAX_PARTS_DEFAULT) {
     const partsMsg =
-      "Reached default max of 10 parts. Use Manual for finer splitting or Compress tool.";
+      "Reached default max of 5 parts. Use Manual for finer splitting or Compress tool.";
     res.warningMessage = res.warningMessage
       ? `${partsMsg}\n${res.warningMessage}`
       : partsMsg;
@@ -1882,6 +2042,11 @@ async function processDefaultFast({
   console.log(
     `[timing] qpdf=${qpdfMs}ms compress=${compressMs}ms split=${splitMs}ms total=${totalMs}ms parts=${partsN} bytes_in=${preInBytes} bytes_out=${bytesOut}`,
   );
+
+  if (rescueSplitOnly) {
+    res.rescueSplitOnly = true;
+    res.rescueReason = rescueReason;
+  }
 
   return res;
 }
@@ -2051,6 +2216,16 @@ async function processOneJob(job) {
       systemFit && res.warningMessage ? res.warningMessage : null;
 
     const tFinalize = Date.now();
+    const rescueInfo = res && res.rescueSplitOnly ? res.rescueReason || null : null;
+    const rescueMsg =
+      rescueInfo && systemFit
+        ? `Could not reach <=${SYSTEM_TARGET_PARTS_GOAL} parts at ${SYSTEM_PART_MB}MB target.\n` +
+          `Estimated parts needed: ${rescueInfo.estimatedParts ?? "unknown"}.\n` +
+          `Use Manual mode or stronger compression if you need fewer parts.`
+        : null;
+    const finalWarningText =
+      rescueMsg && warningText ? `${rescueMsg}\n${warningText}` : rescueMsg || warningText;
+
     await updateJob(jobId, {
       status: "DONE",
       stage: "DONE",
@@ -2070,7 +2245,7 @@ async function processOneJob(job) {
         typeof maxPartB === "number"
           ? Math.round(bytesToMb(maxPartB) * 100) / 100
           : null,
-      warning_text: warningText,
+      warning_text: finalWarningText,
       error_text: null,
       error_code: null,
       claimed_by: null,
