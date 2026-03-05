@@ -1511,6 +1511,36 @@ async function processDefaultFast({
     }
   }
 
+  const MAX_PARTS_HARD_CEIL = 30;
+  let hardPartsNeeded = Math.ceil(afterCompressBytes / SYSTEM_PART_BYTES);
+  if (hardPartsNeeded > MAX_PARTS_HARD_CEIL && !softStop()) {
+    const outTurbo = path.join(wd, `.__hardfit_turbo_${rand6()}.pdf`);
+    const okTurbo = await runGsWithHeartbeat({
+      jobId,
+      label: "compress: turbo 72/35 (pre-split)",
+      runFn: () =>
+        gsCompressOnce({
+          inPdf: workPdf,
+          outPdf: outTurbo,
+          mode: "PRESET",
+          dpi: 72,
+          jpegQ: 35,
+          pdfSettings: "/screen",
+          expiresAtIso,
+          timeoutMs: 180_000,
+        }),
+    });
+    if (okTurbo) {
+      const outBytes = safeStatSize(outTurbo) ?? 0;
+      if (outBytes > 0) {
+        workPdf = outTurbo;
+        afterCompressBytes = outBytes;
+        hardPartsNeeded = Math.ceil(afterCompressBytes / SYSTEM_PART_BYTES);
+      }
+    }
+    tmark(T, "gs_turbo");
+  }
+
   await updateJob(jobId, {
     stage: "SPLIT",
     progress: 55,
@@ -1521,8 +1551,7 @@ async function processDefaultFast({
   const targetBytes = Math.floor(
     SYSTEM_PART_BYTES * (heavyLane ? HEAVY_TARGET_MARGIN : 0.985),
   ); // per-part cap 9MB
-  const hardPartsNeeded = Math.ceil(afterCompressBytes / SYSTEM_PART_BYTES);
-  const MAX_PARTS_HARD_CEIL = 30;
+  hardPartsNeeded = Math.ceil(afterCompressBytes / SYSTEM_PART_BYTES);
   let maxPartsForSplit = Math.max(SYSTEM_MAX_PARTS, hardPartsNeeded);
   if (maxPartsForSplit > MAX_PARTS_HARD_CEIL) maxPartsForSplit = MAX_PARTS_HARD_CEIL;
 
