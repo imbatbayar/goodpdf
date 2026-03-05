@@ -1432,6 +1432,16 @@ async function processDefaultFast({
   const targetTotalBytes = SYSTEM_PART_BYTES * SYSTEM_MAX_PARTS; // e.g. 9MB * 5 = 45MB
   let afterCompressBytes = preBytes;
 
+  const IMAGE_HEAVY_MB_PER_PAGE = 2;
+  if (prePages > 0 && preBytes > 0) {
+    const mbPerPage = preBytes / (1024 * 1024) / prePages;
+    if (mbPerPage > IMAGE_HEAVY_MB_PER_PAGE) {
+      const err = new Error("PDF is too image-heavy to process.");
+      err.code = "REFUSED_IMAGE_HEAVY";
+      throw err;
+    }
+  }
+
   // Only compress when file exceeds one-part size; do not degrade quality to force multiple parts.
   if (afterCompressBytes > SYSTEM_PART_BYTES && !softStop()) {
     await updateJob(jobId, {
@@ -1891,6 +1901,7 @@ async function processOneJob(job) {
     });
   } catch (e) {
     const msg = String(e?.message || e);
+    const code = e?.code ? String(e.code) : "WORKER_ERROR";
     timing.total_ms = Date.now() - jobStartMs;
     console.error("[JOB_TIMING_FAILED]", {
       jobId,
@@ -1898,13 +1909,27 @@ async function processOneJob(job) {
       error: msg.slice(0, 200),
     });
 
+    const corruptCodes = ["INPUT_EMPTY", "INVALID_PDF_SIGNATURE", "NPAGES_FAILED"];
+    const isRefusedCorrupt = corruptCodes.includes(code);
+    const isRefusedImageHeavy = code === "REFUSED_IMAGE_HEAVY";
+    const refusalCode = isRefusedCorrupt
+      ? "REFUSED_CORRUPT_PDF"
+      : isRefusedImageHeavy
+        ? "REFUSED_IMAGE_HEAVY"
+        : code;
+    const refusalText = isRefusedCorrupt
+      ? "PDF is corrupt or invalid."
+      : isRefusedImageHeavy
+        ? "PDF is too image-heavy to process."
+        : msg.slice(0, 800);
+
     await updateJob(jobId, {
       status: "FAILED",
       stage: "FAILED",
       progress: 100,
       split_progress: 100,
-      error_code: e?.code ? String(e.code) : "WORKER_ERROR",
-      error_text: msg.slice(0, 800),
+      error_code: refusalCode,
+      error_text: refusalText,
       claimed_by: null,
       claimed_at: null,
       updated_at: nowIso(),
@@ -1976,6 +2001,12 @@ async function main() {
   let lastErrorLogAt = 0;
   let lastLoggedIdleSleepMs = 0;
   let idleSleepMs = POLL_MS;
+  let idleStartedAtMs = null;
+
+  function getIdleSinceMs() {
+    if (idleStartedAtMs === null) return 0;
+    return Date.now() - idleStartedAtMs;
+  }
 
   while (true) {
     try {
@@ -2002,8 +2033,9 @@ async function main() {
 
       if (!jobs.length) {
         const nowMs = Date.now();
-        if (idleSinceMs == null) idleSinceMs = nowMs;
-        if (WORKER_IDLE_EXIT_MS > 0 && nowMs - idleSinceMs >= WORKER_IDLE_EXIT_MS) {
+        if (idleStartedAtMs === null) idleStartedAtMs = nowMs;
+        const idleSinceMs = getIdleSinceMs();
+        if (WORKER_IDLE_EXIT_MS > 0 && idleSinceMs >= WORKER_IDLE_EXIT_MS) {
           console.log("[POLL] idle exit: no jobs for", WORKER_IDLE_EXIT_MS, "ms");
           process.exit(0);
         }
@@ -2029,7 +2061,7 @@ async function main() {
         continue;
       }
 
-      idleSinceMs = null;
+      idleStartedAtMs = null;
       idleSleepMs = POLL_MS;
       console.log(
         "[POLL] taking first job =",
@@ -2045,14 +2077,10 @@ async function main() {
           }),
         ),
       );
-    } catch (e) {
-      const nowMs = Date.now();
-      if (nowMs - lastErrorLogAt >= POLL_IDLE_LOG_EVERY_MS) {
-        lastErrorLogAt = nowMs;
-        console.error("[POLL] loop error:", e?.message || e);
-      }
-      await sleep(idleSleepMs);
-      idleSleepMs = Math.min(idleSleepMs * 2, POLL_IDLE_MAX_MS);
+    } catch (err) {
+      console.error("[POLL] loop error:", err?.stack || err?.message || err);
+      await new Promise((r) => setTimeout(r, 5000));
+      continue;
     }
   }
 }

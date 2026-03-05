@@ -13,25 +13,6 @@ type DownloadUX = "IDLE" | "PREPARE" | "SUCCESS";
 type Step = "PICK" | "SETTINGS" | "RUN";
 type StepState = "pending" | "active" | "done";
 type PipelineRow = { key: string; label: string; stages: string[]; state: StepState; pct: number };
-type PrecheckInfo = {
-  tokenCost: 1 | 2 | 3;
-  mode: "NORMAL" | "HEAVY" | "EXTREME";
-  etaMinLow: number;
-  etaMinHigh: number;
-  estimatedCpuMin?: number;
-  fileSizeMb: number;
-  pages: number | null;
-  avgMbPerPage: number | null;
-  confidence?: "HIGH" | "MEDIUM" | "LOW";
-  confidenceNote?: string;
-  recommendation?: string;
-  reason: string[];
-};
-
-const LS_PRECHECK_CALIBRATION = "goodpdf_precheck_calibration_v1";
-const ENABLE_PRECHECK_CALIBRATION =
-  String(process.env.NEXT_PUBLIC_ENABLE_PRECHECK_CALIBRATION || "false").toLowerCase() ===
-  "true";
 
 const SYSTEM_TICK_MESSAGES = [
   "Scanning pages…",
@@ -194,10 +175,11 @@ function stageDotClass(state: StepState) {
   return "bg-zinc-200 text-zinc-700";
 }
 
-function confidenceBadge(conf?: "HIGH" | "MEDIUM" | "LOW") {
-  if (conf === "HIGH") return { label: "High confidence", cls: "bg-emerald-100 text-emerald-800" };
-  if (conf === "LOW") return { label: "Low confidence", cls: "bg-amber-100 text-amber-800" };
-  return { label: "Medium confidence", cls: "bg-zinc-200 text-zinc-700" };
+function refusalMessage(errorCode?: string | null, fallback?: string | null): string {
+  const code = String(errorCode || "").toUpperCase();
+  if (code === "REFUSED_CORRUPT_PDF") return "PDF is corrupt or invalid.";
+  if (code === "REFUSED_IMAGE_HEAVY") return "PDF is too image-heavy to process.";
+  return fallback || "Something went wrong.";
 }
 
 export function UploadScreen() {
@@ -215,14 +197,7 @@ export function UploadScreen() {
 
   const [dlUx, setDlUx] = useState<DownloadUX>("IDLE");
   const [downloadError, setDownloadError] = useState<string | null>(null);
-  const [precheck, setPrecheck] = useState<PrecheckInfo | null>(null);
-  const [precheckLoading, setPrecheckLoading] = useState(false);
-  const [precheckError, setPrecheckError] = useState<string | null>(null);
-  const [precheckPct, setPrecheckPct] = useState(0);
-  const precheckTimerRef = useRef<number | null>(null);
   const processingStartedAtRef = useRef<number | null>(null);
-  const precheckEstimateAtStartRef = useRef<number | null>(null);
-  const calibrationAppliedForRunRef = useRef(false);
 
   // PROCESSING үеийн “хиймэл” progress + нэг мөр систем мессеж
   const [procFakePct, setProcFakePct] = useState(1);
@@ -279,8 +254,6 @@ export function UploadScreen() {
     !!file &&
     !flow.busy &&
     flow.phase === "UPLOADED" &&
-    !!precheck &&
-    !precheckLoading &&
     (mode === "SYSTEM" || splitValid.ok);
 
   const canDownload = !flow.busy && flow.phase === "READY";
@@ -293,12 +266,6 @@ export function UploadScreen() {
     if (procTickTimerRef.current) {
       window.clearInterval(procTickTimerRef.current);
       procTickTimerRef.current = null;
-    }
-  };
-  const stopPrecheckTimer = () => {
-    if (precheckTimerRef.current) {
-      window.clearInterval(precheckTimerRef.current);
-      precheckTimerRef.current = null;
     }
   };
   const stopStageTicker = () => {
@@ -327,13 +294,7 @@ export function UploadScreen() {
 
     setDlUx("IDLE");
     setDownloadError(null);
-    setPrecheck(null);
-    setPrecheckLoading(false);
-    setPrecheckError(null);
-    setPrecheckPct(0);
     processingStartedAtRef.current = null;
-    precheckEstimateAtStartRef.current = null;
-    calibrationAppliedForRunRef.current = false;
 
     // processing fake-ийг цэвэрлэнэ
     setProcFakePct(1);
@@ -350,58 +311,11 @@ export function UploadScreen() {
     );
     rowHeartbeatAtRef.current = PIPELINE_STEPS.map(() => Date.now());
     stopProcFakeTimers();
-    stopPrecheckTimer();
     stopStageTicker();
 
     flow.resetAll();
   };
 
-  useEffect(() => {
-    let cancelled = false;
-    const run = async () => {
-      if (flow.phase !== "UPLOADED" || !flow.jobId) return;
-      setPrecheckPct(4);
-      setPrecheckLoading(true);
-      setPrecheckError(null);
-      try {
-        const splitMbToPass = mode === "SYSTEM" ? SYSTEM_MAX_PART_MB : (splitValid.ok && splitMb != null ? splitMb : SYSTEM_MAX_PART_MB);
-        const info = (await JobService.precheck(flow.jobId, {
-          mode,
-          splitMb: splitMbToPass,
-        })) as PrecheckInfo;
-        if (cancelled) return;
-        setPrecheck(info);
-        setPrecheckPct(100);
-      } catch (e: any) {
-        if (cancelled) return;
-        setPrecheck(null);
-        setPrecheckError(e?.message || "Precheck failed");
-        setPrecheckPct(0);
-      } finally {
-        if (!cancelled) setPrecheckLoading(false);
-      }
-    };
-    run();
-    return () => {
-      cancelled = true;
-    };
-  }, [flow.phase, flow.jobId, mode, splitMb, splitValid.ok]);
-
-  useEffect(() => {
-    if (flow.phase !== "UPLOADED" || !precheckLoading) {
-      stopPrecheckTimer();
-      return;
-    }
-    if (!precheckTimerRef.current) {
-      precheckTimerRef.current = window.setInterval(() => {
-        setPrecheckPct((p) => (p >= 95 ? 95 : p + 1));
-      }, 220);
-    }
-    return () => {
-      stopPrecheckTimer();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [flow.phase, precheckLoading]);
 
   // ✅ PROCESSING үед “хиймэл” progress + систем мессежийг ажиллуулна
   useEffect(() => {
@@ -451,9 +365,6 @@ export function UploadScreen() {
 
     setStep("RUN");
     processingStartedAtRef.current = Date.now();
-    precheckEstimateAtStartRef.current =
-      typeof precheck?.estimatedCpuMin === "number" ? precheck.estimatedCpuMin : null;
-    calibrationAppliedForRunRef.current = false;
 
     // PROCESSING эхлэхэд fake-ийг шинэчлэх
     setProcFakePct(1);
@@ -474,30 +385,9 @@ export function UploadScreen() {
       await flow.startProcessing({
         mode: mode === "SYSTEM" ? ("SYSTEM" as any) : ("MANUAL" as any),
         splitMb: splitMbToSend as number,
-        precheckMode: precheck?.mode,
       });
-
     } catch {}
   };
-
-  useEffect(() => {
-    if (!ENABLE_PRECHECK_CALIBRATION) return;
-    if (flow.phase !== "READY") return;
-    if (calibrationAppliedForRunRef.current) return;
-    const startedAt = processingStartedAtRef.current;
-    const estimated = precheckEstimateAtStartRef.current;
-    if (!startedAt || !estimated || estimated <= 0) return;
-
-    const actualMin = Math.max(0.2, (Date.now() - startedAt) / 60_000);
-    const ratio = Math.max(0.65, Math.min(2.2, actualMin / estimated));
-    try {
-      const prev = Number(localStorage.getItem(LS_PRECHECK_CALIBRATION) || "1");
-      const safePrev = Number.isFinite(prev) ? Math.max(0.65, Math.min(2.2, prev)) : 1;
-      const next = Math.max(0.65, Math.min(2.2, safePrev * 0.75 + ratio * 0.25));
-      localStorage.setItem(LS_PRECHECK_CALIBRATION, String(next));
-    } catch {}
-    calibrationAppliedForRunRef.current = true;
-  }, [flow.phase]);
 
   const startDownloadAndPrepare = async () => {
     if (!flow.jobId) return;
@@ -751,54 +641,6 @@ export function UploadScreen() {
 
               <Card>
                 <div className="grid gap-3">
-                  <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-3">
-                    {precheckLoading ? (
-                      <div className="grid gap-2">
-                        <div className="flex items-center justify-between text-sm">
-                          <div className="font-semibold text-zinc-900">Preparing start check</div>
-                          <div className="text-zinc-600">{clampPct(precheckPct)}%</div>
-                        </div>
-                        <Progress value={clampPct(precheckPct)} />
-                        <div className="text-xs text-zinc-600">
-                          Checking file complexity, token usage and ETA...
-                        </div>
-                      </div>
-                    ) : precheck ? (
-                      <div className="grid gap-2">
-                        <div className="flex items-center justify-between gap-3 text-sm">
-                          <div className="font-semibold text-zinc-900">Estimated processing</div>
-                          <div className="rounded-full bg-zinc-900 px-2.5 py-1 text-xs font-semibold text-white">
-                            {precheck.tokenCost} token{precheck.tokenCost > 1 ? "s" : ""}
-                          </div>
-                        </div>
-                        <div className="text-xs text-zinc-700">
-                          Time: <b>~{precheck.etaMinLow}-{precheck.etaMinHigh} min</b>
-                        </div>
-                        <div>
-                          {(() => {
-                            const c = confidenceBadge(precheck.confidence);
-                            return (
-                              <span className={`inline-flex rounded-full px-2 py-0.5 text-[11px] font-semibold ${c.cls}`}>
-                                {c.label}
-                              </span>
-                            );
-                          })()}
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="grid gap-2">
-                        <div className="text-sm text-amber-700">
-                          Could not estimate token/time yet.
-                        </div>
-                        {precheckError ? (
-                          <div className="text-xs text-amber-700">{precheckError}</div>
-                        ) : null}
-                        <div className="text-xs text-zinc-600">
-                          Please retry in a few seconds.
-                        </div>
-                      </div>
-                    )}
-                  </div>
                   <div className="flex items-center justify-between gap-3">
                     <div className="font-semibold text-zinc-900">
                       {mode === "SYSTEM" ? "System-fit" : "Target size per part"}
@@ -924,7 +766,7 @@ export function UploadScreen() {
 
               <div className="flex flex-wrap gap-2.5">
                 <Button disabled={!canStart} onClick={doStart}>
-                  {precheckLoading ? "Preparing..." : "Start"}
+                  Start
                 </Button>
 
                 <Button
@@ -1010,7 +852,7 @@ export function UploadScreen() {
                       Something went wrong
                     </div>
                     <div className="whitespace-pre-wrap text-xs text-zinc-500">
-                      {flow.error}
+                      {refusalMessage(flow.errorCode, flow.error)}
                     </div>
 
                     <div className="flex flex-wrap gap-2.5 pt-1">

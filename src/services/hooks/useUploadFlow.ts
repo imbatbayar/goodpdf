@@ -119,13 +119,20 @@ function computeUsage(plan: Plan | null): Usage | null {
 }
 
 /**
- * Record 1 job event. Keep events bounded to 365 days to avoid growth.
+ * Server-side idempotent charge: POST /api/usage/charge once when job reaches DONE.
+ * Client guard (chargedForJobIdRef) avoids repeated calls; server is source of truth.
  */
-function recordJobEvent(ts: number) {
-  const cutoff = ts - planWindowMs(365);
-  const events = readJobEvents().filter((t) => t >= cutoff);
-  events.push(ts);
-  writeJobEvents(events);
+async function chargeUsageOnce(jobId: string): Promise<void> {
+  try {
+    const token =
+      typeof localStorage !== "undefined" ? localStorage.getItem(LS_OWNER_TOKEN) : null;
+    if (!token) return;
+    await fetch("/api/usage/charge", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-owner-token": token },
+      body: JSON.stringify({ jobId }),
+    });
+  } catch {}
 }
 
 function clampPct(n: any) {
@@ -200,6 +207,7 @@ export function useUploadFlow() {
   const [messageLine, setMessageLine] = useState<string>("");
 
   const [error, setError] = useState<string | null>(null);
+  const [errorCode, setErrorCode] = useState<string | null>(null);
 
   const [warning, setWarning] = useState<string | null>(null);
 
@@ -219,6 +227,7 @@ export function useUploadFlow() {
   const stageRef = useRef<string>("");
   const partsCountRef = useRef<number | null>(null);
   const processingStartedRef = useRef(false);
+  const chargedForJobIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     phaseRef.current = phase;
@@ -269,10 +278,12 @@ export function useUploadFlow() {
     setStageCode("");
 
     setError(null);
+    setErrorCode(null);
     setWarning(null);
     setResult(null);
     setDownloadUrl(null);
     processingStartedRef.current = false;
+    chargedForJobIdRef.current = null;
   }, [stopPolling]);
 
   // Resume last jobId (best effort). Do NOT auto-start processing.
@@ -339,6 +350,7 @@ export function useUploadFlow() {
         targetMb: st.targetMb ?? null,
       });
       setWarning(st.warningText ?? null);
+      setErrorCode(st.errorCode ?? null);
 
       if (nextPhase === "READY") {
         processingStartedRef.current = false;
@@ -346,6 +358,10 @@ export function useUploadFlow() {
         setBusy(false);
         closeEventSource();
         stopPolling();
+        if (chargedForJobIdRef.current !== jid) {
+          chargedForJobIdRef.current = jid;
+          chargeUsageOnce(jid).catch(() => {});
+        }
         return;
       }
       if (nextPhase === "ERROR") {
@@ -354,6 +370,7 @@ export function useUploadFlow() {
         closeEventSource();
         stopPolling();
         setError(st.errorText || "Failed");
+        setErrorCode(st.errorCode ?? null);
         return;
       }
       setBusy(true);
@@ -549,19 +566,11 @@ export function useUploadFlow() {
   );
 
   /**
-   * Start processing
-   * ✅ Job is counted HERE (on Start success)
+   * Start processing.
+   * Billing: 1 token is charged only when job reaches DONE (via POST /api/usage/charge).
    */
   const startProcessing = useCallback(
-    async ({
-      mode,
-      splitMb,
-      precheckMode,
-    }: {
-      mode: Mode;
-      splitMb: number;
-      precheckMode?: "NORMAL" | "HEAVY" | "EXTREME";
-    }) => {
+    async ({ mode, splitMb }: { mode: Mode; splitMb: number }) => {
       const jid = jobId;
       if (!jid) {
         setPhase("ERROR");
@@ -569,7 +578,6 @@ export function useUploadFlow() {
         return;
       }
 
-      // Enforce job quota BEFORE starting expensive processing
       try {
         assertJobQuotaOrThrow();
       } catch (e: any) {
@@ -580,13 +588,13 @@ export function useUploadFlow() {
       }
 
       setError(null);
+      setErrorCode(null);
       setWarning(null);
       setResult(null);
       setDownloadUrl(null);
 
       setBusy(true);
 
-      // Sync refs immediately so startPolling won't stall
       phaseRef.current = "PROCESSING";
       stageRef.current = "Queued";
 
@@ -597,11 +605,7 @@ export function useUploadFlow() {
       processingStartedAtRef.current = Date.now();
 
       try {
-        await JobService.start(jid, splitMb, precheckMode);
-
-        // ✅ COUNT 1 JOB only after Start succeeded
-        recordJobEvent(nowMs());
-
+        await JobService.start(jid, splitMb);
         startStatusStream(jid);
       } catch (e: any) {
         processingStartedRef.current = false;
@@ -675,6 +679,7 @@ export function useUploadFlow() {
     stageLabel,
     stageCode,
     error,
+    errorCode,
     warning,
     result,
     downloadUrl,

@@ -30,8 +30,6 @@ type StartJobResp = {
     stage?: string | null;
   };
 };
-type PrecheckMode = "NORMAL" | "HEAVY" | "EXTREME";
-
 export type StatusResp = {
   status: string;
   progress: number;
@@ -50,27 +48,6 @@ export type StatusResp = {
   warningText?: string | null;
 };
 
-export type PrecheckResp = {
-  tokenCost: 1 | 2 | 3;
-  mode: "NORMAL" | "HEAVY" | "EXTREME";
-  etaMinLow: number;
-  etaMinHigh: number;
-  estimatedCpuMinRaw?: number;
-  estimatedCpuMin?: number;
-  calibrationFactor?: number;
-  fileSizeMb: number;
-  pages: number | null;
-  avgMbPerPage: number | null;
-  confidence?: "HIGH" | "MEDIUM" | "LOW";
-  confidenceNote?: string;
-  recommendation?: string;
-  reason: string[];
-  /** Target-aware debug (optional) */
-  expectedParts?: number;
-  effectiveSplitMb?: number;
-  modeUsedForEstimate?: "SYSTEM" | "MANUAL";
-};
-
 type CreateArgs = {
   file: File;
 
@@ -85,7 +62,6 @@ type CreateArgs = {
 };
 
 const LS_OWNER_TOKEN = "goodpdf_last_owner_token";
-const LS_PRECHECK_CALIBRATION = "goodpdf_precheck_calibration_v1";
 
 function getOwnerToken(): string {
   try {
@@ -100,20 +76,6 @@ function ownerHeaders(extra?: Record<string, string>) {
   const h: Record<string, string> = { ...(extra || {}) };
   if (tok) h["x-owner-token"] = tok;
   return h;
-}
-
-function readPrecheckCalibrationFactor() {
-  const enableCal =
-    String(process.env.NEXT_PUBLIC_ENABLE_PRECHECK_CALIBRATION || "false").toLowerCase() ===
-    "true";
-  if (!enableCal) return 1;
-  try {
-    const raw = Number(localStorage.getItem(LS_PRECHECK_CALIBRATION) || "1");
-    if (!Number.isFinite(raw)) return 1;
-    return Math.max(0.65, Math.min(2.2, raw));
-  } catch {
-    return 1;
-  }
 }
 
 function assertOk<T>(res: JsonResp<T>, fallbackMsg: string) {
@@ -227,43 +189,14 @@ export class JobService {
   /**
    * 3) Start processing (✅ splitMb энд жинхэнээрээ ирнэ)
    */
-  static async start(
-    jobId: string,
-    splitMb: number,
-    precheckMode?: PrecheckMode
-  ): Promise<StartJobResp> {
+  static async start(jobId: string, splitMb: number): Promise<StartJobResp> {
     const res = await fetch("/api/jobs/start", {
       method: "POST",
       headers: ownerHeaders({ "content-type": "application/json" }),
-      body: JSON.stringify({ jobId, splitMb, precheckMode }),
+      body: JSON.stringify({ jobId, splitMb }),
     }).then((r) => readJson<StartJobResp>(r));
 
     return assertOk(res, "Start failed");
-  }
-
-  /**
-   * 3.5) Precheck before start (token + ETA hint)
-   * Pass mode + splitMb so ETA and HEAVY_HINT routing are target-aware.
-   */
-  static async precheck(
-    jobId: string,
-    opts?: { mode?: "SYSTEM" | "MANUAL"; splitMb?: number }
-  ): Promise<PrecheckResp> {
-    const calibrationFactor = readPrecheckCalibrationFactor();
-    const res = await fetch("/api/jobs/precheck", {
-      method: "POST",
-      headers: ownerHeaders({
-        "content-type": "application/json",
-        "x-precheck-calibration": String(calibrationFactor),
-      }),
-      body: JSON.stringify({
-        jobId,
-        mode: opts?.mode,
-        splitMb: opts?.splitMb,
-      }),
-    }).then((r) => readJson<PrecheckResp>(r));
-
-    return assertOk(res, "Precheck failed");
   }
 
   /**

@@ -18,9 +18,6 @@ export async function POST(req: Request) {
     const ownerToken = String(req.headers.get("x-owner-token") || "").trim();
 
     const splitMbRaw = Number(body?.splitMb);
-    const precheckModeRaw = String(body?.precheckMode || "").toUpperCase();
-    const wantsHeavyMode =
-      precheckModeRaw === "HEAVY" || precheckModeRaw === "EXTREME";
     if (!jobId) return jsonError("Missing jobId", 400);
     if (!ownerToken) return jsonError("Forbidden", 403);
     if (!Number.isFinite(splitMbRaw)) return jsonError("Invalid splitMb", 400);
@@ -57,8 +54,7 @@ export async function POST(req: Request) {
         updated_at: new Date().toISOString(),
         error: null,
         error_text: null,
-        // Non-fatal routing hint consumed by worker.
-        error_code: wantsHeavyMode ? "HEAVY_HINT" : null,
+        error_code: null,
       })
       .eq("id", jobId)
       .eq("owner_token", ownerToken);

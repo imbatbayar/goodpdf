@@ -81,6 +81,10 @@ export async function GET(req: Request) {
       status === "FAILED"
         ? (job.error_text ?? job.error ?? null)
         : null;
+    const errorCode =
+      status === "FAILED"
+        ? (job.error_code ?? null)
+        : null;
 
     return res(true, {
       id: job.id,
@@ -110,6 +114,7 @@ export async function GET(req: Request) {
 
       // messaging (IMPORTANT)
       errorText,     // only when FAILED
+      errorCode,     // only when FAILED (e.g. REFUSED_IMAGE_HEAVY, REFUSED_CORRUPT_PDF)
       warningText,   // only when DONE
     });
   } catch (e: any) {

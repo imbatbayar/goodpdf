@@ -23,6 +23,7 @@ function buildStatusPayload(job: any) {
   const zipPath = job?.output_zip_path ?? job?.zip_path ?? job?.output_path ?? null;
   const warningText = status === "DONE" ? (job?.warning_text ?? null) : null;
   const errorText = status === "FAILED" ? (job?.error_text ?? job?.error ?? null) : null;
+  const errorCode = status === "FAILED" ? (job?.error_code ?? null) : null;
 
   return {
     id: job?.id,
@@ -42,6 +43,7 @@ function buildStatusPayload(job: any) {
     cleaned: job?.cleaned_at != null || status === "CLEANED",
     doneAt: job?.done_at ?? null,
     errorText,
+    errorCode,
     warningText,
   };
 }
