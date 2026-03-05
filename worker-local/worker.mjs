@@ -166,10 +166,13 @@ const UX_SOFTSTOP_MS = Math.max(
   Math.min(UX_CAP_MS - 10_000, Number(process.env.UX_SOFTSTOP_MS || 150_000)),
 );
 
-// DEFAULT system-fit policy
+// DEFAULT system-fit policy: 9MB per part, ≤N parts (canonical 5; optionally 10 for rollout)
 const SYSTEM_MAX_PARTS = Number(process.env.SYSTEM_MAX_PARTS || 5);
 const SYSTEM_PART_MB = Number(process.env.SYSTEM_PART_MB || 9);
 const SYSTEM_PART_BYTES = Math.floor(SYSTEM_PART_MB * 1024 * 1024);
+const SYSTEM_TARGET_TOTAL_BYTES = Math.floor(
+  SYSTEM_MAX_PARTS * SYSTEM_PART_MB * 1024 * 1024 * 0.97,
+);
 const SYSTEM_TOTAL_CAP_BYTES = Math.floor(
   SYSTEM_PART_BYTES * SYSTEM_MAX_PARTS - 512 * 1024, // headroom
 );
@@ -1429,116 +1432,58 @@ async function processDefaultFast({
 
   const prePages = await qpdfPages(workPdf, expiresAtIso, qpdfWarnings);
   const preBytes = safeStatSize(workPdf) ?? safeStatSize(inPdf) ?? 0;
-  const targetTotalBytes = SYSTEM_PART_BYTES * SYSTEM_MAX_PARTS; // e.g. 9MB * 5 = 45MB
   let afterCompressBytes = preBytes;
 
-  const IMAGE_HEAVY_MB_PER_PAGE = 2;
-  if (prePages > 0 && preBytes > 0) {
-    const mbPerPage = preBytes / (1024 * 1024) / prePages;
-    if (mbPerPage > IMAGE_HEAVY_MB_PER_PAGE) {
-      const err = new Error("PDF is too image-heavy to process.");
-      err.code = "REFUSED_IMAGE_HEAVY";
-      throw err;
-    }
-  }
+  // Ensure total size <= SYSTEM_TARGET_TOTAL_BYTES before split; otherwise run up to 3 compression levels (time-boxed) or refuse.
+  const COMPRESS_PASSES = [
+    { label: "High (200/70)", dpi: 200, jpegQ: 70, pdfSettings: "/printer" },
+    { label: "Med (150/60)", dpi: 150, jpegQ: 60, pdfSettings: "/ebook" },
+    { label: "Low (120/50)", dpi: 120, jpegQ: 50, pdfSettings: "/screen" },
+  ];
+  const COMPRESS_PASS_TIMEOUT_MS = 120_000;
 
-  // Only compress when file exceeds one-part size; do not degrade quality to force multiple parts.
-  if (afterCompressBytes > SYSTEM_PART_BYTES && !softStop()) {
-    await updateJob(jobId, {
-      stage: "COMPRESS_HARDFIT",
-      progress: 22,
-      split_progress: 12,
-      updated_at: nowIso(),
-    });
-
-    const passPlan = buildHardFitPassPlan();
-    const normalPass = passPlan[0];
-    const rescuePass = passPlan[1];
-
-    const outNormal = path.join(wd, `.__hardfit_1_${rand6()}.pdf`);
-    const okNormal = await runGsWithHeartbeat({
-      jobId,
-      label: "compress: normal 110/50",
-      runFn: () =>
-        gsCompressOnce({
-          inPdf: workPdf,
-          outPdf: outNormal,
-          mode: "PRESET",
-          dpi: normalPass.dpi,
-          jpegQ: normalPass.jpegQ,
-          pdfSettings: normalPass.pdfSettings || "/ebook",
-          expiresAtIso,
-          timeoutMs: 120_000,
-        }),
-    });
-    if (okNormal) {
-      const outBytes = safeStatSize(outNormal) ?? 0;
-      if (outBytes > 0) {
-        workPdf = outNormal;
-        afterCompressBytes = outBytes;
-      }
-    }
-    tmark(T, "gs1");
-
-    const idealParts = Math.ceil(afterCompressBytes / SYSTEM_PART_BYTES);
-    const needRescue = idealParts > SYSTEM_MAX_PARTS;
-
-    if (needRescue && !softStop() && rescuePass) {
-      const outRescue = path.join(wd, `.__hardfit_2_${rand6()}.pdf`);
-      const okRescue = await runGsWithHeartbeat({
+  if (afterCompressBytes > SYSTEM_TARGET_TOTAL_BYTES && !softStop()) {
+    for (const pass of COMPRESS_PASSES) {
+      if (afterCompressBytes <= SYSTEM_TARGET_TOTAL_BYTES) break;
+      await updateJob(jobId, {
+        stage: "COMPRESS_HARDFIT",
+        progress: 22,
+        split_progress: 12,
+        updated_at: nowIso(),
+      });
+      const outPath = path.join(wd, `.__target_fit_${pass.label.replace(/\s+/g, "_")}_${rand6()}.pdf`);
+      const ok = await runGsWithHeartbeat({
         jobId,
-        label: "compress: rescue 85/45",
+        label: `compress: ${pass.label}`,
         runFn: () =>
           gsCompressOnce({
             inPdf: workPdf,
-            outPdf: outRescue,
+            outPdf: outPath,
             mode: "PRESET",
-            dpi: rescuePass.dpi,
-            jpegQ: rescuePass.jpegQ,
-            pdfSettings: rescuePass.pdfSettings || "/screen",
+            dpi: pass.dpi,
+            jpegQ: pass.jpegQ,
+            pdfSettings: pass.pdfSettings,
             expiresAtIso,
-            timeoutMs: 120_000,
+            timeoutMs: COMPRESS_PASS_TIMEOUT_MS,
           }),
       });
-      if (okRescue) {
-        const outBytes = safeStatSize(outRescue) ?? 0;
-        if (outBytes > 0) {
-          workPdf = outRescue;
+      if (ok) {
+        const outBytes = safeStatSize(outPath) ?? 0;
+        if (outBytes > 0 && outBytes < afterCompressBytes) {
+          workPdf = outPath;
           afterCompressBytes = outBytes;
+          if (afterCompressBytes <= SYSTEM_TARGET_TOTAL_BYTES) break;
         }
       }
-      tmark(T, "gs2");
     }
-  }
-
-  const MAX_PARTS_HARD_CEIL = 30;
-  let hardPartsNeeded = Math.ceil(afterCompressBytes / SYSTEM_PART_BYTES);
-  if (hardPartsNeeded > MAX_PARTS_HARD_CEIL && !softStop()) {
-    const outTurbo = path.join(wd, `.__hardfit_turbo_${rand6()}.pdf`);
-    const okTurbo = await runGsWithHeartbeat({
-      jobId,
-      label: "compress: turbo 72/35 (pre-split)",
-      runFn: () =>
-        gsCompressOnce({
-          inPdf: workPdf,
-          outPdf: outTurbo,
-          mode: "PRESET",
-          dpi: 72,
-          jpegQ: 35,
-          pdfSettings: "/screen",
-          expiresAtIso,
-          timeoutMs: 180_000,
-        }),
-    });
-    if (okTurbo) {
-      const outBytes = safeStatSize(outTurbo) ?? 0;
-      if (outBytes > 0) {
-        workPdf = outTurbo;
-        afterCompressBytes = outBytes;
-        hardPartsNeeded = Math.ceil(afterCompressBytes / SYSTEM_PART_BYTES);
-      }
+    if (afterCompressBytes > SYSTEM_TARGET_TOTAL_BYTES) {
+      const err = new Error(
+        "This PDF could not be reduced to fit within the size limit. Try a larger target size per part, or use a less image-heavy file.",
+      );
+      err.code = "REFUSED_IMAGE_HEAVY";
+      throw err;
     }
-    tmark(T, "gs_turbo");
+    tmark(T, "compress");
   }
 
   await updateJob(jobId, {
@@ -1551,10 +1496,7 @@ async function processDefaultFast({
   const targetBytes = Math.floor(
     SYSTEM_PART_BYTES * (heavyLane ? HEAVY_TARGET_MARGIN : 0.985),
   ); // per-part cap 9MB
-  hardPartsNeeded = Math.ceil(afterCompressBytes / SYSTEM_PART_BYTES);
-  let maxPartsForSplit = Math.max(SYSTEM_MAX_PARTS, hardPartsNeeded);
-  if (maxPartsForSplit > MAX_PARTS_HARD_CEIL) maxPartsForSplit = MAX_PARTS_HARD_CEIL;
-
+  const maxPartsForSplit = SYSTEM_MAX_PARTS;
   const maxParts = SYSTEM_MAX_PARTS;
 
   const wipePartsDir = () => {
@@ -1646,9 +1588,6 @@ async function processDefaultFast({
   tmark(T, "split");
 
   const partsCount = (res.partMeta && res.partMeta.length) || 0;
-  if (partsCount > SYSTEM_MAX_PARTS) {
-    res.warningMessage = `Best effort: required ${partsCount} files to keep each file <=9MB for this PDF.`;
-  }
   if (qpdfWarnings.length) {
     const qpdfMsg = qpdfWarnings.join("\n").slice(0, 2000).trim();
     res.warningMessage = res.warningMessage ? `${res.warningMessage}\n${qpdfMsg}` : qpdfMsg;
@@ -1712,15 +1651,14 @@ async function processDefaultFast({
 
   tmark(T, "end");
   const qpdfMs = td(T, "start", "qpdf");
-  const gs1Ms = T.gs1 != null ? td(T, "qpdf", "gs1") : 0;
-  const gs2Ms = T.gs2 != null ? td(T, "gs1", "gs2") : 0;
-  const splitStart = T.gs2 != null ? "gs2" : T.gs1 != null ? "gs1" : "qpdf";
+  const compressMs = T.compress != null ? td(T, "qpdf", "compress") : 0;
+  const splitStart = T.compress != null ? "compress" : "qpdf";
   const splitMs = td(T, splitStart, "split");
   const totalMs = td(T, "start", "end");
   const partsN = (res.partMeta && res.partMeta.length) || 0;
   const bytesOut = (res.partMeta || []).reduce((s, m) => s + (Number(m?.bytes) || 0), 0);
   console.log(
-    `[timing] qpdf=${qpdfMs}ms gs1=${gs1Ms}ms gs2=${gs2Ms}ms split=${splitMs}ms total=${totalMs}ms parts=${partsN} bytes_in=${preInBytes} bytes_out=${bytesOut}`,
+    `[timing] qpdf=${qpdfMs}ms compress=${compressMs}ms split=${splitMs}ms total=${totalMs}ms parts=${partsN} bytes_in=${preInBytes} bytes_out=${bytesOut}`,
   );
 
   return res;
@@ -1880,14 +1818,7 @@ async function processOneJob(job) {
       ? partBytes.reduce((a, b) => a + b, 0)
       : null;
     const maxPartB = partBytes.length ? Math.max(...partBytes) : null;
-    const warningText =
-      systemFit &&
-      (res.warningMessage ||
-        ((res.partFiles?.length || 0) > SYSTEM_MAX_PARTS ||
-          (typeof maxPartB === "number" && maxPartB > SYSTEM_PART_BYTES)))
-        ? (res.warningMessage ||
-            `Best effort output: could not fully fit <=${SYSTEM_PART_MB}MB within ${SYSTEM_MAX_PARTS} files for this PDF.`)
-        : null;
+    const warningText = systemFit && res.warningMessage ? res.warningMessage : null;
 
     const tFinalize = Date.now();
     await updateJob(jobId, {

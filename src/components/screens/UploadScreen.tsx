@@ -178,7 +178,7 @@ function stageDotClass(state: StepState) {
 function refusalMessage(errorCode?: string | null, fallback?: string | null): string {
   const code = String(errorCode || "").toUpperCase();
   if (code === "REFUSED_CORRUPT_PDF") return "PDF is corrupt or invalid.";
-  if (code === "REFUSED_IMAGE_HEAVY") return "PDF is too image-heavy to process.";
+  if (code === "REFUSED_IMAGE_HEAVY") return "This PDF could not be reduced to fit within the default size limit (9MB, up to 5 parts). Try a larger target size per part in Manual mode, or use a less image-heavy file.";
   return fallback || "Something went wrong.";
 }
 
