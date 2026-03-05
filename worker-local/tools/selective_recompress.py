@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 import json
@@ -8,22 +9,13 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import pikepdf
 from PIL import Image
 
-TARGET_BYTES = 45 * 1024 * 1024
-
-# SPEED knobs
-TOP_K = 60                     # зөвхөн хамгийн том 60 image stream
-MIN_STREAM_BYTES = 350 * 1024  # 350KB-с жижиг stream дээр оролдохгүй
 WORKERS = max(2, (os.cpu_count() or 4) - 1)  # CPU-1
 
 # QUALITY floors
-MAX_SIDE_DEFAULT = 1500
-MAX_SIDE_RESCUE = 1300
-JPEG_Q_DEFAULT = 40
-JPEG_Q_RESCUE = 35
 MIN_SIDE_FLOOR = 1200
 MIN_Q_FLOOR = 35
 
-# Heuristic: already-small JPEG бол алгасна
+# Heuristic: already-small JPEG бол алгасна (can be disabled via --force)
 SKIP_JPEG_IF_PIXELS_LT = 1_000_000
 SKIP_JPEG_IF_BYTES_LT = 2_000_000
 
@@ -40,14 +32,14 @@ def _resize(img: Image.Image, max_side: int) -> Image.Image:
 
 def _recompress_one(payload):
     """
-    payload = (sha1, data, w, h, filt, max_side, q)
+    payload = (sha1, data, w, h, filt, max_side, q, force)
     return (sha1, new_bytes or None)
     """
-    sha1, data, w, h, filt, max_side, q = payload
+    sha1, data, w, h, filt, max_side, q, force = payload
 
     try:
-        # JPEG small enough => skip
-        if "DCTDecode" in filt and w and h:
+        # JPEG small enough => skip (unless force=true)
+        if not force and "DCTDecode" in filt and w and h:
             if (w * h) < SKIP_JPEG_IF_PIXELS_LT and len(data) < SKIP_JPEG_IF_BYTES_LT:
                 return (sha1, None)
 
@@ -70,7 +62,7 @@ def _recompress_one(payload):
         return (sha1, None)
 
 
-def _collect_images(pdf: pikepdf.Pdf):
+def _collect_images(pdf: pikepdf.Pdf, min_stream_bytes: int):
     """
     Return list of unique images by sha1(stream_bytes) with metadata:
     {sha1: {"xobjs":[xobj,...], "len":N, "w":w, "h":h, "filt":str}}
@@ -90,7 +82,7 @@ def _collect_images(pdf: pikepdf.Pdf):
                 if xobj.get("/Subtype") != "/Image":
                     continue
                 data = xobj.read_bytes()
-                if len(data) < MIN_STREAM_BYTES:
+                if len(data) < min_stream_bytes:
                     continue
 
                 w = int(xobj.get("/Width", 0) or 0)
@@ -132,17 +124,17 @@ def _apply_results(imgmap, results):
     return changed
 
 
-def recompress_topk_parallel(pdf: pikepdf.Pdf, max_side: int, q: int) -> int:
-    imgmap = _collect_images(pdf)
+def recompress_topk_parallel(pdf: pikepdf.Pdf, max_side: int, q: int, top_k: int, min_stream_bytes: int, force: bool) -> int:
+    imgmap = _collect_images(pdf, min_stream_bytes=min_stream_bytes)
 
-    # sort by stream bytes desc, take TOP_K
-    items = sorted(imgmap.items(), key=lambda kv: kv[1]["len"], reverse=True)[
-        :TOP_K]
+    # sort by stream bytes desc, take top_k
+    items = sorted(imgmap.items(), key=lambda kv: kv[1]["len"], reverse=True)[:top_k]
 
     payloads = []
     for sha1, meta in items:
         payloads.append(
-            (sha1, meta["data"], meta["w"], meta["h"], meta["filt"], max_side, q))
+            (sha1, meta["data"], meta["w"], meta["h"], meta["filt"], max_side, q, force)
+        )
 
     results = {}
     # PARALLEL
@@ -165,39 +157,64 @@ def recompress_topk_parallel(pdf: pikepdf.Pdf, max_side: int, q: int) -> int:
 
 
 def main():
-    if len(sys.argv) < 3:
-        print("Usage: python selective_recompress.py input.pdf output.pdf")
-        sys.exit(1)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input")
+    parser.add_argument("output")
+    parser.add_argument("--target_mb", type=float, default=45.0)
+    parser.add_argument("--top_k", type=int, default=220)
+    parser.add_argument("--min_stream_kb", type=int, default=200)
+    parser.add_argument("--max_side", type=int, default=1100)
+    parser.add_argument("--jpeg_q", type=int, default=28)
+    parser.add_argument("--passes", type=int, default=2)
+    parser.add_argument("--force", action="store_true", default=False)
 
-    inp = sys.argv[1]
-    out = sys.argv[2]
+    args = parser.parse_args()
+
+    inp = args.input
+    out = args.output
+
+    target_bytes = int(args.target_mb * 1024 * 1024)
+    top_k = max(1, int(args.top_k))
+    min_stream_bytes = max(0, int(args.min_stream_kb * 1024))
+    max_side = int(args.max_side)
+    jpeg_q = int(args.jpeg_q)
+    passes = max(1, int(args.passes))
+    force = bool(args.force)
 
     before = os.path.getsize(inp)
     images_touched = 0
-    rescue_used = False
+    passes_run = 0
 
-    # PASS 1
-    with pikepdf.open(inp) as pdf:
-        images_touched += recompress_topk_parallel(
-            pdf, MAX_SIDE_DEFAULT, JPEG_Q_DEFAULT)
-        pdf.save(out)
+    cur_in = inp
+    tmp_out = out
 
-    after = os.path.getsize(out)
-    if after <= TARGET_BYTES:
-        print(json.dumps({"before_bytes": before, "after_bytes": after,
-              "images_touched": images_touched, "rescue_used": False}))
-        return
+    for _ in range(passes):
+        passes_run += 1
+        with pikepdf.open(cur_in) as pdf:
+            images_touched += recompress_topk_parallel(
+                pdf,
+                max_side=max_side,
+                q=jpeg_q,
+                top_k=top_k,
+                min_stream_bytes=min_stream_bytes,
+                force=force,
+            )
+            pdf.save(tmp_out)
 
-    # PASS 2 (rescue once)
-    rescue_used = True
-    with pikepdf.open(out) as pdf:
-        images_touched += recompress_topk_parallel(
-            pdf, MAX_SIDE_RESCUE, JPEG_Q_RESCUE)
-        pdf.save(out)
+        after = os.path.getsize(tmp_out)
+        if after <= target_bytes:
+            break
 
-    after2 = os.path.getsize(out)
-    print(json.dumps({"before_bytes": before, "after_bytes": after2,
-          "images_touched": images_touched, "rescue_used": rescue_used}))
+        # next pass uses previous output as input
+        cur_in = tmp_out
+
+    summary = {
+        "before_bytes": before,
+        "after_bytes": os.path.getsize(tmp_out),
+        "images_touched": images_touched,
+        "passes_run": passes_run,
+    }
+    print(json.dumps(summary))
 
 
 if __name__ == "__main__":

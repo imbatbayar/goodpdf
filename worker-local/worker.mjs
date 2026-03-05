@@ -178,23 +178,24 @@ const UX_SOFTSTOP_MS = Math.max(
   Math.min(UX_CAP_MS - 10_000, Number(process.env.UX_SOFTSTOP_MS || 150_000)),
 );
 
-// DEFAULT system-fit policy: 9MB per part, ≤N parts (canonical 5; optionally 10 for rollout)
-const SYSTEM_MAX_PARTS = Number(process.env.SYSTEM_MAX_PARTS || 5);
+// DEFAULT system-fit policy: 9MB per part
 const SYSTEM_PART_MB = Number(process.env.SYSTEM_PART_MB || 9);
 const SYSTEM_PART_BYTES = Math.floor(SYSTEM_PART_MB * 1024 * 1024);
+// Legacy compat cap (used for some env-driven knobs; Manual mode can override)
+const SYSTEM_MAX_PARTS = Number(process.env.SYSTEM_MAX_PARTS || 5);
+// DEFAULT ladder/goal: aim for ~5×9MB ≈ 45MB total
+const SYSTEM_TARGET_PARTS_GOAL = 5;
+const SYSTEM_MAX_PARTS_DEFAULT = 10; // hard cap for DEFAULT; Manual can exceed this
 const SYSTEM_TARGET_TOTAL_BYTES = Math.floor(
-  SYSTEM_MAX_PARTS * SYSTEM_PART_MB * 1024 * 1024 * 0.97,
+  SYSTEM_TARGET_PARTS_GOAL * SYSTEM_PART_BYTES * 0.97,
 );
 const SYSTEM_DEFAULT_MAX_INPUT_BYTES = 500 * 1024 * 1024; // 500MB hard cap for DEFAULT
 const SYSTEM_TOTAL_CAP_BYTES = Math.floor(
-  SYSTEM_PART_BYTES * SYSTEM_MAX_PARTS - 512 * 1024, // headroom
+  SYSTEM_PART_BYTES * SYSTEM_MAX_PARTS_DEFAULT - 512 * 1024, // headroom
 );
 const SYSTEM_TOTAL_FLOOR_MB = Math.max(
   10,
-  Math.min(
-    SYSTEM_PART_MB * SYSTEM_MAX_PARTS,
-    Number(process.env.SYSTEM_TOTAL_FLOOR_MB || 40),
-  ),
+  Math.min(SYSTEM_PART_MB * SYSTEM_MAX_PARTS_DEFAULT, Number(process.env.SYSTEM_TOTAL_FLOOR_MB || 40)),
 );
 const SYSTEM_TOTAL_FLOOR_BYTES = Math.floor(
   SYSTEM_TOTAL_FLOOR_MB * 1024 * 1024,
@@ -1485,6 +1486,55 @@ async function processDefaultFast({
   const preBytes = safeStatSize(workPdf) ?? safeStatSize(inPdf) ?? 0;
   let afterCompressBytes = preBytes;
 
+  // Optional Python-based image recompress lane (DEFAULT only, large PDFs).
+  if (preBytes >= 200 * 1024 * 1024) {
+    try {
+      const tmpRe = path.join(wd, `.__pyre_${rand6()}.pdf`);
+      const pyArgs = [
+        path.join(__dirname, "tools", "selective_recompress.py"),
+        workPdf,
+        tmpRe,
+        "--target_mb",
+        "45",
+        "--top_k",
+        "220",
+        "--min_stream_kb",
+        "200",
+        "--max_side",
+        "1100",
+        "--jpeg_q",
+        "28",
+        "--passes",
+        "3",
+        "--force",
+      ];
+      const tPy = boundedTimeout(180_000, expiresAtIso, 30_000, 180_000);
+      const pyRes = await runCmd("python", pyArgs, tPy, {}, [0]);
+      let summary = null;
+      try {
+        summary = JSON.parse(pyRes.out.trim() || "{}");
+      } catch {
+        summary = null;
+      }
+      const beforeB = safeStatSize(workPdf) ?? preBytes;
+      const afterB = safeStatSize(tmpRe) ?? beforeB;
+      if (afterB > 0 && afterB < beforeB) {
+        fs.renameSync(tmpRe, workPdf);
+        afterCompressBytes = afterB;
+      } else {
+        safeUnlink(tmpRe);
+      }
+      console.log("[PY_RECOMPRESS]", {
+        before: beforeB,
+        after: afterCompressBytes,
+        images_touched: summary?.images_touched ?? null,
+        passes_run: summary?.passes_run ?? null,
+      });
+    } catch (e) {
+      console.warn("[PY_RECOMPRESS] failed:", e?.message || e);
+    }
+  }
+
   // Achieved stage ladder for DEFAULT:
   // - A_TARGET_MET: total size <= targetA
   // - B_TARGET_RELAXED: total size <= targetB and some compression succeeded
@@ -1597,14 +1647,22 @@ async function processDefaultFast({
     updated_at: nowIso(),
   });
 
-  // DEFAULT split sizing (best-effort, ≤ SYSTEM_MAX_PARTS parts):
-  // - maxParts = SYSTEM_MAX_PARTS (default 5).
-  // - desiredPerPart = ceil(afterCompressBytes / maxParts).
-  // - targetBytes = max(SYSTEM_PART_BYTES, desiredPerPart).
-  const maxParts = SYSTEM_MAX_PARTS;
-  const desiredPerPart = Math.ceil(afterCompressBytes / Math.max(1, maxParts));
-  const targetBytes = Math.max(SYSTEM_PART_BYTES, desiredPerPart);
-  const maxPartsForSplit = maxParts;
+  // DEFAULT split sizing (best-effort, ≤ SYSTEM_MAX_PARTS_DEFAULT parts):
+  // Decide parts AFTER compression using the ladder:
+  // - If total <= SYSTEM_TARGET_TOTAL_BYTES: aim for ≤5 parts (goal), near 9MB each.
+  // - Otherwise: allow up to 10 parts, still near 9MB.
+  let parts = 1;
+  if (afterCompressBytes <= SYSTEM_TARGET_TOTAL_BYTES) {
+    const ideal = Math.ceil(afterCompressBytes / SYSTEM_PART_BYTES);
+    parts = Math.min(SYSTEM_TARGET_PARTS_GOAL, Math.max(1, ideal));
+  } else {
+    const ideal = Math.ceil(afterCompressBytes / SYSTEM_PART_BYTES);
+    parts = Math.min(SYSTEM_MAX_PARTS_DEFAULT, Math.max(1, ideal));
+  }
+
+  // targetBytes ~ equal chunks; clamp min to 4MB so we don't create tiny parts on small PDFs.
+  const targetBytes = Math.max(4 * 1024 * 1024, Math.ceil(afterCompressBytes / parts));
+  const maxPartsForSplit = parts;
 
   const wipePartsDir = () => {
     try {
@@ -1706,10 +1764,17 @@ async function processDefaultFast({
   }
   if (preInBytes >= 200 * 1024 * 1024) {
     const qualityMsg =
-      "Large PDF: default mode may reduce quality to reach size goals. Use Manual for higher quality.";
+      "Large PDF: default mode may reduce quality to reach ~45MB. If not reachable, we split near 9MB with up to 10 parts.";
     res.warningMessage = res.warningMessage
       ? `${qualityMsg}\n${res.warningMessage}`
       : qualityMsg;
+  }
+  if (partsCount >= SYSTEM_MAX_PARTS_DEFAULT) {
+    const partsMsg =
+      "Reached default max of 10 parts. Use Manual for finer splitting or Compress tool.";
+    res.warningMessage = res.warningMessage
+      ? `${partsMsg}\n${res.warningMessage}`
+      : partsMsg;
   }
   if (qpdfWarnings.length) {
     const qpdfMsg = qpdfWarnings.join("\n").slice(0, 2000).trim();
@@ -1803,6 +1868,15 @@ async function processDefaultFast({
     aggressiveLane,
     inputBytes: preInBytes,
     parts: partsN,
+  });
+
+  console.log("[DEFAULT_POLICY]", {
+    jobId,
+    inputBytes: preInBytes,
+    afterCompressBytes,
+    targetTotal: SYSTEM_TARGET_TOTAL_BYTES,
+    parts: partsN,
+    maxPartsDefault: SYSTEM_MAX_PARTS_DEFAULT,
   });
 
   console.log(
