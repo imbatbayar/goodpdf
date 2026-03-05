@@ -578,21 +578,6 @@ export function useUploadFlow() {
         return;
       }
 
-      // Large DEFAULT/system warning (pre-start): surface canonical message but do not block.
-      if (mode === "SYSTEM") {
-        try {
-          const st = await JobService.status(jid);
-          const size = (st as any).fileSizeBytes ?? (st as any).fileSizeBytes ?? null;
-          if (typeof size === "number" && size >= 200 * 1024 * 1024) {
-            setWarning(
-              "Large PDF: default mode may reduce quality to reach ~45MB. If not reachable, we split near 9MB with up to 10 parts."
-            );
-          }
-        } catch {
-          // best-effort; ignore status failures here
-        }
-      }
-
       try {
         assertJobQuotaOrThrow();
       } catch (e: any) {
@@ -604,7 +589,6 @@ export function useUploadFlow() {
 
       setError(null);
       setErrorCode(null);
-      setWarning(null);
       setResult(null);
       setDownloadUrl(null);
 

@@ -250,10 +250,22 @@ export function UploadScreen() {
     return { name: file.name, mb: Math.round(mb * 100) / 100 };
   }, [file]);
 
+  const systemFileBytes = mode === "SYSTEM" && file ? file.size : 0;
+  const isSystemLarge200 =
+    mode === "SYSTEM" &&
+    typeof systemFileBytes === "number" &&
+    systemFileBytes >= 200 * 1024 * 1024 &&
+    systemFileBytes <= 500 * 1024 * 1024;
+  const isSystemOver500 =
+    mode === "SYSTEM" &&
+    typeof systemFileBytes === "number" &&
+    systemFileBytes > 500 * 1024 * 1024;
+
   const canStart =
     !!file &&
     !flow.busy &&
     flow.phase === "UPLOADED" &&
+    !isSystemOver500 &&
     (mode === "SYSTEM" || splitValid.ok);
 
   const canDownload = !flow.busy && flow.phase === "READY";
@@ -641,6 +653,20 @@ export function UploadScreen() {
 
               <Card>
                 <div className="grid gap-3">
+                  {mode === "SYSTEM" && file ? (
+                    <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
+                      {isSystemOver500 ? (
+                        <span>
+                          Default supports up to 500MB. Use Manual split or a separate Compress tool for larger files.
+                        </span>
+                      ) : isSystemLarge200 ? (
+                        <span>
+                          Large PDF (200MB+): Default will aggressively compress toward ~45MB to fit email/portal limits. Quality may noticeably decrease. For higher quality, use Manual.
+                        </span>
+                      ) : null}
+                    </div>
+                  ) : null}
+
                   <div className="flex items-center justify-between gap-3">
                     <div className="font-semibold text-zinc-900">
                       {mode === "SYSTEM" ? "System-fit" : "Target size per part"}
