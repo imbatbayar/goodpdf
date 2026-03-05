@@ -1435,11 +1435,21 @@ async function processDefaultFast({
   let afterCompressBytes = preBytes;
 
   // Achieved stage ladder for DEFAULT:
-  // - A_TARGET_MET: total size <= SYSTEM_TARGET_TOTAL_BYTES
-  // - C_TARGET_RELAXED: some compression succeeded but still above target
+  // - A_TARGET_MET: total size <= targetA
+  // - B_TARGET_RELAXED: total size <= targetB and some compression succeeded
+  // - C_TARGET_RELAXED: total size <= targetC or shrank but still above C
   // - D_RESCUE_SPLIT_ONLY: split-only (no effective compression)
+  const targetA = SYSTEM_TARGET_TOTAL_BYTES;
+  const targetB = Math.floor(targetA * 1.6);
+  const targetC = Math.floor(targetA * 2.5);
   let achievedStage =
-    afterCompressBytes <= SYSTEM_TARGET_TOTAL_BYTES ? "A_TARGET_MET" : "D_RESCUE_SPLIT_ONLY";
+    afterCompressBytes <= targetA
+      ? "A_TARGET_MET"
+      : afterCompressBytes <= targetB
+        ? "B_TARGET_RELAXED"
+        : afterCompressBytes <= targetC
+          ? "C_TARGET_RELAXED"
+          : "D_RESCUE_SPLIT_ONLY";
   let anyShrink = false;
 
   // Ensure total size <= SYSTEM_TARGET_TOTAL_BYTES before split; otherwise run up to 3 compression
@@ -1451,9 +1461,9 @@ async function processDefaultFast({
   ];
   const COMPRESS_PASS_TIMEOUT_MS = 120_000;
 
-  if (afterCompressBytes > SYSTEM_TARGET_TOTAL_BYTES && !softStop()) {
+  if (afterCompressBytes > targetA && !softStop()) {
     for (const pass of COMPRESS_PASSES) {
-      if (afterCompressBytes <= SYSTEM_TARGET_TOTAL_BYTES || softStop()) break;
+      if (afterCompressBytes <= targetA || softStop()) break;
       await updateJob(jobId, {
         stage: "COMPRESS_HARDFIT",
         progress: 22,
@@ -1485,13 +1495,17 @@ async function processDefaultFast({
           workPdf = outPath;
           afterCompressBytes = outBytes;
           anyShrink = true;
-          if (afterCompressBytes <= SYSTEM_TARGET_TOTAL_BYTES) break;
+          if (afterCompressBytes <= targetA) break;
         }
       }
     }
 
-    if (afterCompressBytes <= SYSTEM_TARGET_TOTAL_BYTES) {
+    if (afterCompressBytes <= targetA) {
       achievedStage = "A_TARGET_MET";
+    } else if (anyShrink && afterCompressBytes <= targetB) {
+      achievedStage = "B_TARGET_RELAXED";
+    } else if (anyShrink && afterCompressBytes <= targetC) {
+      achievedStage = "C_TARGET_RELAXED";
     } else if (anyShrink) {
       achievedStage = "C_TARGET_RELAXED";
     } else {
@@ -1681,6 +1695,18 @@ async function processDefaultFast({
   const totalMs = td(T, "start", "end");
   const partsN = (res.partMeta && res.partMeta.length) || 0;
   const bytesOut = (res.partMeta || []).reduce((s, m) => s + (Number(m?.bytes) || 0), 0);
+
+  const ladderTargetA = SYSTEM_TARGET_TOTAL_BYTES;
+  const ladderTargetB = Math.floor(ladderTargetA * 1.6);
+  const ladderTargetC = Math.floor(ladderTargetA * 2.5);
+
+  console.log("[DEFAULT_LADDER]", {
+    targetA: ladderTargetA,
+    targetB: ladderTargetB,
+    targetC: ladderTargetC,
+    afterCompressBytes,
+    achievedStage,
+  });
 
   console.log("[DEFAULT_STAGE]", {
     jobId,
