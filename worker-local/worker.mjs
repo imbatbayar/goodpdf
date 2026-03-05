@@ -1434,7 +1434,16 @@ async function processDefaultFast({
   const preBytes = safeStatSize(workPdf) ?? safeStatSize(inPdf) ?? 0;
   let afterCompressBytes = preBytes;
 
-  // Ensure total size <= SYSTEM_TARGET_TOTAL_BYTES before split; otherwise run up to 3 compression levels (time-boxed) or refuse.
+  // Achieved stage ladder for DEFAULT:
+  // - A_TARGET_MET: total size <= SYSTEM_TARGET_TOTAL_BYTES
+  // - C_TARGET_RELAXED: some compression succeeded but still above target
+  // - D_RESCUE_SPLIT_ONLY: split-only (no effective compression)
+  let achievedStage =
+    afterCompressBytes <= SYSTEM_TARGET_TOTAL_BYTES ? "A_TARGET_MET" : "D_RESCUE_SPLIT_ONLY";
+  let anyShrink = false;
+
+  // Ensure total size <= SYSTEM_TARGET_TOTAL_BYTES before split; otherwise run up to 3 compression
+  // levels (time-boxed) and then proceed best-effort (no size-based refusal).
   const COMPRESS_PASSES = [
     { label: "High (200/70)", dpi: 200, jpegQ: 70, pdfSettings: "/printer" },
     { label: "Med (150/60)", dpi: 150, jpegQ: 60, pdfSettings: "/ebook" },
@@ -1444,14 +1453,17 @@ async function processDefaultFast({
 
   if (afterCompressBytes > SYSTEM_TARGET_TOTAL_BYTES && !softStop()) {
     for (const pass of COMPRESS_PASSES) {
-      if (afterCompressBytes <= SYSTEM_TARGET_TOTAL_BYTES) break;
+      if (afterCompressBytes <= SYSTEM_TARGET_TOTAL_BYTES || softStop()) break;
       await updateJob(jobId, {
         stage: "COMPRESS_HARDFIT",
         progress: 22,
         split_progress: 12,
         updated_at: nowIso(),
       });
-      const outPath = path.join(wd, `.__target_fit_${pass.label.replace(/\s+/g, "_")}_${rand6()}.pdf`);
+      const outPath = path.join(
+        wd,
+        `.__target_fit_${pass.label.replace(/\s+/g, "_")}_${rand6()}.pdf`,
+      );
       const ok = await runGsWithHeartbeat({
         jobId,
         label: `compress: ${pass.label}`,
@@ -1472,17 +1484,20 @@ async function processDefaultFast({
         if (outBytes > 0 && outBytes < afterCompressBytes) {
           workPdf = outPath;
           afterCompressBytes = outBytes;
+          anyShrink = true;
           if (afterCompressBytes <= SYSTEM_TARGET_TOTAL_BYTES) break;
         }
       }
     }
-    if (afterCompressBytes > SYSTEM_TARGET_TOTAL_BYTES) {
-      const err = new Error(
-        "This PDF could not be reduced to fit within the size limit. Try a larger target size per part, or use a less image-heavy file.",
-      );
-      err.code = "REFUSED_IMAGE_HEAVY";
-      throw err;
+
+    if (afterCompressBytes <= SYSTEM_TARGET_TOTAL_BYTES) {
+      achievedStage = "A_TARGET_MET";
+    } else if (anyShrink) {
+      achievedStage = "C_TARGET_RELAXED";
+    } else {
+      achievedStage = "D_RESCUE_SPLIT_ONLY";
     }
+
     tmark(T, "compress");
   }
 
@@ -1493,11 +1508,14 @@ async function processDefaultFast({
     updated_at: nowIso(),
   });
 
-  const targetBytes = Math.floor(
-    SYSTEM_PART_BYTES * (heavyLane ? HEAVY_TARGET_MARGIN : 0.985),
-  ); // per-part cap 9MB
-  const maxPartsForSplit = SYSTEM_MAX_PARTS;
+  // DEFAULT split sizing (best-effort, ≤ SYSTEM_MAX_PARTS parts):
+  // - maxParts = SYSTEM_MAX_PARTS (default 5).
+  // - desiredPerPart = ceil(afterCompressBytes / maxParts).
+  // - targetBytes = max(SYSTEM_PART_BYTES, desiredPerPart).
   const maxParts = SYSTEM_MAX_PARTS;
+  const desiredPerPart = Math.ceil(afterCompressBytes / Math.max(1, maxParts));
+  const targetBytes = Math.max(SYSTEM_PART_BYTES, desiredPerPart);
+  const maxPartsForSplit = maxParts;
 
   const wipePartsDir = () => {
     try {
@@ -1588,6 +1606,12 @@ async function processDefaultFast({
   tmark(T, "split");
 
   const partsCount = (res.partMeta && res.partMeta.length) || 0;
+  if (achievedStage !== "A_TARGET_MET") {
+    const stageMsg = `Best effort delivered (${achievedStage}).`;
+    res.warningMessage = res.warningMessage
+      ? `${stageMsg}\n${res.warningMessage}`
+      : stageMsg;
+  }
   if (qpdfWarnings.length) {
     const qpdfMsg = qpdfWarnings.join("\n").slice(0, 2000).trim();
     res.warningMessage = res.warningMessage ? `${res.warningMessage}\n${qpdfMsg}` : qpdfMsg;
@@ -1657,6 +1681,15 @@ async function processDefaultFast({
   const totalMs = td(T, "start", "end");
   const partsN = (res.partMeta && res.partMeta.length) || 0;
   const bytesOut = (res.partMeta || []).reduce((s, m) => s + (Number(m?.bytes) || 0), 0);
+
+  console.log("[DEFAULT_STAGE]", {
+    jobId,
+    SYSTEM_TARGET_TOTAL_BYTES,
+    afterCompressBytes,
+    achievedStage,
+    parts: partsN,
+  });
+
   console.log(
     `[timing] qpdf=${qpdfMs}ms compress=${compressMs}ms split=${splitMs}ms total=${totalMs}ms parts=${partsN} bytes_in=${preInBytes} bytes_out=${bytesOut}`,
   );
