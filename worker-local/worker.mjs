@@ -55,10 +55,13 @@ const SEVEN_Z_EXE = resolve7zExe();
 // ----------------------
 const WORKER_ID =
   process.env.WORKER_ID || `worker_${crypto.randomBytes(3).toString("hex")}`;
-const WORKER_PROFILE = String(process.env.WORKER_PROFILE || "normal").toLowerCase();
+const WORKER_PROFILE = String(
+  process.env.WORKER_PROFILE || "normal",
+).toLowerCase();
 const IS_HEAVY_PROFILE = WORKER_PROFILE === "heavy";
 const NORMAL_CAN_PROCESS_HEAVY =
-  String(process.env.NORMAL_CAN_PROCESS_HEAVY || "true").toLowerCase() !== "false";
+  String(process.env.NORMAL_CAN_PROCESS_HEAVY || "true").toLowerCase() !==
+  "false";
 const QUEUE_STAGE = IS_HEAVY_PROFILE ? "QUEUE_HEAVY" : "QUEUE";
 const ACCEPTED_QUEUE_STAGES = IS_HEAVY_PROFILE
   ? ["QUEUE_HEAVY"]
@@ -94,7 +97,10 @@ const MAX_IDLE_BACKOFF_MS = Math.max(
   60_000,
   Math.min(120_000, Number(process.env.POLL_IDLE_MAX_MS) || 60_000),
 );
-const WORKER_IDLE_EXIT_MS = Math.max(0, Number(process.env.WORKER_IDLE_EXIT_MS || 0));
+const WORKER_IDLE_EXIT_MS = Math.max(
+  0,
+  Number(process.env.WORKER_IDLE_EXIT_MS || 0),
+);
 const CPU_CORES = Math.max(1, Number(os.cpus()?.length || 1));
 const CONCURRENCY = Math.max(
   1,
@@ -149,8 +155,14 @@ const GS_EXE = process.env.GS_EXE || "gs";
 const QPDF_EXE = process.env.QPDF_EXE || "qpdf";
 
 // Timeouts (bounded by expires_at too)
-const TIMEOUT_QPDF_MS = Math.max(10_000, Number(process.env.TIMEOUT_QPDF_MS || 120_000));
-const TIMEOUT_GS_MS = Math.max(10_000, Number(process.env.TIMEOUT_GS_MS || 75_000));
+const TIMEOUT_QPDF_MS = Math.max(
+  10_000,
+  Number(process.env.TIMEOUT_QPDF_MS || 120_000),
+);
+const TIMEOUT_GS_MS = Math.max(
+  10_000,
+  Number(process.env.TIMEOUT_GS_MS || 75_000),
+);
 const TIMEOUT_7Z_MS = Math.max(
   10_000,
   Number(process.env.TIMEOUT_7Z_MS || 120_000),
@@ -173,14 +185,20 @@ const SYSTEM_PART_BYTES = Math.floor(SYSTEM_PART_MB * 1024 * 1024);
 const SYSTEM_TARGET_TOTAL_BYTES = Math.floor(
   SYSTEM_MAX_PARTS * SYSTEM_PART_MB * 1024 * 1024 * 0.97,
 );
+const SYSTEM_DEFAULT_MAX_INPUT_BYTES = 500 * 1024 * 1024; // 500MB hard cap for DEFAULT
 const SYSTEM_TOTAL_CAP_BYTES = Math.floor(
   SYSTEM_PART_BYTES * SYSTEM_MAX_PARTS - 512 * 1024, // headroom
 );
 const SYSTEM_TOTAL_FLOOR_MB = Math.max(
   10,
-  Math.min(SYSTEM_PART_MB * SYSTEM_MAX_PARTS, Number(process.env.SYSTEM_TOTAL_FLOOR_MB || 40)),
+  Math.min(
+    SYSTEM_PART_MB * SYSTEM_MAX_PARTS,
+    Number(process.env.SYSTEM_TOTAL_FLOOR_MB || 40),
+  ),
 );
-const SYSTEM_TOTAL_FLOOR_BYTES = Math.floor(SYSTEM_TOTAL_FLOOR_MB * 1024 * 1024);
+const SYSTEM_TOTAL_FLOOR_BYTES = Math.floor(
+  SYSTEM_TOTAL_FLOOR_MB * 1024 * 1024,
+);
 const SYSTEM_TURBO_TRIGGER_MB = Math.max(
   20,
   Number(process.env.SYSTEM_TURBO_TRIGGER_MB || 80),
@@ -420,9 +438,10 @@ async function fetchQueue(limit = 1) {
 
 async function claimJob(jobId, queueStage = "QUEUE") {
   const claimOwner = `${WORKER_PROFILE}:${WORKER_ID}`;
-  const safeQueueStage = String(queueStage || "QUEUE").toUpperCase() === "QUEUE_HEAVY"
-    ? "QUEUE_HEAVY"
-    : "QUEUE";
+  const safeQueueStage =
+    String(queueStage || "QUEUE").toUpperCase() === "QUEUE_HEAVY"
+      ? "QUEUE_HEAVY"
+      : "QUEUE";
   const patch = {
     status: "PROCESSING",
     stage: safeQueueStage,
@@ -628,7 +647,13 @@ async function qpdfPages(inPdf, expiresAtIso, warnings = null) {
     boundedTimeout(TIMEOUT_QPDF_MS, expiresAtIso, 10_000, 60_000),
     25_000,
   );
-  const result = await runCmd(QPDF_EXE, ["--show-npages", inPdf], tQ, {}, [0, 3]);
+  const result = await runCmd(
+    QPDF_EXE,
+    ["--show-npages", inPdf],
+    tQ,
+    {},
+    [0, 3],
+  );
   if (result.exitCode === 3 && Array.isArray(warnings)) {
     warnings.push((result.err || "").trim().slice(0, 1000));
   }
@@ -693,7 +718,10 @@ function qpdfFastRecompress({ inPdf, outPdf }) {
       }
       if (code === 3) {
         // qpdf exit 3 = success_with_warning; capture stderr for warning_text
-        resolve({ ok: outBytes > 0, warning: (errText || "").trim().slice(0, 1000) });
+        resolve({
+          ok: outBytes > 0,
+          warning: (errText || "").trim().slice(0, 1000),
+        });
         return;
       }
 
@@ -726,12 +754,10 @@ function buildEqualRanges(pages, parts) {
   return ranges;
 }
 
-async function estimatePageBytes({
-  inPdf,
-  pages,
-  probeDir,
-  expiresAtIso,
-}, warnings = null) {
+async function estimatePageBytes(
+  { inPdf, pages, probeDir, expiresAtIso },
+  warnings = null,
+) {
   safeRm(probeDir);
   fs.mkdirSync(probeDir, { recursive: true });
   const pageNums = [];
@@ -739,12 +765,15 @@ async function estimatePageBytes({
 
   const rows = await asyncPool(SPLIT_PAR, pageNums, async (p) => {
     const onePath = path.join(probeDir, `p${String(p).padStart(5, "0")}.pdf`);
-    const b = await qpdfExtractPage({
-      inPdf,
-      pageNum: p,
-      outPdf: onePath,
-      expiresAtIso,
-    }, warnings);
+    const b = await qpdfExtractPage(
+      {
+        inPdf,
+        pageNum: p,
+        outPdf: onePath,
+        expiresAtIso,
+      },
+      warnings,
+    );
     return { p, bytes: b };
   });
 
@@ -753,11 +782,7 @@ async function estimatePageBytes({
   return rows.map((r) => Math.max(0, Number(r.bytes || 0)));
 }
 
-function buildRangesNearTarget({
-  pageBytes,
-  targetBytes,
-  maxParts,
-}) {
+function buildRangesNearTarget({ pageBytes, targetBytes, maxParts }) {
   const pages = pageBytes.length;
   if (pages <= 0) return [{ start: 1, end: 1 }];
 
@@ -767,7 +792,9 @@ function buildRangesNearTarget({
     Math.min(
       maxParts,
       pages,
-      Math.ceil(totalBytes / Math.max(256 * 1024, Math.floor(targetBytes * 0.96))),
+      Math.ceil(
+        totalBytes / Math.max(256 * 1024, Math.floor(targetBytes * 0.96)),
+      ),
     ),
   );
 
@@ -790,7 +817,10 @@ function buildRangesNearTarget({
     const remainingBytes = suffix[p];
     const dynamicTarget = Math.min(
       Math.floor(targetBytes * 0.98),
-      Math.max(256 * 1024, Math.floor(remainingBytes / Math.max(1, remainingParts))),
+      Math.max(
+        256 * 1024,
+        Math.floor(remainingBytes / Math.max(1, remainingParts)),
+      ),
     );
 
     const b = pageBytes[p - 1];
@@ -807,7 +837,10 @@ function buildRangesNearTarget({
   return ranges;
 }
 
-async function splitSinglePass({ inPdf, partsDir, ranges, expiresAtIso }, warnings = null) {
+async function splitSinglePass(
+  { inPdf, partsDir, ranges, expiresAtIso },
+  warnings = null,
+) {
   fs.mkdirSync(partsDir, { recursive: true });
 
   const tEach = boundedTimeout(TIMEOUT_QPDF_MS, expiresAtIso, 15_000, 60_000);
@@ -975,7 +1008,10 @@ async function shrinkOversizePartsAggressive({
 // ----------------------
 // qpdf page extract / concat helpers (oversize-safe split fallback)
 // ----------------------
-async function qpdfExtractPage({ inPdf, pageNum, outPdf, expiresAtIso }, warnings = null) {
+async function qpdfExtractPage(
+  { inPdf, pageNum, outPdf, expiresAtIso },
+  warnings = null,
+) {
   const tQ = boundedTimeout(TIMEOUT_QPDF_MS, expiresAtIso, 15_000, 60_000);
   const result = await runCmd(
     QPDF_EXE,
@@ -991,7 +1027,10 @@ async function qpdfExtractPage({ inPdf, pageNum, outPdf, expiresAtIso }, warning
   return b;
 }
 
-async function qpdfConcatSinglePages({ pagePdfs, outPdf, expiresAtIso }, warnings = null) {
+async function qpdfConcatSinglePages(
+  { pagePdfs, outPdf, expiresAtIso },
+  warnings = null,
+) {
   // Each file in pagePdfs is a 1-page PDF. We stitch them into one multi-page PDF.
   const tQ = boundedTimeout(TIMEOUT_QPDF_MS, expiresAtIso, 20_000, 60_000);
   const args = ["--empty", "--pages"];
@@ -1005,12 +1044,10 @@ async function qpdfConcatSinglePages({ pagePdfs, outPdf, expiresAtIso }, warning
   return b;
 }
 
-async function splitOversizeSafe({
-  inPdf,
-  partsDir,
-  targetBytes,
-  expiresAtIso,
-}, warnings = null) {
+async function splitOversizeSafe(
+  { inPdf, partsDir, targetBytes, expiresAtIso },
+  warnings = null,
+) {
   // Fallback mode when normal range-split can't enforce <=targetBytes due to huge single pages.
   // Strategy:
   //  1) Extract every page as its own PDF.
@@ -1028,12 +1065,15 @@ async function splitOversizeSafe({
   for (let p = 1; p <= pages; p++) pageNums.push(p);
   const single = await asyncPool(SPLIT_PAR, pageNums, async (p) => {
     const onePath = path.join(oneDir, `p${String(p).padStart(5, "0")}.pdf`);
-    const b = await qpdfExtractPage({
-      inPdf,
-      pageNum: p,
-      outPdf: onePath,
-      expiresAtIso,
-    }, warnings);
+    const b = await qpdfExtractPage(
+      {
+        inPdf,
+        pageNum: p,
+        outPdf: onePath,
+        expiresAtIso,
+      },
+      warnings,
+    );
     return { p, path: onePath, bytes: b };
   });
   single.sort((a, b) => a.p - b.p);
@@ -1080,11 +1120,14 @@ async function splitOversizeSafe({
     const idx = partFiles.length + 1;
     const outName = `goodPDF-OVERSIZEPACK(${idx}).pdf`;
     const outPath = path.join(partsDir, outName);
-    await qpdfConcatSinglePages({
-      pagePdfs: pack.map((x) => x.path),
-      outPdf: outPath,
-      expiresAtIso,
-    }, warnings);
+    await qpdfConcatSinglePages(
+      {
+        pagePdfs: pack.map((x) => x.path),
+        outPdf: outPath,
+        expiresAtIso,
+      },
+      warnings,
+    );
     const b = safeStatSize(outPath) ?? 0;
     partFiles.push(outPath);
     partMeta.push({
@@ -1210,8 +1253,7 @@ async function gsCompressOnce({
   timeoutMs,
 }) {
   const tGS = boundedTimeout(TIMEOUT_GS_MS, expiresAtIso, 20_000, 90_000);
-  const effectiveTimeout =
-    timeoutMs != null ? Math.min(timeoutMs, tGS) : tGS;
+  const effectiveTimeout = timeoutMs != null ? Math.min(timeoutMs, tGS) : tGS;
 
   const args =
     mode === "NUCLEAR"
@@ -1353,8 +1395,8 @@ function choosePartCountBySize({
 // Compatibility signature retained; behavior locked to 2 passes.
 function buildHardFitPassPlan({ bytes, pages, forceFast } = {}) {
   return [
-    { dpi: 110, jpegQ: 50, pdfSettings: "/ebook" },   // normal
-    { dpi: 85, jpegQ: 45, pdfSettings: "/screen" },   // rescue
+    { dpi: 110, jpegQ: 50, pdfSettings: "/ebook" }, // normal
+    { dpi: 85, jpegQ: 45, pdfSettings: "/screen" }, // rescue
   ];
 }
 
@@ -1397,6 +1439,15 @@ async function processDefaultFast({
     split_progress: 2,
     updated_at: nowIso(),
   });
+
+  // Hard input cap: refuse only when raw PDF is over 500MB.
+  if (preInBytes > SYSTEM_DEFAULT_MAX_INPUT_BYTES) {
+    const err = new Error(
+      "File is over 500MB. Please use Compress tool or Manual split.",
+    );
+    err.code = "REFUSED_OVER_500MB";
+    throw err;
+  }
 
   // qpdf pre-normalize when input <= 25MB; hard timeout kills process, fall back to inPdf on timeout/failure.
   let workPdf = inPdf;
@@ -1451,15 +1502,39 @@ async function processDefaultFast({
           ? "C_TARGET_RELAXED"
           : "D_RESCUE_SPLIT_ONLY";
   let anyShrink = false;
+  const aggressiveLane = preInBytes >= 200 * 1024 * 1024; // >=200MB input triggers AGGRESSIVE_DEFAULT_LANE
 
-  // Ensure total size <= SYSTEM_TARGET_TOTAL_BYTES before split; otherwise run up to 3 compression
-  // levels (time-boxed) and then proceed best-effort (no size-based refusal).
-  const COMPRESS_PASSES = [
-    { label: "High (200/70)", dpi: 200, jpegQ: 70, pdfSettings: "/printer" },
-    { label: "Med (150/60)", dpi: 150, jpegQ: 60, pdfSettings: "/ebook" },
-    { label: "Low (120/50)", dpi: 120, jpegQ: 50, pdfSettings: "/screen" },
-  ];
-  const COMPRESS_PASS_TIMEOUT_MS = 120_000;
+  // Ensure total size is improved toward the ladder targets before split; AGGRESSIVE_DEFAULT_LANE
+  // uses more passes and longer timeout for >=200MB inputs, but we still proceed best-effort.
+  const COMPRESS_PASSES = aggressiveLane
+    ? [
+        {
+          label: "High (200/70)",
+          dpi: 200,
+          jpegQ: 70,
+          pdfSettings: "/printer",
+        },
+        { label: "Med (150/60)", dpi: 150, jpegQ: 60, pdfSettings: "/ebook" },
+        { label: "Low (120/50)", dpi: 120, jpegQ: 50, pdfSettings: "/screen" },
+        {
+          label: "Lower (110/45)",
+          dpi: 110,
+          jpegQ: 45,
+          pdfSettings: "/screen",
+        },
+        { label: "Floor (96/40)", dpi: 96, jpegQ: 40, pdfSettings: "/screen" },
+      ]
+    : [
+        {
+          label: "High (200/70)",
+          dpi: 200,
+          jpegQ: 70,
+          pdfSettings: "/printer",
+        },
+        { label: "Med (150/60)", dpi: 150, jpegQ: 60, pdfSettings: "/ebook" },
+        { label: "Low (120/50)", dpi: 120, jpegQ: 50, pdfSettings: "/screen" },
+      ];
+  const COMPRESS_PASS_TIMEOUT_MS = aggressiveLane ? 180_000 : 120_000;
 
   if (afterCompressBytes > targetA && !softStop()) {
     for (const pass of COMPRESS_PASSES) {
@@ -1594,12 +1669,15 @@ async function processDefaultFast({
     for (let parts = minParts; parts <= maxPartsForFile; parts++) {
       wipePartsDir();
       const ranges = buildEqualRanges(pages0, parts);
-      const res = await splitSinglePass({
-        inPdf: pdfPath,
-        partsDir,
-        ranges,
-        expiresAtIso,
-      }, qpdfWarnings);
+      const res = await splitSinglePass(
+        {
+          inPdf: pdfPath,
+          partsDir,
+          ranges,
+          expiresAtIso,
+        },
+        qpdfWarnings,
+      );
 
       const peak = maxPartBytes(res.partMeta);
       if (!best || peak < best.peak) best = { res, peak, parts };
@@ -1626,9 +1704,18 @@ async function processDefaultFast({
       ? `${stageMsg}\n${res.warningMessage}`
       : stageMsg;
   }
+  if (preInBytes >= 200 * 1024 * 1024) {
+    const qualityMsg =
+      "Large PDF: default mode may reduce quality to reach size goals. Use Manual for higher quality.";
+    res.warningMessage = res.warningMessage
+      ? `${qualityMsg}\n${res.warningMessage}`
+      : qualityMsg;
+  }
   if (qpdfWarnings.length) {
     const qpdfMsg = qpdfWarnings.join("\n").slice(0, 2000).trim();
-    res.warningMessage = res.warningMessage ? `${res.warningMessage}\n${qpdfMsg}` : qpdfMsg;
+    res.warningMessage = res.warningMessage
+      ? `${res.warningMessage}\n${qpdfMsg}`
+      : qpdfMsg;
   }
 
   // Push oversized parts down to <=9MB (hard rule).
@@ -1644,7 +1731,13 @@ async function processDefaultFast({
       targetBytes,
       expiresAtIso,
       maxPasses: heavyLane ? HEAVY_EXTRA_SHRINK_PASSES : 2,
-      onProgress: async ({ pass, passCount, done, total, maxPartBytes: mpb }) => {
+      onProgress: async ({
+        pass,
+        passCount,
+        done,
+        total,
+        maxPartBytes: mpb,
+      }) => {
         const localPct = total > 0 ? done / total : 0;
         const pct = Math.round(68 + ((pass - 1 + localPct) / passCount) * 18);
         await updateJob(jobId, {
@@ -1665,12 +1758,15 @@ async function processDefaultFast({
       split_progress: 78,
       updated_at: nowIso(),
     });
-    res = await splitOversizeSafe({
-      inPdf: workPdf,
-      partsDir,
-      targetBytes,
-      expiresAtIso,
-    }, qpdfWarnings);
+    res = await splitOversizeSafe(
+      {
+        inPdf: workPdf,
+        partsDir,
+        targetBytes,
+        expiresAtIso,
+      },
+      qpdfWarnings,
+    );
     if (maxPartBytes(res.partMeta) > targetBytes) {
       res = await shrinkOversizePartsAggressive({
         res,
@@ -1694,25 +1790,18 @@ async function processDefaultFast({
   const splitMs = td(T, splitStart, "split");
   const totalMs = td(T, "start", "end");
   const partsN = (res.partMeta && res.partMeta.length) || 0;
-  const bytesOut = (res.partMeta || []).reduce((s, m) => s + (Number(m?.bytes) || 0), 0);
-
-  const ladderTargetA = SYSTEM_TARGET_TOTAL_BYTES;
-  const ladderTargetB = Math.floor(ladderTargetA * 1.6);
-  const ladderTargetC = Math.floor(ladderTargetA * 2.5);
-
-  console.log("[DEFAULT_LADDER]", {
-    targetA: ladderTargetA,
-    targetB: ladderTargetB,
-    targetC: ladderTargetC,
-    afterCompressBytes,
-    achievedStage,
-  });
+  const bytesOut = (res.partMeta || []).reduce(
+    (s, m) => s + (Number(m?.bytes) || 0),
+    0,
+  );
 
   console.log("[DEFAULT_STAGE]", {
     jobId,
     SYSTEM_TARGET_TOTAL_BYTES,
     afterCompressBytes,
     achievedStage,
+    aggressiveLane,
+    inputBytes: preInBytes,
     parts: partsN,
   });
 
@@ -1733,7 +1822,12 @@ function tmpDir(jobId) {
 }
 
 function ingestCachePath(jobId) {
-  return path.join(os.tmpdir(), "goodpdf_ingest", String(jobId || ""), "input.pdf");
+  return path.join(
+    os.tmpdir(),
+    "goodpdf_ingest",
+    String(jobId || ""),
+    "input.pdf",
+  );
 }
 
 async function processOneJob(job) {
@@ -1755,7 +1849,8 @@ async function processOneJob(job) {
 
   const tClaim = Date.now();
   const queuedStage = String(job?.stage || "QUEUE").toUpperCase();
-  const heavyHint = String(job?.error_code || "").toUpperCase() === "HEAVY_HINT";
+  const heavyHint =
+    String(job?.error_code || "").toUpperCase() === "HEAVY_HINT";
   const claimStage = queuedStage === "QUEUE_HEAVY" ? "QUEUE_HEAVY" : "QUEUE";
   const claimed = await claimJob(jobId, claimStage);
   timing.claim_ms = Date.now() - tClaim;
@@ -1836,7 +1931,8 @@ async function processOneJob(job) {
       split_progress: 1,
       updated_at: nowIso(),
     });
-    const heavyLane = heavyHint || queuedStage === "QUEUE_HEAVY" || IS_HEAVY_PROFILE;
+    const heavyLane =
+      heavyHint || queuedStage === "QUEUE_HEAVY" || IS_HEAVY_PROFILE;
     res = await processDefaultFast({
       jobId,
       inPdf,
@@ -1877,7 +1973,8 @@ async function processOneJob(job) {
       ? partBytes.reduce((a, b) => a + b, 0)
       : null;
     const maxPartB = partBytes.length ? Math.max(...partBytes) : null;
-    const warningText = systemFit && res.warningMessage ? res.warningMessage : null;
+    const warningText =
+      systemFit && res.warningMessage ? res.warningMessage : null;
 
     const tFinalize = Date.now();
     await updateJob(jobId, {
@@ -1928,7 +2025,11 @@ async function processOneJob(job) {
       error: msg.slice(0, 200),
     });
 
-    const corruptCodes = ["INPUT_EMPTY", "INVALID_PDF_SIGNATURE", "NPAGES_FAILED"];
+    const corruptCodes = [
+      "INPUT_EMPTY",
+      "INVALID_PDF_SIGNATURE",
+      "NPAGES_FAILED",
+    ];
     const isRefusedCorrupt = corruptCodes.includes(code);
     const isRefusedImageHeavy = code === "REFUSED_IMAGE_HEAVY";
     const refusalCode = isRefusedCorrupt
@@ -2055,11 +2156,14 @@ async function main() {
         if (idleStartedAtMs === null) idleStartedAtMs = nowMs;
         const idleSinceMs = getIdleSinceMs();
         if (WORKER_IDLE_EXIT_MS > 0 && idleSinceMs >= WORKER_IDLE_EXIT_MS) {
-          console.log("[POLL] idle exit: no jobs for", WORKER_IDLE_EXIT_MS, "ms");
+          console.log(
+            "[POLL] idle exit: no jobs for",
+            WORKER_IDLE_EXIT_MS,
+            "ms",
+          );
           process.exit(0);
         }
-        const throttleOk =
-          nowMs - lastIdlePollLogAt >= POLL_IDLE_LOG_EVERY_MS;
+        const throttleOk = nowMs - lastIdlePollLogAt >= POLL_IDLE_LOG_EVERY_MS;
         const backoffChanged = idleSleepMs !== lastLoggedIdleSleepMs;
         if (throttleOk || backoffChanged) {
           lastIdlePollLogAt = nowMs;
