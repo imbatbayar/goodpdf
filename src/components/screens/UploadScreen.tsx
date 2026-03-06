@@ -661,9 +661,13 @@ export function UploadScreen() {
                         </span>
                       ) : isSystemLarge200 ? (
                         <span>
-                          Large PDF (200MB+): Default will aggressively compress toward ~45MB to fit email/portal limits. Quality may noticeably decrease. For higher quality, use Manual.
+                          Large PDF (200MB+): Strong compression may be applied to fit within limits. Quality may decrease. For higher quality, use Manual.
                         </span>
-                      ) : null}
+                      ) : (
+                        <span>
+                          Smart quality split: fewest files first, quality-aware. Outputs typically 5–9MB per part.
+                        </span>
+                      )}
                     </div>
                   ) : null}
 
@@ -710,8 +714,7 @@ export function UploadScreen() {
                         </div>
                       </div>
                       <div className="mt-2 text-xs text-zinc-500">
-                        This mode prioritizes system compatibility over visual
-                        quality. Files remain readable.
+                        ≤200MB: Smart quality split, fewest files first. &gt;200MB: Strong compression may apply.
                       </div>
                     </div>
                   ) : (

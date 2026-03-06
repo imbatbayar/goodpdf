@@ -32,28 +32,34 @@ def _resize(img: Image.Image, max_side: int) -> Image.Image:
 
 def _recompress_one(payload):
     """
-    payload = (sha1, data, w, h, filt, max_side, q, force)
+    payload = (sha1, data, w, h, filt, max_side, q, force, gentle)
     return (sha1, new_bytes or None)
     """
-    sha1, data, w, h, filt, max_side, q, force = payload
+    sha1, data, w, h, filt, max_side, q, force, gentle = payload
 
     try:
-        # JPEG small enough => skip (unless force=true)
+        # Gentle: higher skip thresholds to preserve quality
+        min_side = 1600 if gentle else MIN_SIDE_FLOOR
+        min_q = 45 if gentle else MIN_Q_FLOOR
+        replace_threshold = 0.95 if gentle else 0.92  # don't replace if save <5% (gentle) or <8%
+
+        # JPEG small enough => skip (unless force=true); gentle uses higher thresholds
         if not force and "DCTDecode" in filt and w and h:
-            if (w * h) < SKIP_JPEG_IF_PIXELS_LT and len(data) < SKIP_JPEG_IF_BYTES_LT:
+            skip_px = 1_500_000 if gentle else SKIP_JPEG_IF_PIXELS_LT
+            skip_bytes = 3_000_000 if gentle else SKIP_JPEG_IF_BYTES_LT
+            if (w * h) < skip_px and len(data) < skip_bytes:
                 return (sha1, None)
 
         img = Image.open(BytesIO(data)).convert("RGB")
-        cap = max(max_side, MIN_SIDE_FLOOR)
+        cap = max(max_side, min_side)
         img = _resize(img, cap)
 
         buf = BytesIO()
-        qq = max(q, MIN_Q_FLOOR)
+        qq = max(q, min_q)
         img.save(buf, format="JPEG", quality=qq, optimize=True)
         new_data = buf.getvalue()
 
-        # зөвхөн бодитоор багассан бол replace
-        if len(new_data) >= len(data) * 0.92:
+        if len(new_data) >= len(data) * replace_threshold:
             return (sha1, None)
 
         return (sha1, new_data)
@@ -124,7 +130,7 @@ def _apply_results(imgmap, results):
     return changed
 
 
-def recompress_topk_parallel(pdf: pikepdf.Pdf, max_side: int, q: int, top_k: int, min_stream_bytes: int, force: bool) -> int:
+def recompress_topk_parallel(pdf: pikepdf.Pdf, max_side: int, q: int, top_k: int, min_stream_bytes: int, force: bool, gentle: bool = False) -> int:
     imgmap = _collect_images(pdf, min_stream_bytes=min_stream_bytes)
 
     # sort by stream bytes desc, take top_k
@@ -133,7 +139,7 @@ def recompress_topk_parallel(pdf: pikepdf.Pdf, max_side: int, q: int, top_k: int
     payloads = []
     for sha1, meta in items:
         payloads.append(
-            (sha1, meta["data"], meta["w"], meta["h"], meta["filt"], max_side, q, force)
+            (sha1, meta["data"], meta["w"], meta["h"], meta["filt"], max_side, q, force, gentle)
         )
 
     results = {}
@@ -167,6 +173,8 @@ def main():
     parser.add_argument("--jpeg_q", type=int, default=28)
     parser.add_argument("--passes", type=int, default=2)
     parser.add_argument("--force", action="store_true", default=False)
+    parser.add_argument("--gentle", action="store_true", default=False,
+                        help="Smart Quality mode: preserve readability, skip marginal gains")
 
     args = parser.parse_args()
 
@@ -180,6 +188,7 @@ def main():
     jpeg_q = int(args.jpeg_q)
     passes = max(1, int(args.passes))
     force = bool(args.force)
+    gentle = bool(args.gentle)
 
     before = os.path.getsize(inp)
     images_touched = 0
@@ -198,6 +207,7 @@ def main():
                 top_k=top_k,
                 min_stream_bytes=min_stream_bytes,
                 force=force,
+                gentle=gentle,
             )
             pdf.save(tmp_out)
 

@@ -25,7 +25,10 @@ import {
   PutObjectCommand,
   DeleteObjectCommand,
 } from "@aws-sdk/client-s3";
-import { estimatePartsForTarget } from "./tools/scan_engine.mjs";
+import {
+  estimatePartsForTarget,
+  buildRangesByEstimatedSize,
+} from "./tools/scan_engine.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1513,13 +1516,13 @@ async function processDefaultFast({
     ? Math.max(30 * 1024 * 1024, HEAVY_FLOOR_BYTES)
     : 0;
   // Single source of truth for policy (used everywhere).
-  const effectiveMaxParts = isHeavyInput ? 5 : 3;
-  const effectiveTotalCap = isHeavyInput
-    ? totalCapBytes
-    : Math.min(preBytes, Math.floor(3 * SYSTEM_PART_BYTES * 1.05));
+  const effectiveMaxParts = 5;
+  // Zone A (<=200MB): fewest-files-first, minimum damage; cap = preBytes so we accept larger outputs to prefer fewer parts.
+  // Zone B (>200MB): aggressive, target ~45MB total.
+  const effectiveTotalCap = isHeavyInput ? totalCapBytes : preBytes;
   const effectiveFloorBytes = isHeavyInput
     ? heavyFloorBytes
-    : Math.max(18 * 1024 * 1024, Math.floor(effectiveTotalCap * 0.55));
+    : Math.max(18 * 1024 * 1024, Math.floor(preBytes * 0.18));
   const targetA = effectiveTotalCap;
 
   console.log("[POLICY_LOCK]", {
@@ -1530,6 +1533,7 @@ async function processDefaultFast({
       Math.round((effectiveTotalCap / 1024 / 1024) * 100) / 100,
     effectiveFloorMb:
       Math.round((effectiveFloorBytes / 1024 / 1024) * 100) / 100,
+    ...(!isHeavyInput && { zone: "Smart Quality Split" }),
   });
 
   function estimateEffectiveParts(totalBytes, maxParts) {
@@ -1770,7 +1774,7 @@ async function processDefaultFast({
           ]);
         }
       } else {
-        // Gentle lane for <200MB: quality-first (touch more streams for scanned PDFs)
+        // Zone A: GENTLE lane - quality-first, minimum necessary compression
         await runPyVariant("GENTLE", [
           "--top_k",
           "400",
@@ -1782,6 +1786,7 @@ async function processDefaultFast({
           "55",
           "--passes",
           "1",
+          "--gentle",
         ]);
       }
     } catch (e) {
@@ -2118,26 +2123,60 @@ async function processDefaultFast({
       desiredPartsBefore,
       desiredPartsAfter: desiredParts,
     });
-    // Under-200MB policy: try only 3 parts (never 4 or 5); each part must be <= SYSTEM_PART_BYTES.
+    // Zone A (<=200MB): try 2 -> 3 -> 4 -> 5 (1 handled above); accept first where each part <= 9MB AND total >= floor.
     if (opts.under200Mb) {
-      const tryParts = [3].filter((p) => p <= effectiveMaxParts);
-      const maxPartsToTry = Math.min(effectiveMaxParts, pages0);
+      const floorBytes = opts.floorBytes ?? 0;
+      const tryParts = [2, 3, 4, 5];
+      const maxPartsToTry = Math.min(5, pages0);
       for (const p of tryParts) {
         if (p > maxPartsToTry) continue;
-        console.log("[UNDER200_SPLIT_TRY]", { jobId, parts: p });
         wipePartsDir();
-        const rangesTry = buildEqualRanges(pages0, p);
+        const rangesTry = buildRangesByEstimatedSize({
+          bytes: bytes0,
+          pages: pages0,
+          targetBytes: partBytes,
+          maxParts: 5,
+          parts: p,
+        });
         const resTry = await splitSinglePass(
           { inPdf: pdfPath, partsDir, ranges: rangesTry, expiresAtIso },
           qpdfWarnings,
         );
         const maxPartBytesTry = maxPartBytes(resTry.partMeta);
-        if (maxPartBytesTry <= partBytes) {
-          console.log("[UNDER200_SPLIT_SUCCESS]", { jobId, parts: p });
+        const totalBytesTry = (resTry.partMeta || []).reduce(
+          (s, m) => s + Number(m?.bytes || 0),
+          0,
+        );
+        const maxPartMb =
+          Math.round((maxPartBytesTry / 1024 / 1024) * 100) / 100;
+        const totalOutMb =
+          Math.round((totalBytesTry / 1024 / 1024) * 100) / 100;
+        console.log("[UNDER200_SPLIT_TRY]", {
+          jobId,
+          parts: p,
+          maxPartMb,
+          totalOutMb,
+        });
+        if (maxPartBytesTry <= partBytes && totalBytesTry >= floorBytes) {
+          console.log("[UNDER200_SPLIT_SUCCESS]", {
+            jobId,
+            parts: p,
+            totalOutMb,
+            maxPartMb,
+          });
           return { ...resTry, _fit: true, _parts: p };
         }
+        if (maxPartBytesTry <= partBytes && totalBytesTry < floorBytes) {
+          const floorMb = Math.round((floorBytes / 1024 / 1024) * 100) / 100;
+          console.log("[UNDER200_SPLIT_REJECT_FLOOR]", {
+            jobId,
+            parts: p,
+            totalOutMb,
+            floorMb,
+          });
+        }
       }
-      // If none fit, fall through to generic split logic below.
+      // If none pass floor, fall through to generic split logic below.
     }
 
     const minParts = Math.min(
@@ -2156,7 +2195,13 @@ async function processDefaultFast({
     let best = null;
     for (let parts = minParts; parts <= maxPartsForFile; parts++) {
       wipePartsDir();
-      const ranges = buildEqualRanges(pages0, parts);
+      const ranges = buildRangesByEstimatedSize({
+        bytes: bytes0,
+        pages: pages0,
+        targetBytes: partBytes,
+        maxParts: maxPartsForFile,
+        parts,
+      });
       const res = await splitSinglePass(
         {
           inPdf: pdfPath,
@@ -2198,10 +2243,12 @@ async function processDefaultFast({
   let rescueReason = null;
 
   if (estimatedParts <= effectiveMaxParts) {
+    const under200Mb = preInBytes < 200 * 1024 * 1024;
     res = await splitForSystem(workPdf, {
       targetBytes: SYSTEM_PART_BYTES,
       maxParts: effectiveMaxParts,
-      under200Mb: preInBytes < 200 * 1024 * 1024,
+      under200Mb,
+      ...(under200Mb && { floorBytes: effectiveFloorBytes }),
     });
   } else {
     rescueSplitOnly = true;
