@@ -14,6 +14,7 @@
 import "dotenv/config";
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
 import os from "os";
 import { spawn } from "child_process";
 import crypto from "crypto";
@@ -26,8 +27,8 @@ import {
 } from "@aws-sdk/client-s3";
 import { estimatePartsForTarget } from "./tools/scan_engine.mjs";
 
-const __dirname = path.dirname(new URL(import.meta.url).pathname);
-
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 // ----------------------
 // 7z resolve
 // ----------------------
@@ -195,9 +196,15 @@ const SYSTEM_DEFAULT_MAX_INPUT_BYTES = 500 * 1024 * 1024; // 500MB hard cap for 
 const SYSTEM_TOTAL_CAP_BYTES = Math.floor(
   SYSTEM_PART_BYTES * SYSTEM_MAX_PARTS_DEFAULT - 512 * 1024, // headroom
 );
+const SOFT_TARGET_BYTES = SYSTEM_TARGET_TOTAL_BYTES; // ~43MB; <=200MB soft goal (5×9MB)
+const SOFT_FLOOR_BYTES = Math.floor(SOFT_TARGET_BYTES * 0.3); // minimum acceptable for <200MB; reject over-shrunk below this
+const HEAVY_FLOOR_BYTES = Math.floor(SYSTEM_TOTAL_CAP_BYTES * 0.8); // ~36MB; avoid over-shrinking heavy inputs
 const SYSTEM_TOTAL_FLOOR_MB = Math.max(
   10,
-  Math.min(SYSTEM_PART_MB * SYSTEM_MAX_PARTS_DEFAULT, Number(process.env.SYSTEM_TOTAL_FLOOR_MB || 40)),
+  Math.min(
+    SYSTEM_PART_MB * SYSTEM_MAX_PARTS_DEFAULT,
+    Number(process.env.SYSTEM_TOTAL_FLOOR_MB || 40),
+  ),
 );
 const SYSTEM_TOTAL_FLOOR_BYTES = Math.floor(
   SYSTEM_TOTAL_FLOOR_MB * 1024 * 1024,
@@ -381,6 +388,15 @@ function runCmd(cmd, args, timeoutMs, spawnOpts = {}, okCodes = [0]) {
 
 // ----------------------
 // Python helper (Selective recompression)
+
+function pickPythonExe() {
+  const env = String(process.env.PYTHON_EXE || "").trim();
+  if (env) return env;
+  // Common fallbacks
+  if (process.platform === "win32") return "python";
+  return "python3";
+}
+
 // ----------------------
 // ----------------------
 // Supabase helpers
@@ -1492,11 +1508,26 @@ async function processDefaultFast({
   const partCapBytes = SYSTEM_PART_BYTES;
   const maxPartsGoal = SYSTEM_TARGET_PARTS_GOAL;
   const totalCapBytes = SYSTEM_TOTAL_CAP_BYTES;
-  const targetA = SYSTEM_TARGET_TOTAL_BYTES;
   const isHeavyInput = preBytes >= 200 * 1024 * 1024;
   const heavyFloorBytes = isHeavyInput
-    ? Math.max(30 * 1024 * 1024, Math.floor(0.65 * totalCapBytes))
+    ? Math.max(30 * 1024 * 1024, HEAVY_FLOOR_BYTES)
     : 0;
+  const maxPartsUnder200 = 3;
+  const under200TargetTotalBytes = Math.min(
+    preBytes,
+    Math.floor(maxPartsUnder200 * SYSTEM_PART_BYTES * 1.05),
+  );
+  const targetA = isHeavyInput
+    ? SYSTEM_TARGET_TOTAL_BYTES
+    : under200TargetTotalBytes;
+  // Effective policy: one set used everywhere for cap, parts, and floor.
+  const effectiveTotalCap = isHeavyInput
+    ? totalCapBytes
+    : under200TargetTotalBytes;
+  const effectiveMaxPartsGoal = isHeavyInput ? maxPartsGoal : maxPartsUnder200;
+  const effectiveFloorBytes = isHeavyInput
+    ? heavyFloorBytes
+    : Math.max(18 * 1024 * 1024, Math.round(0.55 * effectiveTotalCap));
 
   const estimateSystemParts = (totalBytes) =>
     estimatePartsForTarget({
@@ -1507,24 +1538,78 @@ async function processDefaultFast({
     });
   let estimatedParts = estimateSystemParts(afterCompressBytes);
 
-  let bestFitPath = null;
+  function shouldRejectOverShrunkCandidate({
+    isHeavyInput,
+    candidateBytes,
+    effectiveCapBytes,
+    effectiveMaxParts,
+    floorBytes,
+  }) {
+    if (candidateBytes <= 0 || isHeavyInput) return false;
+    if (candidateBytes >= floorBytes) return false;
+    const fitsCap = candidateBytes <= effectiveCapBytes;
+    const fitsParts = estimateSystemParts(candidateBytes) <= effectiveMaxParts;
+    return fitsCap && fitsParts; // reject when it fits but is below floor
+  }
+
+  let bestFitPath = null; // best candidate under cap (fallback)
   let bestFitBytes = 0;
   let bestFitStepLabel = null;
+
+  let bestFitFloorPath = null; // best candidate under cap AND above floor (preferred)
+  let bestFitFloorBytes = 0;
+  let bestFitFloorStepLabel = null;
+
   function maybeAcceptBestFit(candidatePath, bytes, label) {
-    if (bytes <= 0) return;
-    if (bytes > totalCapBytes) return;
-    if (estimateSystemParts(bytes) > maxPartsGoal) return;
-    if (isHeavyInput && heavyFloorBytes > 0 && bytes < heavyFloorBytes) return;
-    if (bytes <= bestFitBytes) return;
-    bestFitPath = candidatePath;
-    bestFitBytes = bytes;
-    bestFitStepLabel = label;
-    console.log("[CANDIDATE]", {
-      jobId,
-      label,
-      bytesMb: Math.round(bytesToMb(bytes) * 100) / 100,
-      estParts: estimateSystemParts(bytes),
-    });
+    if (bytes <= 0) return false;
+    if (bytes > effectiveTotalCap) return false;
+    if (estimateSystemParts(bytes) > effectiveMaxPartsGoal) return false;
+
+    if (
+      shouldRejectOverShrunkCandidate({
+        isHeavyInput,
+        candidateBytes: bytes,
+        effectiveCapBytes: effectiveTotalCap,
+        effectiveMaxParts: effectiveMaxPartsGoal,
+        floorBytes: effectiveFloorBytes,
+      })
+    ) {
+      console.log("[CANDIDATE_REJECT_OVER_SHRINK]", {
+        jobId,
+        label,
+        candidateMb: Math.round(bytesToMb(bytes) * 100) / 100,
+        floorMb: Math.round(bytesToMb(effectiveFloorBytes) * 100) / 100,
+        effectiveCapMb: Math.round(bytesToMb(effectiveTotalCap) * 100) / 100,
+        isHeavyInput,
+      });
+      return false;
+    }
+
+    // Track any-under-cap best (fallback)
+    if (bytes > bestFitBytes) {
+      bestFitPath = candidatePath;
+      bestFitBytes = bytes;
+      bestFitStepLabel = label;
+    }
+
+    // Track above-floor best (preferred)
+    if (bytes >= effectiveFloorBytes && bytes > bestFitFloorBytes) {
+      bestFitFloorPath = candidatePath;
+      bestFitFloorBytes = bytes;
+      bestFitFloorStepLabel = label;
+    }
+
+    // Log only when it becomes a "new best" (either tier)
+    if (bytes === bestFitBytes || bytes === bestFitFloorBytes) {
+      console.log("[CANDIDATE]", {
+        jobId,
+        label,
+        bytesMb: Math.round(bytesToMb(bytes) * 100) / 100,
+        estParts: estimateSystemParts(bytes),
+        tier: bytes >= effectiveFloorBytes ? "ABOVE_FLOOR" : "UNDER_FLOOR",
+      });
+    }
+    return true; // candidate accepted (updated bestFitPath and/or bestFitFloorPath)
   }
 
   maybeAcceptBestFit(workPdf, preBytes, "initial");
@@ -1537,90 +1622,145 @@ async function processDefaultFast({
     bytes: afterCompressBytes,
   });
 
-  // Python-based selective image recompress lane:
-  // For <200MB: only if estimatedParts > 5 or bytes > totalCapBytes; gentle args.
-  // For >=200MB: only if bytes > totalCapBytes (or estimatedParts > 5); strong args.
+  // Python-based selective image recompress lane (quality-aware):
+  //  - <200MB: gentle profile; never accept over-shrunk (below effectiveFloorBytes) unless still cannot fit.
+  //  - >=200MB: try MILD then STRONG; prefer candidates above HEAVY_FLOOR_BYTES.
   const needPython =
-    (estimatedParts > maxPartsGoal || preBytes > totalCapBytes) &&
+    (estimatedParts > effectiveMaxPartsGoal || preBytes > effectiveTotalCap) &&
     preBytes <= SYSTEM_DEFAULT_MAX_INPUT_BYTES &&
     !softStop();
   if (needPython) {
     try {
-      const tmpRe = path.join(wd, `.__pyre_${rand6()}.pdf`);
-      const targetMb = Math.max(
-        1,
-        Math.ceil(SYSTEM_TARGET_TOTAL_BYTES / (1024 * 1024)),
-      );
-      const pyArgs = [
-        path.join(__dirname, "tools", "selective_recompress.py"),
-        workPdf,
-        tmpRe,
-        "--target_mb",
-        String(targetMb),
-      ];
-      if (isHeavyInput) {
-        pyArgs.push(
-          "--top_k",
-          "220",
-          "--min_stream_kb",
-          "200",
-          "--max_side",
-          "1100",
-          "--jpeg_q",
-          "30",
-          "--passes",
-          "3",
-          "--force",
+      const targetMb = Math.max(1, Math.ceil(totalCapBytes / (1024 * 1024)));
+      const pyExe = pickPythonExe();
+
+      const runPyVariant = async (variantLabel, extraArgs) => {
+        const tmpRe = path.join(wd, `.__pyre_${variantLabel}_${rand6()}.pdf`);
+        const pyArgs = [
+          path.join(__dirname, "tools", "selective_recompress.py"),
+          workPdf,
+          tmpRe,
+          "--target_mb",
+          String(targetMb),
+          ...extraArgs,
+        ];
+
+        const tPy = boundedTimeout(180_000, expiresAtIso, 30_000, 180_000);
+        const pyRes = await runCmd(pyExe, pyArgs, tPy, {}, [0]);
+
+        let summary = null;
+        try {
+          summary = JSON.parse(pyRes.out.trim() || "{}");
+        } catch {
+          summary = null;
+        }
+
+        const beforeB = safeStatSize(workPdf) ?? preBytes;
+        const afterB = safeStatSize(tmpRe) ?? beforeB;
+
+        // Guard: reject over-shrunk unless we still cannot fit within effective policy.
+        const wouldStillNeedFit =
+          estimateSystemParts(afterB) > effectiveMaxPartsGoal ||
+          afterB > effectiveTotalCap;
+        const overShrunk =
+          !isHeavyInput && afterB > 0 && afterB < effectiveFloorBytes;
+
+        const acceptable =
+          afterB > 0 && afterB < beforeB && (!overShrunk || wouldStillNeedFit);
+
+        console.log("[PY_VARIANT]", {
+          jobId,
+          variant: variantLabel,
+          beforeMb: Math.round(bytesToMb(beforeB) * 100) / 100,
+          afterMb: Math.round(bytesToMb(afterB) * 100) / 100,
+          images_touched: summary?.images_touched ?? null,
+          passes_run: summary?.passes_run ?? null,
+          overShrunk,
+          acceptable,
+        });
+        if (variantLabel === "GENTLE" && (summary?.images_touched ?? 0) === 0) {
+          console.log("[PY_GENTLE_NOOP]", {
+            jobId,
+            inputBytes: beforeB,
+            note: "min_stream_kb/top_k may still skip images",
+          });
+        }
+
+        const accepted = maybeAcceptBestFit(
+          tmpRe,
+          afterB,
+          `python_${variantLabel}`,
         );
-      } else {
-        // Gentle lane for <200MB: quality-first
-        pyArgs.push(
+        if (acceptable && accepted) {
+          workPdf = tmpRe;
+          afterCompressBytes = afterB;
+          estimatedParts = estimateSystemParts(afterCompressBytes);
+          anyShrink = true;
+          console.log("[DEFAULT_FEASIBILITY]", {
+            jobId,
+            step: `python_${variantLabel}`,
+            estimatedParts,
+            targetPartBytes: partCapBytes,
+            maxPartsGoal,
+            bytes: afterCompressBytes,
+          });
+          return true;
+        }
+
+        safeUnlink(tmpRe);
+        return false;
+      };
+
+      if (isHeavyInput) {
+        // 1) MILD: keep better readability (prefer)
+        await runPyVariant("MILD", [
           "--top_k",
-          "90",
+          "160",
           "--min_stream_kb",
-          "300",
+          "220",
+          "--max_side",
+          "1600",
+          "--jpeg_q",
+          "44",
+          "--passes",
+          "2",
+          "--force",
+        ]);
+
+        // 2) STRONG: only if still infeasible
+        if (
+          estimateSystemParts(afterCompressBytes) > maxPartsGoal ||
+          afterCompressBytes > totalCapBytes
+        ) {
+          await runPyVariant("STRONG", [
+            "--top_k",
+            "220",
+            "--min_stream_kb",
+            "200",
+            "--max_side",
+            "1100",
+            "--jpeg_q",
+            "30",
+            "--passes",
+            "3",
+            "--force",
+          ]);
+        }
+      } else {
+        // Gentle lane for <200MB: quality-first (touch more streams for scanned PDFs)
+        await runPyVariant("GENTLE", [
+          "--top_k",
+          "400",
+          "--min_stream_kb",
+          "20",
           "--max_side",
           "2000",
           "--jpeg_q",
           "55",
           "--passes",
           "1",
-        );
+        ]);
       }
-      const tPy = boundedTimeout(180_000, expiresAtIso, 30_000, 180_000);
-      const pyExe = pickPythonExe();
-      const pyRes = await runCmd(pyExe, pyArgs, tPy, {}, [0]);
-      let summary = null;
-      try {
-        summary = JSON.parse(pyRes.out.trim() || "{}");
-      } catch {
-        summary = null;
-      }
-      const beforeB = safeStatSize(workPdf) ?? preBytes;
-      const afterB = safeStatSize(tmpRe) ?? beforeB;
-      if (afterB > 0 && afterB < beforeB) {
-        workPdf = tmpRe;
-        afterCompressBytes = afterB;
-        estimatedParts = estimateSystemParts(afterCompressBytes);
-        anyShrink = true;
-        maybeAcceptBestFit(tmpRe, afterB, "python_recompress");
-        console.log("[DEFAULT_FEASIBILITY]", {
-          jobId,
-          step: "python_recompress",
-          estimatedParts,
-          targetPartBytes: partCapBytes,
-          maxPartsGoal,
-          bytes: afterCompressBytes,
-        });
-      } else {
-        safeUnlink(tmpRe);
-      }
-      console.log("[PY_RECOMPRESS]", {
-        before: beforeB,
-        after: afterCompressBytes,
-        images_touched: summary?.images_touched ?? null,
-        passes_run: summary?.passes_run ?? null,
-      });
     } catch (e) {
       console.warn("[PY_RECOMPRESS] failed:", e?.message || e);
     }
@@ -1677,17 +1817,18 @@ async function processDefaultFast({
       ];
   const COMPRESS_PASS_TIMEOUT_MS = aggressiveLane ? 180_000 : 120_000;
 
-  // Only run compression ladder if we don't already fit: estimatedParts > 5 OR bytes > totalCapBytes.
+  // Only run compression ladder if we don't already fit (uses under200 cap for <200MB).
   if (
-    (estimatedParts > maxPartsGoal || afterCompressBytes > totalCapBytes) &&
+    (estimatedParts > effectiveMaxPartsGoal ||
+      afterCompressBytes > effectiveTotalCap) &&
     !softStop()
   ) {
     for (const pass of COMPRESS_PASSES) {
       if (softStop()) break;
       estimatedParts = estimateSystemParts(afterCompressBytes);
       if (
-        estimatedParts <= maxPartsGoal &&
-        afterCompressBytes <= totalCapBytes
+        estimatedParts <= effectiveMaxPartsGoal &&
+        afterCompressBytes <= effectiveTotalCap
       ) {
         break;
       }
@@ -1727,8 +1868,12 @@ async function processDefaultFast({
       if (ok) {
         const outBytes = safeStatSize(outPath) ?? 0;
         if (outBytes > 0) {
-          maybeAcceptBestFit(outPath, outBytes, `gs_${pass.label}`);
-          if (outBytes < afterCompressBytes) {
+          const accepted = maybeAcceptBestFit(
+            outPath,
+            outBytes,
+            `gs_${pass.label}`,
+          );
+          if (accepted && outBytes < afterCompressBytes) {
             workPdf = outPath;
             afterCompressBytes = outBytes;
             anyShrink = true;
@@ -1742,12 +1887,12 @@ async function processDefaultFast({
               bytes: afterCompressBytes,
             });
             if (
-              estimatedParts <= maxPartsGoal &&
-              afterCompressBytes <= totalCapBytes
+              estimatedParts <= effectiveMaxPartsGoal &&
+              afterCompressBytes <= effectiveTotalCap
             )
               break;
-          } else {
-            if (bestFitPath !== outPath) safeUnlink(outPath);
+          } else if (!accepted) {
+            safeUnlink(outPath);
           }
         } else {
           safeUnlink(outPath);
@@ -1760,16 +1905,14 @@ async function processDefaultFast({
     tmark(T, "compress");
   }
 
-  // Last-resort nuclear pass only if still estimate >5 parts or above cap.
-  if (
+  // Last-resort nuclear pass only if still over effective cap/parts (blocked for <200MB).
+  const needNuclear =
     !softStop() &&
-    (estimateSystemParts(afterCompressBytes) > maxPartsGoal ||
-      afterCompressBytes > totalCapBytes)
-  ) {
-    const nuclearOut = path.join(
-      wd,
-      `.__target_fit_NUCLEAR_${rand6()}.pdf`,
-    );
+    (estimateSystemParts(afterCompressBytes) > effectiveMaxPartsGoal ||
+      afterCompressBytes > effectiveTotalCap);
+  const allowNuclear = isHeavyInput; // only heavy inputs (>=200MB) may run nuclear
+  if (needNuclear && allowNuclear) {
+    const nuclearOut = path.join(wd, `.__target_fit_NUCLEAR_${rand6()}.pdf`);
     const okNuclear = await runGsWithHeartbeat({
       jobId,
       label: "compress: nuclear",
@@ -1785,41 +1928,82 @@ async function processDefaultFast({
     if (okNuclear) {
       const outBytes = safeStatSize(nuclearOut) ?? 0;
       if (outBytes > 0) {
-        maybeAcceptBestFit(nuclearOut, outBytes, "nuclear");
-        if (outBytes < afterCompressBytes) {
+        const accepted = maybeAcceptBestFit(nuclearOut, outBytes, "nuclear");
+        if (accepted && outBytes < afterCompressBytes) {
           workPdf = nuclearOut;
           afterCompressBytes = outBytes;
           anyShrink = true;
           estimatedParts = estimateSystemParts(afterCompressBytes);
+          console.log("[DEFAULT_FEASIBILITY]", {
+            jobId,
+            step: "gs_nuclear_done",
+            estimatedParts,
+            targetPartBytes: partCapBytes,
+            maxPartsGoal,
+            bytes: afterCompressBytes,
+          });
+        } else if (!accepted) {
+          safeUnlink(nuclearOut);
         }
-        if (bestFitPath !== nuclearOut) safeUnlink(nuclearOut);
-        console.log("[DEFAULT_FEASIBILITY]", {
-          jobId,
-          step: "gs_nuclear_done",
-          estimatedParts,
-          targetPartBytes: partCapBytes,
-          maxPartsGoal,
-          bytes: afterCompressBytes,
-        });
       } else {
         safeUnlink(nuclearOut);
       }
     } else {
       safeUnlink(nuclearOut);
     }
+  } else if (needNuclear && !allowNuclear) {
+    console.log("[NUCLEAR_SKIP_UNDER200]", {
+      jobId,
+      inputBytes: preBytes,
+      reason: "quality_guard",
+    });
   }
 
-  // Apply best-fit candidate before split (maximize quality under cap)
+  // Apply best-fit candidate: prefer FLOOR; only use FALLBACK when no floor candidate and current does not fit.
   let appliedBestFit = false;
-  if (bestFitPath && (bestFitPath !== workPdf || bestFitBytes !== afterCompressBytes)) {
-    workPdf = bestFitPath;
-    afterCompressBytes = bestFitBytes;
+  const currentFits =
+    afterCompressBytes <= effectiveTotalCap &&
+    estimateSystemParts(afterCompressBytes) <= effectiveMaxPartsGoal;
+  const useFallback =
+    !bestFitFloorPath && !currentFits && bestFitPath && bestFitBytes > 0;
+  const finalBestPath = bestFitFloorPath
+    ? bestFitFloorPath
+    : useFallback
+      ? bestFitPath
+      : workPdf;
+  const finalBestBytes = bestFitFloorPath
+    ? bestFitFloorBytes
+    : useFallback
+      ? bestFitBytes
+      : afterCompressBytes;
+  const finalBestLabel = bestFitFloorPath
+    ? bestFitFloorStepLabel
+    : useFallback
+      ? bestFitStepLabel
+      : null;
+  const tier = bestFitFloorPath ? "FLOOR" : useFallback ? "FALLBACK" : "NONE";
+  const tierReason = bestFitFloorPath
+    ? "above_floor_candidate"
+    : useFallback
+      ? "no_floor_candidate_needed_fit"
+      : currentFits
+        ? "current_fits"
+        : "no_acceptable_candidate";
+
+  if (
+    finalBestPath &&
+    (finalBestPath !== workPdf || finalBestBytes !== afterCompressBytes)
+  ) {
+    workPdf = finalBestPath;
+    afterCompressBytes = finalBestBytes;
     appliedBestFit = true;
     console.log("[BEST_FIT_SELECTED]", {
       jobId,
-      label: bestFitStepLabel,
-      bytesMb: Math.round(bytesToMb(bestFitBytes) * 100) / 100,
-      estimatedParts: estimateSystemParts(bestFitBytes),
+      label: finalBestLabel,
+      bytesMb: Math.round(bytesToMb(finalBestBytes) * 100) / 100,
+      estimatedParts: estimateSystemParts(finalBestBytes),
+      tier,
+      tierReason,
     });
   }
   recomputeAchievedStage();
@@ -1878,22 +2062,62 @@ async function processDefaultFast({
     }
 
     const maxPartsForFile = Math.min(effectiveMaxParts, pages0);
-    const desiredParts = choosePartCountBySize({
+    let desiredParts = choosePartCountBySize({
       bytes: bytes0,
       pages: pages0,
       targetBytes: partBytes,
       minParts: 1,
       maxParts: maxPartsForFile,
     });
+    const desiredPartsBefore = desiredParts;
+    const minPartsNeeded = Math.ceil(bytes0 / partBytes);
+    const minPartsNeededClamped = Math.min(
+      effectiveMaxParts,
+      Math.max(2, minPartsNeeded),
+    );
+    if (opts.under200Mb) {
+      desiredParts = Math.min(desiredParts, minPartsNeededClamped);
+    }
+    console.log("[SPLIT_BUCKET]", {
+      jobId,
+      bytesMb: Math.round(bytesToMb(bytes0) * 100) / 100,
+      targetMb: Math.round((partBytes / (1024 * 1024)) * 100) / 100,
+      desiredPartsBefore,
+      desiredPartsAfter: desiredParts,
+    });
+    // Under-200MB policy: try 3, then 4, then 5 parts; stop at first where each part <= SYSTEM_PART_BYTES.
+    if (opts.under200Mb) {
+      const tryParts = [3, 4, 5];
+      const maxPartsToTry = Math.min(5, pages0);
+      for (const p of tryParts) {
+        if (p > maxPartsToTry) continue;
+        console.log("[UNDER200_SPLIT_TRY]", { jobId, parts: p });
+        wipePartsDir();
+        const rangesTry = buildEqualRanges(pages0, p);
+        const resTry = await splitSinglePass(
+          { inPdf: pdfPath, partsDir, ranges: rangesTry, expiresAtIso },
+          qpdfWarnings,
+        );
+        const maxPartBytesTry = maxPartBytes(resTry.partMeta);
+        if (maxPartBytesTry <= partBytes) {
+          console.log("[UNDER200_SPLIT_SUCCESS]", { jobId, parts: p });
+          return { ...resTry, _fit: true, _parts: p };
+        }
+      }
+      // If none fit, fall through to generic split logic below.
+    }
 
-    const minParts = Math.max(
-      desiredParts,
-      estimatePartsForTarget({
-        bytes: bytes0,
-        targetBytes: partBytes,
-        maxParts: maxPartsForFile,
-        pages: pages0,
-      }),
+    const minParts = Math.min(
+      maxPartsForFile,
+      Math.max(
+        desiredParts,
+        estimatePartsForTarget({
+          bytes: bytes0,
+          targetBytes: partBytes,
+          maxParts: maxPartsForFile,
+          pages: pages0,
+        }),
+      ),
     );
 
     let best = null;
@@ -1922,14 +2146,16 @@ async function processDefaultFast({
     };
   };
 
-  // Strict feasibility check: can we hit <=5 parts at 9MB target?
+  // Strict feasibility check: under200 targets <=3 parts; heavy targets <=5.
   estimatedParts = estimateSystemParts(afterCompressBytes);
+  const feasibleMaxParts =
+    preInBytes < 200 * 1024 * 1024 ? 3 : SYSTEM_TARGET_PARTS_GOAL;
   console.log("[DEFAULT_FEASIBILITY]", {
     jobId,
     step: "pre_split",
     estimatedParts,
     targetPartBytes: SYSTEM_PART_BYTES,
-    maxPartsGoal: SYSTEM_TARGET_PARTS_GOAL,
+    maxPartsGoal: feasibleMaxParts,
     bytes: afterCompressBytes,
   });
 
@@ -1937,11 +2163,14 @@ async function processDefaultFast({
   let rescueSplitOnly = false;
   let rescueReason = null;
 
-  if (estimatedParts <= SYSTEM_TARGET_PARTS_GOAL) {
-    // Feasible: split with fixed 9MB target and <=5 parts.
+  if (estimatedParts <= feasibleMaxParts) {
+    // Feasible: split with fixed 9MB target. Under 200MB prefer <=3 parts.
+    const maxPartsForSplitActual =
+      preInBytes < 200 * 1024 * 1024 ? 3 : maxPartsForSplit;
     res = await splitForSystem(workPdf, {
       targetBytes: SYSTEM_PART_BYTES,
-      maxParts: maxPartsForSplit,
+      maxParts: maxPartsForSplitActual,
+      under200Mb: preInBytes < 200 * 1024 * 1024,
     });
   } else {
     // Infeasible even after compression ladder: RESCUE_SPLIT_ONLY.
@@ -1949,7 +2178,7 @@ async function processDefaultFast({
     rescueReason = {
       estimatedParts,
       targetPartBytes: SYSTEM_PART_BYTES,
-      maxPartsGoal: SYSTEM_TARGET_PARTS_GOAL,
+      maxPartsGoal: feasibleMaxParts,
       finalBytes: afterCompressBytes,
     };
     console.warn("[DEFAULT_FEASIBILITY]", {
@@ -2273,7 +2502,8 @@ async function processOneJob(job) {
       systemFit && res.warningMessage ? res.warningMessage : null;
 
     const tFinalize = Date.now();
-    const rescueInfo = res && res.rescueSplitOnly ? res.rescueReason || null : null;
+    const rescueInfo =
+      res && res.rescueSplitOnly ? res.rescueReason || null : null;
     const rescueMsg =
       rescueInfo && systemFit
         ? `Could not reach <=${SYSTEM_TARGET_PARTS_GOAL} parts at ${SYSTEM_PART_MB}MB target.\n` +
@@ -2281,7 +2511,9 @@ async function processOneJob(job) {
           `Use Manual mode or stronger compression if you need fewer parts.`
         : null;
     const finalWarningText =
-      rescueMsg && warningText ? `${rescueMsg}\n${warningText}` : rescueMsg || warningText;
+      rescueMsg && warningText
+        ? `${rescueMsg}\n${warningText}`
+        : rescueMsg || warningText;
 
     await updateJob(jobId, {
       status: "DONE",
