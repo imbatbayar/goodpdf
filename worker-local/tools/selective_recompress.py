@@ -203,8 +203,12 @@ def main():
 
     args = parser.parse_args()
 
-    inp = args.input
+    inp = os.path.abspath(args.input)
     out = args.output
+    tmp_out = os.path.abspath(out)
+    parent_dir = os.path.dirname(tmp_out)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
 
     target_bytes = int(args.target_mb * 1024 * 1024)
     top_k = max(1, int(args.top_k))
@@ -221,7 +225,6 @@ def main():
     passes_run = 0
 
     cur_in = inp
-    tmp_out = out
 
     for _ in range(passes):
         passes_run += 1
@@ -236,9 +239,37 @@ def main():
                 gentle=gentle,
                 gentle_level=gentle_level,
             )
-            pdf.save(tmp_out)
 
-        after = os.path.getsize(tmp_out)
+            # Robust output-path handling (Windows-safe)
+            if passes_run == 1 and os.path.exists(tmp_out):
+                os.remove(tmp_out)
+            out_dir = os.path.dirname(tmp_out)
+            out_dir_exists = os.path.isdir(out_dir) if out_dir else True
+            out_exists = os.path.exists(tmp_out)
+            print(
+                f"[SELECTIVE_RECOMPRESS] before save: input={cur_in!r} output={tmp_out!r} output_dir_exists={out_dir_exists} output_exists={out_exists}",
+                file=sys.stderr,
+            )
+
+            # Safe save with retry
+            try:
+                pdf.save(tmp_out, garbage=3, deflate=True)
+            except Exception as e:
+                print(f"[SELECTIVE_RECOMPRESS] save failed: {e!r}", file=sys.stderr)
+                try:
+                    pdf.save(tmp_out)
+                except Exception as e2:
+                    raise RuntimeError(
+                        f"selective_recompress save failed (original: {e!r}, retry: {e2!r})"
+                    ) from e2
+
+            saved_bytes = os.path.getsize(tmp_out)
+            print(
+                f"[SELECTIVE_RECOMPRESS] after save: saved_bytes={saved_bytes} path={tmp_out!r}",
+                file=sys.stderr,
+            )
+
+        after = saved_bytes
         if after <= target_bytes:
             break
 

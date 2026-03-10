@@ -1,6 +1,7 @@
 // worker-local/worker.mjs — GOODPDF Worker (FAST v4.0)
 // Core goals (locked):
-//  - Zone A (<200MB): Smart Quality Split — fewest files first, minimum damage, 1→2→3→4→5 parts.
+//  - Zone A (<200MB): Smart Quality Split — fewest files first, 1→2→3→4→5 parts.
+//    Fallback: compress toward ~43–45MB (stop at <=45MB), then exact 5-part split.
 //  - Zone B (200–500MB): Hard Limit Split — aggressive compression, <=10 parts near 9MB each.
 //  - MANUAL: user target MB (default 9) + quality presets:
 //      High   = 110 DPI / Q50
@@ -194,7 +195,7 @@ const SYSTEM_TARGET_PARTS_GOAL = 5;
 const SYSTEM_MAX_PARTS_DEFAULT = 5; // hard cap for DEFAULT; Manual can exceed this
 // Absolute hard cap for dynamic system-fit expansion (final acceptance gate).
 const SYSTEM_MAX_PARTS_HARD_CAP = 25;
-// Zone A: total-size target for 5-part mode when fewest-files-first fails.
+// Zone A: preferred ~43–44MB, hard stop <=45MB. Used when fewest-files-first fails; then exact 5-part split.
 const ZONE_A_TARGET_MB_IDEAL_MIN = 43;
 const ZONE_A_TARGET_MB_IDEAL_MAX = 44;
 const ZONE_A_TARGET_MB_HARD_MAX = 45;
@@ -407,21 +408,24 @@ function pickPythonExe() {
   return "python3";
 }
 
-/**
- * Zone A compression ladder: reduce total PDF size gradually until <=45MB.
- * Returns path to final compressed file (or null on failure).
- */
 async function runZoneACompressionLadder(
   inputPdfPath,
   outDir,
   expiresAtIso,
   jobId = null,
 ) {
-  const ladder = [
+  // Stage A: quality-preserving ladder (current behavior).
+  // Stage B: mild additional image-quality sacrifice, only if Stage A cannot reach <=45MB.
+  const ladderStageA = [
     { target: 70, passes: 1 },
     { target: 60, passes: 2 },
     { target: 50, passes: 2 },
     { target: 45, passes: 3 },
+  ];
+  const ladderStageB = [
+    // Slightly stronger than final Stage A step; still non-destructive.
+    { target: 45, passes: 3, jpegQ: 38, maxSide: 1350 },
+    { target: 45, passes: 4, jpegQ: 36, maxSide: 1300 },
   ];
   const hardMaxBytes = ZONE_A_TOTAL_TARGET_HARD_MAX;
   let curInput = inputPdfPath;
@@ -432,10 +436,13 @@ async function runZoneACompressionLadder(
   console.log("[ZONE_A_COMPRESS_START]", {
     jobId,
     inputMb: Math.round(bytesToMb(inputBytes) * 100) / 100,
+    intent: "preserve quality, reduce toward ~43–45MB, stop at <=45MB",
   });
 
-  for (let i = 0; i < ladder.length; i++) {
-    const step = ladder[i];
+  // Stage A — preserve quality first.
+  console.log("[ZONE_A_COMPRESS_STAGE_A]", { jobId, stage: "A" });
+  for (let i = 0; i < ladderStageA.length; i++) {
+    const step = ladderStageA[i];
     const outPath = path.join(
       outDir,
       `.__zone_a_ladder_${step.target}_${rand6()}.pdf`,
@@ -470,6 +477,7 @@ async function runZoneACompressionLadder(
     const resultMb = Math.round(bytesToMb(outBytes) * 100) / 100;
     console.log("[ZONE_A_COMPRESS_STEP]", {
       jobId,
+      stage: "A",
       stepTarget: step.target,
       resultMb,
     });
@@ -478,10 +486,86 @@ async function runZoneACompressionLadder(
     prevOutput = outPath;
 
     if (outBytes > 0 && outBytes <= hardMaxBytes) {
+      const finalMb = Math.round(bytesToMb(outBytes) * 100) / 100;
       console.log("[ZONE_A_COMPRESS_STOP]", {
         jobId,
-        resultMb,
+        resultMb: finalMb,
         reason: "under_hard_max",
+      });
+      console.log("[ZONE_A_COMPRESS_RESULT]", {
+        finalMb,
+        inIdealRange:
+          finalMb >= ZONE_A_TARGET_MB_IDEAL_MIN &&
+          finalMb <= ZONE_A_TARGET_MB_IDEAL_MAX,
+        hardMaxReached: finalMb <= ZONE_A_TARGET_MB_HARD_MAX,
+      });
+      return outPath;
+    }
+
+    curInput = outPath;
+  }
+
+  // Stage B — allow mild additional image-quality sacrifice if still above 45MB.
+  curInput = prevOutput || inputPdfPath;
+  console.log("[ZONE_A_COMPRESS_STAGE_B]", { jobId, stage: "B" });
+  for (let i = 0; i < ladderStageB.length; i++) {
+    const step = ladderStageB[i];
+    const outPath = path.join(
+      outDir,
+      `.__zone_a_ladder_B${step.target}_${rand6()}.pdf`,
+    );
+    const tPy = boundedTimeout(120_000, expiresAtIso, 20_000, 120_000);
+    await runCmd(
+      pyExe,
+      [
+        path.join(__dirname, "tools", "selective_recompress.py"),
+        curInput,
+        outPath,
+        "--target_mb",
+        String(step.target),
+        "--passes",
+        String(step.passes),
+        "--top_k",
+        "220",
+        "--min_stream_kb",
+        "180",
+        "--max_side",
+        String(step.maxSide || 1400),
+        "--jpeg_q",
+        String(step.jpegQ || 42),
+        "--force",
+      ],
+      tPy,
+      {},
+      [0],
+    );
+
+    const outBytes = safeStatSize(outPath) ?? 0;
+    const resultMb = Math.round(bytesToMb(outBytes) * 100) / 100;
+    console.log("[ZONE_A_COMPRESS_STEP]", {
+      jobId,
+      stage: "B",
+      stepTarget: step.target,
+      resultMb,
+    });
+
+    if (prevOutput && prevOutput !== inputPdfPath) safeUnlink(prevOutput);
+    prevOutput = outPath;
+
+    if (outBytes > 0 && outBytes <= hardMaxBytes) {
+      const finalMb = Math.round(bytesToMb(outBytes) * 100) / 100;
+      console.log("[ZONE_A_COMPRESS_STOP]", {
+        jobId,
+        resultMb: finalMb,
+        reason: "under_hard_max",
+        stage: "B",
+      });
+      console.log("[ZONE_A_COMPRESS_RESULT]", {
+        finalMb,
+        inIdealRange:
+          finalMb >= ZONE_A_TARGET_MB_IDEAL_MIN &&
+          finalMb <= ZONE_A_TARGET_MB_IDEAL_MAX,
+        hardMaxReached: finalMb <= ZONE_A_TARGET_MB_HARD_MAX,
       });
       return outPath;
     }
@@ -497,6 +581,15 @@ async function runZoneACompressionLadder(
     resultMb: finalMb,
     reason: "ladder_exhausted",
   });
+  if (finalMb != null) {
+    console.log("[ZONE_A_COMPRESS_RESULT]", {
+      finalMb,
+      inIdealRange:
+        finalMb >= ZONE_A_TARGET_MB_IDEAL_MIN &&
+        finalMb <= ZONE_A_TARGET_MB_IDEAL_MAX,
+      hardMaxReached: finalMb <= ZONE_A_TARGET_MB_HARD_MAX,
+    });
+  }
   return prevOutput;
 }
 
@@ -3063,8 +3156,8 @@ async function processOneJob(job) {
       }
     }
 
-    // Zone A only: when fewest-files-first (1–5 parts) fails, run compression ladder
-    // (70→60→50→45 MB) until total <=45MB, then split into 5 parts before final failure.
+    // Zone A only: when fewest-files-first (1–5 parts) fails, run quality-preserving
+    // compression ladder toward ~43–45MB (stop at <=45MB), then exact 5-part split.
     if (!hardCapMet && systemFit && zone === "A") {
       try {
         const compressedPdf = await runZoneACompressionLadder(
