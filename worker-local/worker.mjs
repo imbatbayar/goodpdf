@@ -192,6 +192,8 @@ const SYSTEM_PART_BYTES = Math.floor(SYSTEM_PART_MB * 1024 * 1024);
 const SYSTEM_MAX_PARTS = Number(process.env.SYSTEM_MAX_PARTS || 5);
 const SYSTEM_TARGET_PARTS_GOAL = 5;
 const SYSTEM_MAX_PARTS_DEFAULT = 5; // hard cap for DEFAULT; Manual can exceed this
+// Absolute hard cap for dynamic system-fit expansion (final acceptance gate).
+const SYSTEM_MAX_PARTS_HARD_CAP = 25;
 const SYSTEM_TARGET_TOTAL_BYTES = Math.floor(
   SYSTEM_TARGET_PARTS_GOAL * SYSTEM_PART_BYTES * 0.97,
 );
@@ -2860,26 +2862,25 @@ async function processOneJob(job) {
     timing.process_ms = Date.now() - tProcess;
 
     // ---------- FINAL ACCEPTANCE GATE (per-part hard cap) ----------
-    const partBytes = (res.partMeta || [])
+    let partBytes = (res.partMeta || [])
       .map((p) => p.bytes)
       .filter((x) => typeof x === "number" && Number.isFinite(x));
-    const totalPartsBytes = partBytes.length
+    let totalPartsBytes = partBytes.length
       ? partBytes.reduce((a, b) => a + b, 0)
       : null;
-    const maxPartB = partBytes.length ? Math.max(...partBytes) : null;
+    let maxPartB = partBytes.length ? Math.max(...partBytes) : null;
     const zone = inBytes < 200 * 1024 * 1024 ? "A" : "B";
     const targetMb = Math.round(bytesToMb(targetBytes) * 100) / 100;
-    const maxPartMb =
+    let maxPartMb =
       typeof maxPartB === "number"
         ? Math.round(bytesToMb(maxPartB) * 100) / 100
         : null;
-    const totalOutMb =
+    let totalOutMb =
       typeof totalPartsBytes === "number"
         ? Math.round(bytesToMb(totalPartsBytes) * 100) / 100
         : null;
 
-    const hardCapMet =
-      !systemFit || maxPartB == null || maxPartB <= targetBytes;
+    let hardCapMet = !systemFit || maxPartB == null || maxPartB <= targetBytes;
 
     console.log("[FINAL_ACCEPTANCE_CHECK]", {
       jobId,
@@ -2891,6 +2892,74 @@ async function processOneJob(job) {
       targetMb,
       hardCapMet,
     });
+
+    // Dynamic part scaling: when default max parts (5 for Zone A, 10 for Zone B)
+    // cannot satisfy the per-part limit, allow a one-time expansion up to the
+    // hard cap (SYSTEM_MAX_PARTS_HARD_CAP) using oversize-safe split.
+    if (!hardCapMet && systemFit) {
+      const defaultMaxParts =
+        inBytes < 200 * 1024 * 1024 ? SYSTEM_MAX_PARTS_DEFAULT : 10;
+      const requiredPartsRaw =
+        targetBytes > 0 ? Math.ceil(inBytes / targetBytes) : defaultMaxParts;
+      const requiredParts = Math.max(
+        1,
+        Math.min(
+          SYSTEM_MAX_PARTS_HARD_CAP,
+          Number.isFinite(requiredPartsRaw)
+            ? requiredPartsRaw
+            : defaultMaxParts,
+        ),
+      );
+
+      if (requiredParts > defaultMaxParts) {
+        console.log("[DYNAMIC_PART_EXPANSION]", {
+          jobId,
+          inputMb: Math.round(bytesToMb(inBytes) * 100) / 100,
+          targetMb,
+          defaultMaxParts,
+          requiredParts,
+        });
+        try {
+          // Re-split from original input PDF using a higher part cap.
+          safeRm(partsDir);
+          fs.mkdirSync(partsDir, { recursive: true });
+          const dynWarnings = [];
+          const dynRes = await splitOversizeSafe(
+            {
+              inPdf,
+              partsDir,
+              targetBytes,
+              expiresAtIso,
+              maxParts: requiredParts,
+            },
+            dynWarnings,
+          );
+          res = dynRes;
+          partBytes = (res.partMeta || [])
+            .map((p) => p.bytes)
+            .filter((x) => typeof x === "number" && Number.isFinite(x));
+          totalPartsBytes = partBytes.length
+            ? partBytes.reduce((a, b) => a + b, 0)
+            : null;
+          maxPartB = partBytes.length ? Math.max(...partBytes) : null;
+          maxPartMb =
+            typeof maxPartB === "number"
+              ? Math.round(bytesToMb(maxPartB) * 100) / 100
+              : null;
+          totalOutMb =
+            typeof totalPartsBytes === "number"
+              ? Math.round(bytesToMb(totalPartsBytes) * 100) / 100
+              : null;
+          hardCapMet =
+            !systemFit || maxPartB == null || maxPartB <= targetBytes;
+        } catch (e) {
+          console.warn(
+            "[DYNAMIC_PART_EXPANSION] failed, keeping original result:",
+            String(e?.message || e).slice(0, 300),
+          );
+        }
+      }
+    }
 
     if (!hardCapMet) {
       const partsCount = res.partFiles?.length || 0;
