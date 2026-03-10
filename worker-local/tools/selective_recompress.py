@@ -1,5 +1,6 @@
 import argparse
 import os
+import shutil
 import sys
 import json
 import traceback
@@ -224,11 +225,18 @@ def main():
     before = os.path.getsize(inp)
     images_touched = 0
     passes_run = 0
+    base_out, ext_out = os.path.splitext(tmp_out)
 
     cur_in = inp
 
     for _ in range(passes):
         passes_run += 1
+        pass_out = f"{base_out}.pass{passes_run}{ext_out}"
+        print(
+            f"[SELECTIVE_RECOMPRESS] pass={passes_run} input={cur_in!r} output={pass_out!r}",
+            file=sys.stderr,
+        )
+
         with pikepdf.open(cur_in) as pdf:
             images_touched += recompress_topk_parallel(
                 pdf,
@@ -241,27 +249,27 @@ def main():
                 gentle_level=gentle_level,
             )
 
-            # Robust output-path handling (Windows-safe)
-            if passes_run == 1 and os.path.exists(tmp_out):
-                os.remove(tmp_out)
-            out_dir = os.path.dirname(tmp_out)
+            # Robust output-path handling (Windows-safe): never read and write same path
+            if os.path.exists(pass_out):
+                os.remove(pass_out)
+            out_dir = os.path.dirname(pass_out)
             out_dir_exists = os.path.isdir(out_dir) if out_dir else True
-            out_exists_before = os.path.exists(tmp_out)
+            out_exists_before = os.path.exists(pass_out)
             input_exists = os.path.isfile(cur_in)
             input_size = os.path.getsize(cur_in) if input_exists else None
             print(
-                f"[SELECTIVE_RECOMPRESS] before save: input={cur_in!r} output={tmp_out!r} input_exists={input_exists} input_size_bytes={input_size} output_dir_exists={out_dir_exists} output_exists_before_save={out_exists_before}",
+                f"[SELECTIVE_RECOMPRESS] before save: input={cur_in!r} output={pass_out!r} input_exists={input_exists} input_size_bytes={input_size} output_dir_exists={out_dir_exists} output_exists_before_save={out_exists_before}",
                 file=sys.stderr,
             )
 
             # Safe save with retry
             try:
-                pdf.save(tmp_out, garbage=3, deflate=True)
+                pdf.save(pass_out, garbage=3, deflate=True)
             except Exception as e:
                 print(f"[SELECTIVE_RECOMPRESS] save failed (full): {e!r}", file=sys.stderr)
                 print(traceback.format_exc(), file=sys.stderr)
                 try:
-                    pdf.save(tmp_out)
+                    pdf.save(pass_out)
                 except Exception as e2:
                     print(f"[SELECTIVE_RECOMPRESS] retry save failed (full): {e2!r}", file=sys.stderr)
                     print(traceback.format_exc(), file=sys.stderr)
@@ -269,18 +277,30 @@ def main():
                         f"selective_recompress save failed (original: {e!r}, retry: {e2!r})"
                     ) from e2
 
-            saved_bytes = os.path.getsize(tmp_out)
+            saved_bytes = os.path.getsize(pass_out)
             print(
-                f"[SELECTIVE_RECOMPRESS] after save: saved_bytes={saved_bytes} path={tmp_out!r}",
+                f"[SELECTIVE_RECOMPRESS] after save: saved_bytes={saved_bytes} path={pass_out!r}",
                 file=sys.stderr,
             )
 
         after = saved_bytes
+        cur_in = pass_out
         if after <= target_bytes:
             break
 
-        # next pass uses previous output as input
-        cur_in = tmp_out
+    # Place final result at requested output path; clean up intermediates
+    final_result = cur_in
+    if final_result != tmp_out:
+        if os.path.exists(tmp_out):
+            os.remove(tmp_out)
+        shutil.copy2(final_result, tmp_out)
+        for n in range(1, passes_run + 1):
+            p = f"{base_out}.pass{n}{ext_out}"
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
     summary = {
         "before_bytes": before,
