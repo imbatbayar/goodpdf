@@ -2990,6 +2990,22 @@ async function processOneJob(job) {
         targetMb,
       });
 
+      // For FAILED final state, strip success-ish lines from warning_text so
+      // messaging stays truthful (no "Best effort delivered" or "Reached max..." etc.).
+      let failureWarning = res.warningMessage || null;
+      if (failureWarning) {
+        const bannedPhrases = [
+          "Best effort delivered",
+          "Reached max of 5 parts",
+          "Reached max of 10 parts",
+          "Dynamic expansion applied to preserve the 9MB per-part limit",
+        ];
+        const cleanedLines = String(failureWarning)
+          .split("\n")
+          .filter((ln) => !bannedPhrases.some((phrase) => ln.includes(phrase)));
+        failureWarning = cleanedLines.length ? cleanedLines.join("\n") : null;
+      }
+
       await updateJob(jobId, {
         status: "FAILED",
         stage: "FAILED",
@@ -3006,7 +3022,7 @@ async function processOneJob(job) {
         output_zip_bytes: null,
         target_mb: SYSTEM_PART_MB,
         max_part_mb: maxPartMb,
-        warning_text: res.warningMessage || null,
+        warning_text: failureWarning,
         error_text: errorText,
         error_code: "SPLIT_TARGET_NOT_MET",
         claimed_by: null,
