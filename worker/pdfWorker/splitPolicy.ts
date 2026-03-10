@@ -4,11 +4,17 @@
  * Policy is ALWAYS based on ORIGINAL INPUT PDF size:
  * - Input < 200MB → goal ≤ 5 parts
  * - Input 200–500MB → goal ≤ 10 parts
- * - Target part size ≈ 9MB (prefer 8–9MB)
+ * - Target part size ≈ 9MB
  */
 
 export const TARGET_PART_BYTES = 9 * 1024 * 1024; // 9MB
 export const TARGET_PART_MB = 9;
+
+export interface SplitPolicy {
+  policyMaxParts: number;
+  targetPartBytes: number;
+  policyLabel: string;
+}
 
 export interface PolicyFromInput {
   maxParts: number;
@@ -18,21 +24,36 @@ export interface PolicyFromInput {
 
 /**
  * Single-source policy from ORIGINAL INPUT bytes.
- * Use this everywhere; never derive policy from compressed size.
+ * Validates input; if invalid, falls back safely to 5 parts and 9MB target.
  */
-export function getPolicyFromInputBytes(originalInputBytes: number): PolicyFromInput {
+export function getSplitPolicy(originalInputBytes: number): SplitPolicy {
+  const targetPartBytes = TARGET_PART_BYTES;
+  const invalid =
+    !Number.isFinite(originalInputBytes) ||
+    originalInputBytes < 0 ||
+    originalInputBytes !== Math.floor(originalInputBytes);
+  if (invalid) {
+    return {
+      policyMaxParts: 5,
+      targetPartBytes,
+      policyLabel: "under_200mb",
+    };
+  }
   const fileSizeMB = originalInputBytes / (1024 * 1024);
-  const targetPartBytes =
-    Number.isFinite(TARGET_PART_BYTES) && TARGET_PART_BYTES > 0
-      ? TARGET_PART_BYTES
-      : 9 * 1024 * 1024;
   if (fileSizeMB < 200) {
-    return { maxParts: 5, targetPartBytes, policyLabel: "under_200mb" };
+    return { policyMaxParts: 5, targetPartBytes, policyLabel: "under_200mb" };
   }
-  if (fileSizeMB <= 500) {
-    return { maxParts: 10, targetPartBytes, policyLabel: "200_to_500mb" };
-  }
-  return { maxParts: 10, targetPartBytes, policyLabel: "over_500mb" };
+  return { policyMaxParts: 10, targetPartBytes, policyLabel: "200mb_to_500mb" };
+}
+
+/** @deprecated Use getSplitPolicy */
+export function getPolicyFromInputBytes(originalInputBytes: number): PolicyFromInput {
+  const p = getSplitPolicy(originalInputBytes);
+  return {
+    maxParts: p.policyMaxParts,
+    targetPartBytes: p.targetPartBytes,
+    policyLabel: p.policyLabel,
+  };
 }
 
 /**
@@ -40,7 +61,7 @@ export function getPolicyFromInputBytes(originalInputBytes: number): PolicyFromI
  * Policy: input < 200MB => maxParts = 5; input 200–500MB => maxParts = 10.
  */
 export function getPartLimit(fileSizeBytes: number): number {
-  return getPolicyFromInputBytes(fileSizeBytes).maxParts;
+  return getSplitPolicy(fileSizeBytes).policyMaxParts;
 }
 
 /** Estimate pages per part using average bytes per page */
@@ -95,12 +116,12 @@ export function getPolicySummary(
   pagesPerPart: number;
   ranges: Array<{ start: number; end: number }>;
 } {
-  const partLimit = getPartLimit(fileSizeBytes);
+  const policy = getSplitPolicy(fileSizeBytes);
   const pagesPerPart = estimatePagesPerPart(fileSizeBytes, pageCount);
-  const ranges = buildSplitRanges(pageCount, pagesPerPart, partLimit);
+  const ranges = buildSplitRanges(pageCount, pagesPerPart, policy.policyMaxParts);
   return {
-    partLimit,
-    targetPartBytes: TARGET_PART_BYTES,
+    partLimit: policy.policyMaxParts,
+    targetPartBytes: policy.targetPartBytes,
     pagesPerPart,
     ranges,
   };

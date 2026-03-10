@@ -11,14 +11,25 @@ import * as fs from "fs";
 import * as path from "path";
 import { compressBalanced, compressRescue, imagesToPdf } from "./ghostscript";
 import {
-  getPolicyFromInputBytes,
+  getSplitPolicy,
   buildSplitRanges,
   estimatePagesPerPart,
 } from "./splitPolicy";
+import {
+  probePageSizesViaSingles,
+  buildRangesNearTarget,
+} from "./pageProbe";
 import { pdfToImages } from "./rasterFallback";
 
 const QPDF_EXE = process.env.QPDF_EXE || "qpdf";
 const DEFAULT_TIMEOUT_MS = 120_000;
+
+export type StrategyUsed =
+  | "balanced"
+  | "rescue"
+  | "raster_q60"
+  | "raster_q45"
+  | "raster_q35";
 
 export interface ProcessPdfResult {
   parts: string[];
@@ -29,6 +40,7 @@ export interface ProcessPdfResult {
   finalPartCount: number;
   maxPartBytes: number;
   fitStatus: "fit" | "best_effort";
+  strategyUsed: StrategyUsed;
 }
 
 function runCmd(
@@ -148,9 +160,9 @@ export async function processPdf(
 
   // Policy from ORIGINAL INPUT only — never from compressed size
   const originalInputBytes = safeStatSize(inputPath) ?? 0;
-  const policy = getPolicyFromInputBytes(originalInputBytes);
-  const partTargetBytes = policy.targetPartBytes;
-  const partLimit = policy.maxParts;
+  const policy = getSplitPolicy(originalInputBytes);
+  const targetPartBytes = policy.targetPartBytes;
+  const policyMaxParts = policy.policyMaxParts;
 
   const workDir = path.join(outputDir, ".__process_work");
   const partsDir = outputDir;
@@ -181,13 +193,35 @@ export async function processPdf(
     const compressedBytes = safeStatSize(compressedPath) ?? 0;
     const pageCount = await qpdfPages(compressedPath, timeoutMs);
 
-    // 3. Split using policy from original input (partLimit already set above)
-    const pagesPerPart = estimatePagesPerPart(
-      compressedBytes,
-      pageCount,
-      partTargetBytes
-    );
-    const ranges = buildSplitRanges(pageCount, pagesPerPart, partLimit);
+    // 3. Byte-aware split planning: probe page sizes, then build ranges
+    let ranges: Array<{ start: number; end: number }>;
+    const probeDir = path.join(workDir, ".__probe");
+    let pageBytes: number[] | null = null;
+    try {
+      pageBytes = await probePageSizesViaSingles(
+        compressedPath,
+        pageCount,
+        probeDir,
+        Math.min(120_000, timeoutMs)
+      );
+    } catch {
+      pageBytes = null;
+    }
+
+    if (pageBytes && pageBytes.length === pageCount) {
+      ranges = buildRangesNearTarget(
+        pageBytes,
+        targetPartBytes,
+        policyMaxParts
+      );
+    } else {
+      const pagesPerPart = estimatePagesPerPart(
+        compressedBytes,
+        pageCount,
+        targetPartBytes
+      );
+      ranges = buildSplitRanges(pageCount, pagesPerPart, policyMaxParts);
+    }
 
     // 4. Split
     let partPaths = await splitByRanges(
@@ -197,11 +231,13 @@ export async function processPdf(
       timeoutMs
     );
 
-    // 5. Oversize rescue: recompress parts > partTargetBytes
+    // 5. Oversize rescue: recompress parts > targetPartBytes
+    let strategyUsed: StrategyUsed = "balanced";
     for (let i = 0; i < partPaths.length; i++) {
       const p = partPaths[i];
       const sz = safeStatSize(p) ?? 0;
-      if (sz > partTargetBytes) {
+      if (sz > targetPartBytes) {
+        strategyUsed = "rescue";
         const rescuedPath = path.join(workDir, `rescued_${i + 1}.pdf`);
         tempFiles.push(rescuedPath);
         await compressRescue({
@@ -217,50 +253,95 @@ export async function processPdf(
     }
 
     // Check if we're within policy
-    const partSizes = partPaths.map((p) => safeStatSize(p) ?? 0);
-    const maxPartSize = Math.max(...partSizes, 0);
-    const partCount = partPaths.length;
+    let partSizes = partPaths.map((p) => safeStatSize(p) ?? 0);
+    let maxPartSize = Math.max(...partSizes, 0);
+    let partCount = partPaths.length;
     let usedFallback = false;
 
-    // 6. Raster fallback: if part count > limit or any part still > partTargetBytes
-    if (partCount > partLimit || maxPartSize > partTargetBytes) {
-      usedFallback = true;
-      const rasterPath = path.join(workDir, "rasterized.pdf");
-      tempFiles.push(rasterPath);
+    // 6. Raster fallback ladder: q60 -> q45 -> q35
+    const rasterQualities: Array<{ q: number; label: StrategyUsed }> = [
+      { q: 60, label: "raster_q60" },
+      { q: 45, label: "raster_q45" },
+      { q: 35, label: "raster_q35" },
+    ];
 
-      const imagePaths = await pdfToImages(
-        compressedPath,
-        path.join(workDir, ".__raster_imgs"),
-        "page",
-        60,
-        timeoutMs
-      );
-      await imagesToPdf(imagePaths, rasterPath, timeoutMs);
-      safeRm(path.join(workDir, ".__raster_imgs"));
+    for (const { q, label } of rasterQualities) {
+      if (partCount <= policyMaxParts && maxPartSize <= targetPartBytes) break;
+
+      usedFallback = true;
+      strategyUsed = label;
+      const rasterPath = path.join(workDir, `rasterized_q${q}.pdf`);
+      tempFiles.push(rasterPath);
+      const imgDir = path.join(workDir, `.__raster_imgs_q${q}`);
+
+      try {
+        safeRm(imgDir);
+        fs.mkdirSync(imgDir, { recursive: true });
+        const imagePaths = await pdfToImages(
+          compressedPath,
+          imgDir,
+          "page",
+          q,
+          timeoutMs
+        );
+        await imagesToPdf(imagePaths, rasterPath, timeoutMs);
+      } finally {
+        safeRm(imgDir);
+      }
 
       const rasterBytes = safeStatSize(rasterPath) ?? 0;
       const rasterPages = await qpdfPages(rasterPath, timeoutMs);
-      const newPagesPerPart = estimatePagesPerPart(
-        rasterBytes,
-        rasterPages,
-        partTargetBytes
-      );
-      const newRanges = buildSplitRanges(
-        rasterPages,
-        newPagesPerPart,
-        partLimit
-      );
 
-      // Clear old parts and split rasterized PDF
+      let rasterRanges: Array<{ start: number; end: number }>;
+      const rasterProbeDir = path.join(workDir, `.__probe_raster_q${q}`);
+      let rasterPageBytes: number[] | null = null;
+      try {
+        rasterPageBytes = await probePageSizesViaSingles(
+          rasterPath,
+          rasterPages,
+          rasterProbeDir,
+          Math.min(90_000, timeoutMs)
+        );
+      } catch {
+        rasterPageBytes = null;
+      }
+      safeRm(rasterProbeDir);
+
+      if (rasterPageBytes && rasterPageBytes.length === rasterPages) {
+        rasterRanges = buildRangesNearTarget(
+          rasterPageBytes,
+          targetPartBytes,
+          policyMaxParts
+        );
+      } else {
+        const newPagesPerPart = estimatePagesPerPart(
+          rasterBytes,
+          rasterPages,
+          targetPartBytes
+        );
+        rasterRanges = buildSplitRanges(
+          rasterPages,
+          newPagesPerPart,
+          policyMaxParts
+        );
+      }
+
       for (const p of partPaths) safeUnlink(p);
-      partPaths = await splitByRanges(rasterPath, partsDir, newRanges, timeoutMs);
+      partPaths = await splitByRanges(
+        rasterPath,
+        partsDir,
+        rasterRanges,
+        timeoutMs
+      );
 
-      // Final validation after raster fallback: oversize rescue on any part > target
       for (let i = 0; i < partPaths.length; i++) {
         const p = partPaths[i];
         const sz = safeStatSize(p) ?? 0;
-        if (sz > partTargetBytes) {
-          const rescuedPath = path.join(workDir, `raster_rescued_${i + 1}.pdf`);
+        if (sz > targetPartBytes) {
+          const rescuedPath = path.join(
+            workDir,
+            `raster_rescued_q${q}_${i + 1}.pdf`
+          );
           tempFiles.push(rescuedPath);
           await compressRescue({
             inPdf: p,
@@ -273,6 +354,10 @@ export async function processPdf(
           fs.copyFileSync(rescuedPath, p);
         }
       }
+
+      partSizes = partPaths.map((p) => safeStatSize(p) ?? 0);
+      maxPartSize = Math.max(...partSizes, 0);
+      partCount = partPaths.length;
     }
 
     // Rename to final names: goodPDF-N(1).pdf, goodPDF-N(2).pdf, ...
@@ -294,20 +379,23 @@ export async function processPdf(
     const maxPartBytes = sizes.length > 0 ? Math.max(...sizes) : 0;
     const finalPartCount = finalParts.length;
 
-    const partCountOk = finalPartCount <= partLimit;
-    const maxSizeOk = maxPartBytes <= partTargetBytes;
+    const partCountOk = finalPartCount <= policyMaxParts;
+    const maxSizeOk = maxPartBytes <= targetPartBytes;
+    const fitsReasonably =
+      maxPartBytes <= targetPartBytes * 1.1;
     const fitStatus =
-      partCountOk && maxSizeOk ? "fit" : "best_effort";
+      partCountOk && (maxSizeOk || fitsReasonably) ? "fit" : "best_effort";
 
     return {
       parts: finalParts,
       partCount: finalPartCount,
       avgPartSize,
       usedFallback,
-      policyMaxParts: partLimit,
+      policyMaxParts,
       finalPartCount,
       maxPartBytes,
       fitStatus,
+      strategyUsed,
     };
   } finally {
     for (const f of tempFiles) safeUnlink(f);

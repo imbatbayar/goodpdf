@@ -1067,10 +1067,12 @@ async function qpdfConcatSinglePages(
 }
 
 async function splitOversizeSafe(
-  { inPdf, partsDir, targetBytes, expiresAtIso, maxParts = 5 },
+  { inPdf, partsDir, targetBytes, expiresAtIso, maxParts },
   warnings = null,
 ) {
-  // Fallback when range-split can't enforce <=targetBytes. Cap at maxParts (default 5).
+  const effectiveMaxParts =
+    Number.isFinite(maxParts) && maxParts > 0 ? maxParts : 10;
+  // Fallback when range-split can't enforce <=targetBytes. Cap at maxParts (policy-based).
   fs.mkdirSync(partsDir, { recursive: true });
 
   const pages = await qpdfPages(inPdf, expiresAtIso, warnings);
@@ -1127,8 +1129,8 @@ async function splitOversizeSafe(
     });
   }
 
-  // 3-B) Greedy pack remaining normal pages; cap total parts at maxParts
-  const maxPackedParts = Math.max(1, maxParts - partFiles.length);
+  // 3-B) Greedy pack remaining normal pages; cap total parts at effectiveMaxParts
+  const maxPackedParts = Math.max(1, effectiveMaxParts - partFiles.length);
   let pack = [];
   let packBytes = 0;
   let packStart = null;
@@ -1171,8 +1173,9 @@ async function splitOversizeSafe(
       continue;
     }
 
-    // if adding exceeds, flush current and start new (unless we'd exceed maxParts)
-    const wouldExceedCap = partFiles.length + 1 > maxParts && pack.length > 0;
+    // if adding exceeds, flush current and start new (unless we'd exceed effectiveMaxParts)
+    const wouldExceedCap =
+      partFiles.length + 1 > effectiveMaxParts && pack.length > 0;
     if (
       !wouldExceedCap &&
       packBytes + it.bytes > Math.floor(targetBytes * 0.98)
@@ -1403,12 +1406,12 @@ function choosePartCountBySize({
   pages,
   targetBytes,
   minParts = 1,
-  maxParts = 5,
+  maxParts = 10,
 }) {
   const b = Math.max(0, Number(bytes || 0));
   const p = Math.max(1, Number(pages || 1));
   const t = Math.max(256 * 1024, Number(targetBytes || SYSTEM_PART_BYTES));
-  const maxP = Math.max(1, Math.min(Number(maxParts || 5), p));
+  const maxP = Math.max(1, Math.min(Number(maxParts || 10), p));
 
   const ideal = Math.ceil(b / t);
   return Math.max(1, Math.min(maxP, ideal));
@@ -1884,7 +1887,8 @@ async function processDefaultFast({
     }
   }
 
-  // Achieved stage ladder for DEFAULT (labels/progress; targetA not used as hard trigger)
+  // Achieved stage ladder for DEFAULT (labels/progress; targetA = ideal total bytes)
+  const targetA = effectiveMaxParts * SYSTEM_PART_BYTES;
   const targetB = Math.floor(targetA * 1.6);
   const targetC = Math.floor(targetA * 2.5);
   let achievedStage = "D_RESCUE_SPLIT_ONLY";
@@ -2232,7 +2236,7 @@ async function processDefaultFast({
     // Zone A: try 2 -> 3 -> 4 -> 5; accept first where each part <= 9MB (no total-size floor).
     if (opts.under200Mb) {
       const tryParts = [2, 3, 4, 5];
-      const maxPartsToTry = Math.min(5, pages0);
+      const maxPartsToTry = Math.min(effectiveMaxParts, pages0);
       let pageBytes = null;
       try {
         const probeDir = path.join(wd, ".__probe");
@@ -2255,7 +2259,7 @@ async function processDefaultFast({
                 bytes: bytes0,
                 pages: pages0,
                 targetBytes: partBytes,
-                maxParts: 5,
+                maxParts: effectiveMaxParts,
                 parts: p,
               });
         const resTry = await splitSinglePass(
@@ -2669,6 +2673,10 @@ async function processOneJob(job) {
           pdfRes.policyMaxParts <= 5
             ? "Designed to fit within 5 parts."
             : "Designed to fit within 10 parts.";
+        const strategyNote =
+          pdfRes.strategyUsed && pdfRes.strategyUsed !== "balanced"
+            ? ` Strategy: ${pdfRes.strategyUsed}.`
+            : "";
         res = {
           partFiles: pdfRes.parts,
           partMeta: pdfRes.parts.map((p) => ({
@@ -2678,10 +2686,12 @@ async function processOneJob(job) {
           })),
           warningMessage:
             pdfRes.fitStatus === "best_effort"
-              ? `${policyMsg} Best-effort delivery (some parts may exceed target).`
+              ? `${policyMsg} Best-effort delivery (some parts may exceed target).${strategyNote}`
               : pdfRes.usedFallback
-                ? `${policyMsg} Raster fallback was used to meet policy limits.`
-                : null,
+                ? `${policyMsg} Raster fallback was used to meet policy limits.${strategyNote}`
+                : strategyNote
+                  ? `${policyMsg}${strategyNote}`
+                  : null,
         };
       } catch (pdfWorkerErr) {
         const stage = "processPdf";
@@ -2759,7 +2769,8 @@ async function processOneJob(job) {
     const tFinalize = Date.now();
     const rescueInfo =
       res && res.rescueSplitOnly ? res.rescueReason || null : null;
-    const maxPartsGoal = rescueInfo?.maxPartsGoal ?? 5;
+    const policyMaxPartsFromInput = inBytes < 200 * 1024 * 1024 ? 5 : 10;
+    const maxPartsGoal = rescueInfo?.maxPartsGoal ?? policyMaxPartsFromInput;
     const rescueMsg =
       rescueInfo && systemFit
         ? `Could not reach <=${maxPartsGoal} parts at ${SYSTEM_PART_MB}MB target.\n` +
