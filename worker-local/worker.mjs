@@ -1,7 +1,7 @@
 // worker-local/worker.mjs — GOODPDF Worker (FAST v4.0)
 // Core goals (locked):
-//  - Zone A (<=200MB): Smart Quality Split — fewest files first, minimum damage, 1→2→3→4→5 parts.
-//  - Zone B (>200MB): Hard Limit Split — aggressive compression, <=5 parts near 9MB each.
+//  - Zone A (<200MB): Smart Quality Split — fewest files first, minimum damage, 1→2→3→4→5 parts.
+//  - Zone B (200–500MB): Hard Limit Split — aggressive compression, <=10 parts near 9MB each.
 //  - MANUAL: user target MB (default 9) + quality presets:
 //      High   = 110 DPI / Q50
 //      Medium = 100 DPI / Q45
@@ -1517,10 +1517,9 @@ async function processDefaultFast({
     ? Math.max(30 * 1024 * 1024, HEAVY_FLOOR_BYTES)
     : 0;
   // Single source of truth for policy: <200MB => 5 parts, 200–500MB => 10 parts.
-  const effectiveMaxParts =
-    preInBytes < 200 * 1024 * 1024 ? 5 : 10;
+  const effectiveMaxParts = preInBytes < 200 * 1024 * 1024 ? 5 : 10;
   // Zone A: fewest-files-first, minimum damage; accept any valid fit (no total-size floor rejection).
-  // Zone B: aggressive compression, <=5 parts; uses total cap and quality floor.
+  // Zone B: aggressive compression, <=effectiveMaxParts (5 or 10); uses total cap and quality floor.
   const effectiveTotalCap = isHeavyInput ? totalCapBytes : preBytes;
   const effectiveFloorBytes = isHeavyInput ? heavyFloorBytes : 0; // Zone B only; Zone A never uses
 
@@ -2396,14 +2395,18 @@ async function processDefaultFast({
   }
   if (preInBytes >= 200 * 1024 * 1024) {
     const qualityMsg =
-      "Large PDF: strong compression may be applied. Output up to 5 parts near 9MB each.";
+      effectiveMaxParts <= 5
+        ? "Large PDF: strong compression may be applied. Output up to 5 parts near 9MB each."
+        : "Large PDF: strong compression may be applied. Output up to 10 parts near 9MB each.";
     res.warningMessage = res.warningMessage
       ? `${qualityMsg}\n${res.warningMessage}`
       : qualityMsg;
   }
-  if (partsCount >= SYSTEM_MAX_PARTS_DEFAULT) {
+  if (partsCount >= effectiveMaxParts) {
     const partsMsg =
-      "Reached default max of 5 parts. Use Manual for finer splitting or Compress tool.";
+      effectiveMaxParts <= 5
+        ? "Reached max of 5 parts. Use Manual for finer splitting or Compress tool."
+        : "Reached max of 10 parts. Use Manual for finer splitting or Compress tool.";
     res.warningMessage = res.warningMessage
       ? `${partsMsg}\n${res.warningMessage}`
       : partsMsg;
@@ -2662,6 +2665,10 @@ async function processOneJob(job) {
           ),
           targetBytes: partTargetBytes,
         });
+        const policyMsg =
+          pdfRes.policyMaxParts <= 5
+            ? "Designed to fit within 5 parts."
+            : "Designed to fit within 10 parts.";
         res = {
           partFiles: pdfRes.parts,
           partMeta: pdfRes.parts.map((p) => ({
@@ -2669,9 +2676,12 @@ async function processOneJob(job) {
             bytes: safeStatSize(p) ?? 0,
             sizeMb: Math.round(bytesToMb(safeStatSize(p) ?? 0) * 10) / 10,
           })),
-          warningMessage: pdfRes.usedFallback
-            ? "Raster fallback was used to meet policy limits."
-            : null,
+          warningMessage:
+            pdfRes.fitStatus === "best_effort"
+              ? `${policyMsg} Best-effort delivery (some parts may exceed target).`
+              : pdfRes.usedFallback
+                ? `${policyMsg} Raster fallback was used to meet policy limits.`
+                : null,
         };
       } catch (pdfWorkerErr) {
         const stage = "processPdf";
@@ -2749,9 +2759,10 @@ async function processOneJob(job) {
     const tFinalize = Date.now();
     const rescueInfo =
       res && res.rescueSplitOnly ? res.rescueReason || null : null;
+    const maxPartsGoal = rescueInfo?.maxPartsGoal ?? 5;
     const rescueMsg =
       rescueInfo && systemFit
-        ? `Could not reach <=${SYSTEM_TARGET_PARTS_GOAL} parts at ${SYSTEM_PART_MB}MB target.\n` +
+        ? `Could not reach <=${maxPartsGoal} parts at ${SYSTEM_PART_MB}MB target.\n` +
           `Estimated parts needed: ${rescueInfo.estimatedParts ?? "unknown"}.\n` +
           `Use Manual mode or stronger compression if you need fewer parts.`
         : null;

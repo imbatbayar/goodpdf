@@ -11,8 +11,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { compressBalanced, compressRescue, imagesToPdf } from "./ghostscript";
 import {
-  TARGET_PART_BYTES,
-  getPartLimit,
+  getPolicyFromInputBytes,
   buildSplitRanges,
   estimatePagesPerPart,
 } from "./splitPolicy";
@@ -21,14 +20,15 @@ import { pdfToImages } from "./rasterFallback";
 const QPDF_EXE = process.env.QPDF_EXE || "qpdf";
 const DEFAULT_TIMEOUT_MS = 120_000;
 
-/** Single source for part-size budget. Never allow missing/invalid targetBytes. */
-const SYSTEM_PART_BYTES = TARGET_PART_BYTES;
-
 export interface ProcessPdfResult {
   parts: string[];
   partCount: number;
   avgPartSize: number;
   usedFallback: boolean;
+  policyMaxParts: number;
+  finalPartCount: number;
+  maxPartBytes: number;
+  fitStatus: "fit" | "best_effort";
 }
 
 function runCmd(
@@ -145,11 +145,12 @@ export async function processPdf(
   options?: { timeoutMs?: number; targetBytes?: number }
 ): Promise<ProcessPdfResult> {
   const timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const rawTarget = options?.targetBytes ?? SYSTEM_PART_BYTES;
-  const partTargetBytes =
-    Number.isFinite(rawTarget) && rawTarget > 0
-      ? Math.floor(rawTarget)
-      : SYSTEM_PART_BYTES;
+
+  // Policy from ORIGINAL INPUT only — never from compressed size
+  const originalInputBytes = safeStatSize(inputPath) ?? 0;
+  const policy = getPolicyFromInputBytes(originalInputBytes);
+  const partTargetBytes = policy.targetPartBytes;
+  const partLimit = policy.maxParts;
 
   const workDir = path.join(outputDir, ".__process_work");
   const partsDir = outputDir;
@@ -177,13 +178,12 @@ export async function processPdf(
       timeoutMs,
     });
 
-    const fileSizeBytes = safeStatSize(compressedPath) ?? 0;
+    const compressedBytes = safeStatSize(compressedPath) ?? 0;
     const pageCount = await qpdfPages(compressedPath, timeoutMs);
 
-    // 3. Determine policy: <200MB => 5 parts, 200–500MB => 10 parts
-    const partLimit = getPartLimit(fileSizeBytes);
+    // 3. Split using policy from original input (partLimit already set above)
     const pagesPerPart = estimatePagesPerPart(
-      fileSizeBytes,
+      compressedBytes,
       pageCount,
       partTargetBytes
     );
@@ -254,6 +254,25 @@ export async function processPdf(
       // Clear old parts and split rasterized PDF
       for (const p of partPaths) safeUnlink(p);
       partPaths = await splitByRanges(rasterPath, partsDir, newRanges, timeoutMs);
+
+      // Final validation after raster fallback: oversize rescue on any part > target
+      for (let i = 0; i < partPaths.length; i++) {
+        const p = partPaths[i];
+        const sz = safeStatSize(p) ?? 0;
+        if (sz > partTargetBytes) {
+          const rescuedPath = path.join(workDir, `raster_rescued_${i + 1}.pdf`);
+          tempFiles.push(rescuedPath);
+          await compressRescue({
+            inPdf: p,
+            outPdf: rescuedPath,
+            pdfSettings: "/screen",
+            colorImageResolution: 110,
+            grayImageResolution: 110,
+            timeoutMs,
+          });
+          fs.copyFileSync(rescuedPath, p);
+        }
+      }
     }
 
     // Rename to final names: goodPDF-N(1).pdf, goodPDF-N(2).pdf, ...
@@ -272,12 +291,23 @@ export async function processPdf(
     const sizes = finalParts.map((p) => safeStatSize(p) ?? 0);
     const totalBytes = sizes.reduce((a, b) => a + b, 0);
     const avgPartSize = sizes.length > 0 ? totalBytes / sizes.length : 0;
+    const maxPartBytes = sizes.length > 0 ? Math.max(...sizes) : 0;
+    const finalPartCount = finalParts.length;
+
+    const partCountOk = finalPartCount <= partLimit;
+    const maxSizeOk = maxPartBytes <= partTargetBytes;
+    const fitStatus =
+      partCountOk && maxSizeOk ? "fit" : "best_effort";
 
     return {
       parts: finalParts,
-      partCount: finalParts.length,
+      partCount: finalPartCount,
       avgPartSize,
       usedFallback,
+      policyMaxParts: partLimit,
+      finalPartCount,
+      maxPartBytes,
+      fitStatus,
     };
   } finally {
     for (const f of tempFiles) safeUnlink(f);

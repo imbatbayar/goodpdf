@@ -1,7 +1,7 @@
 /**
  * splitPolicy.ts — Deterministic PDF split policy for GOODPDF
  *
- * Policies:
+ * Policy is ALWAYS based on ORIGINAL INPUT PDF size:
  * - Input < 200MB → goal ≤ 5 parts
  * - Input 200–500MB → goal ≤ 10 parts
  * - Target part size ≈ 9MB (prefer 8–9MB)
@@ -10,15 +10,37 @@
 export const TARGET_PART_BYTES = 9 * 1024 * 1024; // 9MB
 export const TARGET_PART_MB = 9;
 
+export interface PolicyFromInput {
+  maxParts: number;
+  targetPartBytes: number;
+  policyLabel: string;
+}
+
+/**
+ * Single-source policy from ORIGINAL INPUT bytes.
+ * Use this everywhere; never derive policy from compressed size.
+ */
+export function getPolicyFromInputBytes(originalInputBytes: number): PolicyFromInput {
+  const fileSizeMB = originalInputBytes / (1024 * 1024);
+  const targetPartBytes =
+    Number.isFinite(TARGET_PART_BYTES) && TARGET_PART_BYTES > 0
+      ? TARGET_PART_BYTES
+      : 9 * 1024 * 1024;
+  if (fileSizeMB < 200) {
+    return { maxParts: 5, targetPartBytes, policyLabel: "under_200mb" };
+  }
+  if (fileSizeMB <= 500) {
+    return { maxParts: 10, targetPartBytes, policyLabel: "200_to_500mb" };
+  }
+  return { maxParts: 10, targetPartBytes, policyLabel: "over_500mb" };
+}
+
 /**
  * Part limit based on input file size (MB).
  * Policy: input < 200MB => maxParts = 5; input 200–500MB => maxParts = 10.
  */
 export function getPartLimit(fileSizeBytes: number): number {
-  const fileSizeMB = fileSizeBytes / (1024 * 1024);
-  if (fileSizeMB < 200) return 5;
-  if (fileSizeMB <= 500) return 10;
-  return 10; // cap at 10 for 500MB+
+  return getPolicyFromInputBytes(fileSizeBytes).maxParts;
 }
 
 /** Estimate pages per part using average bytes per page */

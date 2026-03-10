@@ -2,7 +2,7 @@
 
 Production PDF processing pipeline: **Normalize → Compress → Split → Oversize Rescue → Raster Fallback**.
 
-## Policies
+Policy is **always** based on **original input PDF size** (never compressed size):
 
 | Input Size | Part Limit |
 |------------|------------|
@@ -30,15 +30,17 @@ Production PDF processing pipeline: **Normalize → Compress → Split → Overs
 npm run build:worker
 ```
 
+Output: `worker/dist/` (single build location). Runtime imports from `../worker/dist/index.js`.
+
 ## Usage
 
 ```ts
-import { processPdf } from "./worker/pdfWorker";
+import { processPdf } from "../worker/dist/index.js";
 
 const result = await processPdf("/path/to/input.pdf", "/path/to/output");
-// result: { parts, partCount, avgPartSize, usedFallback }
+// result: { parts, partCount, avgPartSize, usedFallback, policyMaxParts, finalPartCount, maxPartBytes, fitStatus }
 ```
 
 ## Integration with worker-local
 
-Set `USE_PDF_WORKER=true` to use this deterministic pipeline instead of the default adaptive logic. Requires `npm run build:worker` first.
+Set `USE_PDF_WORKER=true` to use this deterministic pipeline as the authoritative split engine. Requires `npm run build:worker` first.
