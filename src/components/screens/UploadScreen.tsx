@@ -179,6 +179,13 @@ function refusalMessage(errorCode?: string | null, fallback?: string | null): st
   const code = String(errorCode || "").toUpperCase();
   if (code === "REFUSED_CORRUPT_PDF") return "PDF is corrupt or invalid.";
   if (code === "REFUSED_IMAGE_HEAVY") return "This PDF could not be reduced to fit within the default size limit (9MB, up to 5 parts). Try a larger target size per part in Manual mode, or use a less image-heavy file.";
+  if (code === "SPLIT_TARGET_NOT_MET") {
+    // Backend error_text already includes detailed numbers; use a clear, user-facing summary here.
+    return (
+      fallback ||
+      "Could not fit all parts within the 9MB per-part limit. Try Manual mode or stronger compression."
+    );
+  }
   return fallback || "Something went wrong.";
 }
 

@@ -46,6 +46,7 @@ type ResultSummary = {
   partsCount?: number | null;
   maxPartMb?: number | null;
   targetMb?: number | null;
+  hasZip?: boolean | null;
 };
 
 function nowMs() {
@@ -348,13 +349,19 @@ export function useUploadFlow() {
         partsCount: st.partsCount ?? null,
         maxPartMb: st.maxPartMb ?? null,
         targetMb: st.targetMb ?? null,
+        hasZip: st.outputZipPath ? true : false,
       });
       setWarning(st.warningText ?? null);
       setErrorCode(st.errorCode ?? null);
 
       if (nextPhase === "READY") {
         processingStartedRef.current = false;
-        setDownloadUrl(JobService.downloadUrl(jid));
+        // Only expose download when backend reports a zip path.
+        if (st.outputZipPath) {
+          setDownloadUrl(JobService.downloadUrl(jid));
+        } else {
+          setDownloadUrl(null);
+        }
         setBusy(false);
         closeEventSource();
         stopPolling();
@@ -389,6 +396,7 @@ export function useUploadFlow() {
           partsCount: st.partsCount,
           maxPartMb: st.maxPartMb,
           targetMb: st.targetMb,
+          outputZipPath: (st as any).outputZipPath,
           errorText: st.errorText,
           warningText: (st as any).warningText,
         },

@@ -37,6 +37,9 @@ export type StatusResp = {
   stage?: string | null;
   downloadUrl?: string | null;
 
+  // Raw storage path for ZIP (truth source for whether download is available)
+  outputZipPath?: string | null;
+
   partsCount?: number | null;
   maxPartMb?: number | null;
   targetMb?: number | null;

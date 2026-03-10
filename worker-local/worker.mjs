@@ -972,15 +972,29 @@ async function shrinkOversizePartsAggressive({
   expiresAtIso,
   maxPasses = 1,
   onProgress,
+  zoneA = false,
 }) {
   const fileByName = new Map(
     (res.partFiles || []).map((p) => [path.basename(p), p]),
   );
-  const passes = [
-    { dpi: 42, jpegQ: 14 },
-    { dpi: 36, jpegQ: 10 },
-    { dpi: 30, jpegQ: 8 },
-  ];
+  // Zone A (<200MB): gentle, quality-preserving part-fit ladder.
+  // Zone B (>=200MB): retain existing aggressive ladder for hard-fit behavior.
+  const passes = zoneA
+    ? [
+        { dpi: 150, jpegQ: 60, pdfSettings: "/ebook" },
+        { dpi: 135, jpegQ: 54, pdfSettings: "/ebook" },
+        { dpi: 120, jpegQ: 50, pdfSettings: "/screen" },
+      ]
+    : [
+        { dpi: 42, jpegQ: 14, pdfSettings: "/screen" },
+        { dpi: 36, jpegQ: 10, pdfSettings: "/screen" },
+        { dpi: 30, jpegQ: 8, pdfSettings: "/screen" },
+      ];
+
+  // For Zone A we keep a soft lower guard so we don't keep shrinking already-small parts.
+  const lowerGuardBytes = zoneA
+    ? Math.max(Math.floor(targetBytes * 0.55), 5 * 1024 * 1024)
+    : 0;
 
   const passCount = Math.max(1, Math.min(maxPasses, passes.length));
   for (let i = 0; i < passCount; i++) {
@@ -1003,10 +1017,20 @@ async function shrinkOversizePartsAggressive({
           expiresAtIso,
           dpi: pass.dpi,
           jpegQ: pass.jpegQ,
-          pdfSettings: "/screen",
+          pdfSettings: pass.pdfSettings,
         });
+        // Stop tracking as oversize once it is reasonably close to target.
+        // For Zone A, avoid driving parts far below the useful 5–9MB band.
         meta.bytes = nb;
         meta.sizeMb = Math.round(bytesToMb(nb) * 10) / 10;
+        if (zoneA && nb > 0 && nb < lowerGuardBytes) {
+          console.log("[ZONE_A_PART_RESCUE]", {
+            name: meta.name,
+            bytesMb: Math.round(bytesToMb(nb) * 100) / 100,
+            targetMb: Math.round(bytesToMb(targetBytes) * 100) / 100,
+            lowerGuardMb: Math.round(bytesToMb(lowerGuardBytes) * 100) / 100,
+          });
+        }
         done += 1;
         if (typeof onProgress === "function") {
           await Promise.resolve(
@@ -2422,70 +2446,109 @@ async function processDefaultFast({
       : qpdfMsg;
   }
 
-  // Push oversized parts down to <=9MB (hard rule).
-  if (maxPartBytes(res.partMeta) > targetBytes) {
-    await updateJob(jobId, {
-      stage: "PART_FIT_9MB",
-      progress: 68,
-      split_progress: 52,
-      updated_at: nowIso(),
-    });
-    res = await shrinkOversizePartsAggressive({
-      res,
-      targetBytes,
-      expiresAtIso,
-      maxPasses: heavyLane ? HEAVY_EXTRA_SHRINK_PASSES : 2,
-      onProgress: async ({
-        pass,
-        passCount,
-        done,
-        total,
-        maxPartBytes: mpb,
-      }) => {
-        const localPct = total > 0 ? done / total : 0;
-        const pct = Math.round(68 + ((pass - 1 + localPct) / passCount) * 18);
-        await updateJob(jobId, {
-          stage: "PART_FIT_9MB",
-          progress: Math.min(95, Math.max(68, pct)),
-          split_progress: Math.min(95, Math.max(52, pct)),
-          max_part_mb: Math.round(bytesToMb(mpb) * 100) / 100,
-          updated_at: nowIso(),
-        });
-      },
-    });
-  }
+  const zoneA = preInBytes < 200 * 1024 * 1024;
 
-  if (maxPartBytes(res.partMeta) > targetBytes && !softStop()) {
-    await updateJob(jobId, {
-      stage: "OVERSIZE_SAFE_SPLIT",
-      progress: 86,
-      split_progress: 78,
-      updated_at: nowIso(),
-    });
-    res = await splitOversizeSafe(
-      {
-        inPdf: workPdf,
-        partsDir,
-        targetBytes,
-        expiresAtIso,
-        maxParts: effectiveMaxParts,
-      },
-      qpdfWarnings,
-    );
+  // Zone-aware part-fit:
+  // - Zone A (<200MB): prefer repartitioning (splitOversizeSafe) before gentle rescue.
+  // - Zone B (>=200MB): retain existing aggressive hard-fit behavior.
+  if (maxPartBytes(res.partMeta) > targetBytes) {
+    if (zoneA && !softStop()) {
+      console.log("[ZONE_A_REPARTITION]", {
+        jobId,
+        inputMb: Math.round(bytesToMb(preInBytes) * 100) / 100,
+        estimatedParts,
+        maxPartsGoal: effectiveMaxParts,
+        targetMb: Math.round(bytesToMb(targetBytes) * 100) / 100,
+      });
+      await updateJob(jobId, {
+        stage: "OVERSIZE_SAFE_SPLIT",
+        progress: 70,
+        split_progress: 55,
+        updated_at: nowIso(),
+      });
+      res = await splitOversizeSafe(
+        {
+          inPdf: workPdf,
+          partsDir,
+          targetBytes,
+          expiresAtIso,
+          maxParts: effectiveMaxParts,
+        },
+        qpdfWarnings,
+      );
+    }
+
     if (maxPartBytes(res.partMeta) > targetBytes) {
+      await updateJob(jobId, {
+        stage: "PART_FIT_9MB",
+        progress: 68,
+        split_progress: 52,
+        updated_at: nowIso(),
+      });
       res = await shrinkOversizePartsAggressive({
         res,
         targetBytes,
         expiresAtIso,
         maxPasses: heavyLane ? HEAVY_EXTRA_SHRINK_PASSES : 2,
+        onProgress: async ({
+          pass,
+          passCount,
+          done,
+          total,
+          maxPartBytes: mpb,
+        }) => {
+          const localPct = total > 0 ? done / total : 0;
+          const pct = Math.round(68 + ((pass - 1 + localPct) / passCount) * 18);
+          await updateJob(jobId, {
+            stage: zoneA ? "ZONE_A_PART_RESCUE" : "PART_FIT_9MB",
+            progress: Math.min(95, Math.max(68, pct)),
+            split_progress: Math.min(95, Math.max(52, pct)),
+            max_part_mb: Math.round(bytesToMb(mpb) * 100) / 100,
+            updated_at: nowIso(),
+          });
+        },
+        zoneA,
       });
     }
-  }
 
-  if (maxPartBytes(res.partMeta) > targetBytes) {
-    console.warn(
-      "[system-fit] hard-fit warning: some parts still exceed 9MB after aggressive fallback",
-    );
+    if (!zoneA && maxPartBytes(res.partMeta) > targetBytes && !softStop()) {
+      console.log("[ZONE_B_HARDFIT]", {
+        jobId,
+        inputMb: Math.round(bytesToMb(preInBytes) * 100) / 100,
+        targetMb: Math.round(bytesToMb(targetBytes) * 100) / 100,
+        maxPartsGoal: effectiveMaxParts,
+      });
+      await updateJob(jobId, {
+        stage: "OVERSIZE_SAFE_SPLIT",
+        progress: 86,
+        split_progress: 78,
+        updated_at: nowIso(),
+      });
+      res = await splitOversizeSafe(
+        {
+          inPdf: workPdf,
+          partsDir,
+          targetBytes,
+          expiresAtIso,
+          maxParts: effectiveMaxParts,
+        },
+        qpdfWarnings,
+      );
+      if (maxPartBytes(res.partMeta) > targetBytes) {
+        res = await shrinkOversizePartsAggressive({
+          res,
+          targetBytes,
+          expiresAtIso,
+          maxPasses: heavyLane ? HEAVY_EXTRA_SHRINK_PASSES : 2,
+        });
+      }
+    }
+
+    if (maxPartBytes(res.partMeta) > targetBytes) {
+      console.warn(
+        "[system-fit] hard-fit warning: some parts still exceed 9MB after final fallback",
+      );
+    }
   }
 
   tmark(T, "end");
@@ -2500,7 +2563,67 @@ async function processDefaultFast({
     0,
   );
 
-  const zoneA = preInBytes < 200 * 1024 * 1024;
+  // Zone A total-output sanity guard: avoid absurdly tiny results for <200MB inputs.
+  if (zoneA && bytesOut > 0) {
+    const requiredParts = Math.max(
+      1,
+      Math.min(partsN || estimatedParts || 1, 5),
+    );
+    const zoneAMinTotalBytes = Math.max(
+      Math.floor(preInBytes * 0.35),
+      requiredParts * 5 * 1024 * 1024,
+    );
+    if (
+      bytesOut < zoneAMinTotalBytes &&
+      bestFitPath &&
+      bestFitBytes > bytesOut
+    ) {
+      console.log("[ZONE_A_REJECT_OVER_SHRINK]", {
+        jobId,
+        inputMb: Math.round(bytesToMb(preInBytes) * 100) / 100,
+        bytesOutMb: Math.round(bytesToMb(bytesOut) * 100) / 100,
+        minTotalMb: Math.round(bytesToMb(zoneAMinTotalBytes) * 100) / 100,
+        bestFitMb: Math.round(bytesToMb(bestFitBytes) * 100) / 100,
+        bestFitStep: bestFitStepLabel,
+        parts: partsN,
+      });
+      try {
+        const resBetter = await splitForSystem(bestFitPath, {
+          targetBytes: SYSTEM_PART_BYTES,
+          maxParts: effectiveMaxParts,
+          under200Mb,
+        });
+        const betterBytesOut = (resBetter.partMeta || []).reduce(
+          (s, m) => s + (Number(m?.bytes) || 0),
+          0,
+        );
+        const betterMaxPart = maxPartBytes(resBetter.partMeta);
+        if (
+          betterBytesOut > bytesOut &&
+          betterBytesOut >= zoneAMinTotalBytes &&
+          betterMaxPart <= targetBytes
+        ) {
+          console.log("[ZONE_A_ACCEPT_FINAL]", {
+            jobId,
+            inputMb: Math.round(bytesToMb(preInBytes) * 100) / 100,
+            bytesOutMb: Math.round(bytesToMb(betterBytesOut) * 100) / 100,
+            maxPartMb: Math.round(bytesToMb(betterMaxPart) * 100) / 100,
+            parts: (resBetter.partMeta && resBetter.partMeta.length) || 0,
+          });
+          res = resBetter;
+        }
+      } catch (e) {
+        console.warn("[ZONE_A_ACCEPT_FINAL] re-split from bestFit failed:", e);
+      }
+    } else {
+      console.log("[ZONE_A_GUARD]", {
+        jobId,
+        inputMb: Math.round(bytesToMb(preInBytes) * 100) / 100,
+        bytesOutMb: Math.round(bytesToMb(bytesOut) * 100) / 100,
+        parts: partsN,
+      });
+    }
+  }
   console.log("[DEFAULT_STAGE]", {
     jobId,
     zone: zoneA ? "A" : "B",
@@ -2643,6 +2766,8 @@ async function processOneJob(job) {
     }
 
     const systemFit = true;
+    // Hard per-part cap for DEFAULT mode (systemFit); defaults to 9MB.
+    let targetBytes = SYSTEM_PART_BYTES;
 
     let res;
     const tProcess = Date.now();
@@ -2658,6 +2783,7 @@ async function processOneJob(job) {
         Number.isFinite(SYSTEM_PART_BYTES) && SYSTEM_PART_BYTES > 0
           ? SYSTEM_PART_BYTES
           : 9 * 1024 * 1024;
+      targetBytes = partTargetBytes;
       try {
         const pdfWorkerUrl = new URL("../worker/dist/index.js", import.meta.url)
           .href;
@@ -2733,6 +2859,104 @@ async function processOneJob(job) {
     }
     timing.process_ms = Date.now() - tProcess;
 
+    // ---------- FINAL ACCEPTANCE GATE (per-part hard cap) ----------
+    const partBytes = (res.partMeta || [])
+      .map((p) => p.bytes)
+      .filter((x) => typeof x === "number" && Number.isFinite(x));
+    const totalPartsBytes = partBytes.length
+      ? partBytes.reduce((a, b) => a + b, 0)
+      : null;
+    const maxPartB = partBytes.length ? Math.max(...partBytes) : null;
+    const zone = inBytes < 200 * 1024 * 1024 ? "A" : "B";
+    const targetMb = Math.round(bytesToMb(targetBytes) * 100) / 100;
+    const maxPartMb =
+      typeof maxPartB === "number"
+        ? Math.round(bytesToMb(maxPartB) * 100) / 100
+        : null;
+    const totalOutMb =
+      typeof totalPartsBytes === "number"
+        ? Math.round(bytesToMb(totalPartsBytes) * 100) / 100
+        : null;
+
+    const hardCapMet =
+      !systemFit || maxPartB == null || maxPartB <= targetBytes;
+
+    console.log("[FINAL_ACCEPTANCE_CHECK]", {
+      jobId,
+      zone,
+      systemFit,
+      parts: res.partFiles?.length || 0,
+      totalOutMb,
+      maxPartMb,
+      targetMb,
+      hardCapMet,
+    });
+
+    if (!hardCapMet) {
+      const partsCount = res.partFiles?.length || 0;
+      const errorText =
+        `Could not fit all parts within the ${SYSTEM_PART_MB}MB per-part limit. ` +
+        `Max part was ${maxPartMb ?? "unknown"}MB across ${partsCount} parts. ` +
+        "Use Manual mode or stronger compression if you need fewer or smaller parts.";
+
+      console.log("[FINAL_ACCEPT_REJECT]", {
+        jobId,
+        zone,
+        parts: partsCount,
+        totalOutMb,
+        maxPartMb,
+        targetMb,
+        finalStatus: "FAILED",
+      });
+      console.log("[SPLIT_TARGET_NOT_MET]", {
+        jobId,
+        zone,
+        parts: partsCount,
+        totalOutMb,
+        maxPartMb,
+        targetMb,
+      });
+
+      await updateJob(jobId, {
+        status: "FAILED",
+        stage: "FAILED",
+        progress: 100,
+        split_progress: 100,
+        output_zip_path: null,
+        zip_path: null,
+        ttl_minutes: ttlMinutes,
+        expires_at: expiresAtIso,
+        delete_at: expiresAtIso,
+        parts_count: partsCount || null,
+        parts_json: res.partMeta || null,
+        total_parts_bytes: totalPartsBytes,
+        output_zip_bytes: null,
+        target_mb: SYSTEM_PART_MB,
+        max_part_mb: maxPartMb,
+        warning_text: res.warningMessage || null,
+        error_text: errorText,
+        error_code: "SPLIT_TARGET_NOT_MET",
+        claimed_by: null,
+        claimed_at: null,
+        updated_at: nowIso(),
+      });
+
+      // Do NOT zip/upload on hard-cap failure; end cleanly.
+      timing.finalize_ms = Date.now() - tProcess;
+      timing.total_ms = Date.now() - jobStartMs;
+      return;
+    }
+
+    console.log("[FINAL_ACCEPT_SUCCESS]", {
+      jobId,
+      zone,
+      parts: res.partFiles?.length || 0,
+      totalOutMb,
+      maxPartMb,
+      targetMb,
+      finalStatus: "DONE",
+    });
+
     // ZIP
     const tZip = Date.now();
     await updateJob(jobId, {
@@ -2756,13 +2980,6 @@ async function processOneJob(job) {
     timing.upload_ms = Date.now() - tUpload;
 
     const outZipBytes = safeStatSize(outZip) ?? null;
-    const partBytes = (res.partMeta || [])
-      .map((p) => p.bytes)
-      .filter((x) => typeof x === "number" && Number.isFinite(x));
-    const totalPartsBytes = partBytes.length
-      ? partBytes.reduce((a, b) => a + b, 0)
-      : null;
-    const maxPartB = partBytes.length ? Math.max(...partBytes) : null;
     const warningText =
       systemFit && res.warningMessage ? res.warningMessage : null;
 
