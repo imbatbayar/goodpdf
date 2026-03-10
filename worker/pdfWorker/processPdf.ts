@@ -21,6 +21,9 @@ import { pdfToImages } from "./rasterFallback";
 const QPDF_EXE = process.env.QPDF_EXE || "qpdf";
 const DEFAULT_TIMEOUT_MS = 120_000;
 
+/** Single source for part-size budget. Never allow missing/invalid targetBytes. */
+const SYSTEM_PART_BYTES = TARGET_PART_BYTES;
+
 export interface ProcessPdfResult {
   parts: string[];
   partCount: number;
@@ -139,9 +142,15 @@ async function splitByRanges(
 export async function processPdf(
   inputPath: string,
   outputDir: string,
-  options?: { timeoutMs?: number }
+  options?: { timeoutMs?: number; targetBytes?: number }
 ): Promise<ProcessPdfResult> {
   const timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const rawTarget = options?.targetBytes ?? SYSTEM_PART_BYTES;
+  const partTargetBytes =
+    Number.isFinite(rawTarget) && rawTarget > 0
+      ? Math.floor(rawTarget)
+      : SYSTEM_PART_BYTES;
+
   const workDir = path.join(outputDir, ".__process_work");
   const partsDir = outputDir;
   const tempFiles: string[] = [];
@@ -171,9 +180,13 @@ export async function processPdf(
     const fileSizeBytes = safeStatSize(compressedPath) ?? 0;
     const pageCount = await qpdfPages(compressedPath, timeoutMs);
 
-    // 3. Determine policy
+    // 3. Determine policy: <200MB => 5 parts, 200–500MB => 10 parts
     const partLimit = getPartLimit(fileSizeBytes);
-    const pagesPerPart = estimatePagesPerPart(fileSizeBytes, pageCount);
+    const pagesPerPart = estimatePagesPerPart(
+      fileSizeBytes,
+      pageCount,
+      partTargetBytes
+    );
     const ranges = buildSplitRanges(pageCount, pagesPerPart, partLimit);
 
     // 4. Split
@@ -184,11 +197,11 @@ export async function processPdf(
       timeoutMs
     );
 
-    // 5. Oversize rescue: recompress parts > 9MB
+    // 5. Oversize rescue: recompress parts > partTargetBytes
     for (let i = 0; i < partPaths.length; i++) {
       const p = partPaths[i];
       const sz = safeStatSize(p) ?? 0;
-      if (sz > TARGET_PART_BYTES) {
+      if (sz > partTargetBytes) {
         const rescuedPath = path.join(workDir, `rescued_${i + 1}.pdf`);
         tempFiles.push(rescuedPath);
         await compressRescue({
@@ -209,8 +222,8 @@ export async function processPdf(
     const partCount = partPaths.length;
     let usedFallback = false;
 
-    // 6. Raster fallback: if part count > limit or any part still > 9MB
-    if (partCount > partLimit || maxPartSize > TARGET_PART_BYTES) {
+    // 6. Raster fallback: if part count > limit or any part still > partTargetBytes
+    if (partCount > partLimit || maxPartSize > partTargetBytes) {
       usedFallback = true;
       const rasterPath = path.join(workDir, "rasterized.pdf");
       tempFiles.push(rasterPath);
@@ -227,7 +240,11 @@ export async function processPdf(
 
       const rasterBytes = safeStatSize(rasterPath) ?? 0;
       const rasterPages = await qpdfPages(rasterPath, timeoutMs);
-      const newPagesPerPart = estimatePagesPerPart(rasterBytes, rasterPages);
+      const newPagesPerPart = estimatePagesPerPart(
+        rasterBytes,
+        rasterPages,
+        partTargetBytes
+      );
       const newRanges = buildSplitRanges(
         rasterPages,
         newPagesPerPart,

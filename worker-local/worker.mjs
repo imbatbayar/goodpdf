@@ -1516,8 +1516,9 @@ async function processDefaultFast({
   const heavyFloorBytes = isHeavyInput
     ? Math.max(30 * 1024 * 1024, HEAVY_FLOOR_BYTES)
     : 0;
-  // Single source of truth for policy (used everywhere).
-  const effectiveMaxParts = 5;
+  // Single source of truth for policy: <200MB => 5 parts, 200–500MB => 10 parts.
+  const effectiveMaxParts =
+    preInBytes < 200 * 1024 * 1024 ? 5 : 10;
   // Zone A: fewest-files-first, minimum damage; accept any valid fit (no total-size floor rejection).
   // Zone B: aggressive compression, <=5 parts; uses total cap and quality floor.
   const effectiveTotalCap = isHeavyInput ? totalCapBytes : preBytes;
@@ -2157,11 +2158,13 @@ async function processDefaultFast({
     updated_at: nowIso(),
   });
 
-  // DEFAULT split sizing (best-effort, ≤ SYSTEM_MAX_PARTS_DEFAULT parts):
-  // We enforce a fixed per-part goal (SYSTEM_PART_BYTES ~= 9MB) and never
-  // increase targetBytes to satisfy the 5-part cap.
-  const targetBytes = SYSTEM_PART_BYTES;
-  const maxPartsForSplit = SYSTEM_TARGET_PARTS_GOAL;
+  // DEFAULT split sizing (best-effort, ≤ effectiveMaxParts parts):
+  // Single source for part-size budget; never allow missing/invalid targetBytes.
+  const targetBytes =
+    Number.isFinite(SYSTEM_PART_BYTES) && SYSTEM_PART_BYTES > 0
+      ? SYSTEM_PART_BYTES
+      : 9 * 1024 * 1024;
+  const maxPartsForSplit = effectiveMaxParts;
 
   const wipePartsDir = () => {
     try {
@@ -2370,10 +2373,10 @@ async function processDefaultFast({
       ...rescueReason,
     });
 
-    // Rescue: still cap at 5 parts; do not silently produce many parts.
+    // Rescue: cap at effectiveMaxParts; do not silently produce many parts.
     res = await splitForSystem(workPdf, {
       targetBytes: SYSTEM_PART_BYTES,
-      maxParts: Math.min(5, prePages),
+      maxParts: Math.min(effectiveMaxParts, prePages),
     });
   }
   tmark(T, "split");
@@ -2458,7 +2461,7 @@ async function processDefaultFast({
         partsDir,
         targetBytes,
         expiresAtIso,
-        maxParts: 5,
+        maxParts: effectiveMaxParts,
       },
       qpdfWarnings,
     );
@@ -2644,6 +2647,10 @@ async function processOneJob(job) {
     });
 
     if (USE_PDF_WORKER) {
+      const partTargetBytes =
+        Number.isFinite(SYSTEM_PART_BYTES) && SYSTEM_PART_BYTES > 0
+          ? SYSTEM_PART_BYTES
+          : 9 * 1024 * 1024;
       try {
         const pdfWorkerUrl = new URL("../worker/dist/index.js", import.meta.url)
           .href;
@@ -2653,6 +2660,7 @@ async function processOneJob(job) {
             60_000,
             boundedTimeout(TIMEOUT_GS_MS, expiresAtIso, 20_000, 90_000) * 2,
           ),
+          targetBytes: partTargetBytes,
         });
         res = {
           partFiles: pdfRes.parts,
@@ -2666,20 +2674,30 @@ async function processOneJob(job) {
             : null,
         };
       } catch (pdfWorkerErr) {
+        const stage = "processPdf";
+        const errMsg = String(pdfWorkerErr?.message || pdfWorkerErr);
         console.warn(
-          "[PDF_WORKER] fallback to processDefaultFast:",
-          pdfWorkerErr?.message || pdfWorkerErr,
+          `[PDF_WORKER] ${stage} failed, falling back to processDefaultFast:`,
+          errMsg.slice(0, 500),
         );
-        const heavyLane =
-          heavyHint || queuedStage === "QUEUE_HEAVY" || IS_HEAVY_PROFILE;
-        res = await processDefaultFast({
-          jobId,
-          inPdf,
-          wd,
-          expiresAtIso,
-          startedAtMs,
-          heavyLane,
-        });
+        try {
+          const heavyLane =
+            heavyHint || queuedStage === "QUEUE_HEAVY" || IS_HEAVY_PROFILE;
+          res = await processDefaultFast({
+            jobId,
+            inPdf,
+            wd,
+            expiresAtIso,
+            startedAtMs,
+            heavyLane,
+          });
+        } catch (fallbackErr) {
+          console.error(
+            "[PDF_WORKER] processDefaultFast fallback also failed:",
+            String(fallbackErr?.message || fallbackErr).slice(0, 500),
+          );
+          throw fallbackErr;
+        }
       }
     } else {
       const heavyLane =
