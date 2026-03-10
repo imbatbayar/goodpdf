@@ -30,24 +30,47 @@ def _resize(img: Image.Image, max_side: int) -> Image.Image:
     return img.resize((nw, nh), Image.LANCZOS)
 
 
+def _gentle_params(level):
+    """Stepped gentle heuristics: 1=most conservative, 3=slightly stronger."""
+    tbl = {
+        1: {"min_side": 1800, "min_q": 48, "replace": 0.97, "skip_bytes": 150_000, "skip_px": 2_000_000, "skip_bytes_jpeg": 4_000_000},
+        2: {"min_side": 1600, "min_q": 45, "replace": 0.95, "skip_bytes": 100_000, "skip_px": 1_500_000, "skip_bytes_jpeg": 3_000_000},
+        3: {"min_side": 1400, "min_q": 42, "replace": 0.93, "skip_bytes": 80_000, "skip_px": 1_200_000, "skip_bytes_jpeg": 2_500_000},
+    }
+    return tbl.get(max(1, min(3, level)), tbl[1])
+
+
 def _recompress_one(payload):
     """
-    payload = (sha1, data, w, h, filt, max_side, q, force, gentle)
+    payload = (sha1, data, w, h, filt, max_side, q, force, gentle, gentle_level)
     return (sha1, new_bytes or None)
     """
-    sha1, data, w, h, filt, max_side, q, force, gentle = payload
+    sha1, data, w, h, filt, max_side, q, force, gentle, gentle_level = payload
 
     try:
-        # Gentle: higher skip thresholds to preserve quality
-        min_side = 1600 if gentle else MIN_SIDE_FLOOR
-        min_q = 45 if gentle else MIN_Q_FLOOR
-        replace_threshold = 0.95 if gentle else 0.92  # don't replace if save <5% (gentle) or <8%
+        if gentle:
+            gp = _gentle_params(gentle_level)
+            min_side = gp["min_side"]
+            min_q = gp["min_q"]
+            replace_threshold = gp["replace"]
+            skip_stream_bytes = gp["skip_bytes"]
+            skip_px = gp["skip_px"]
+            skip_bytes_jpeg = gp["skip_bytes_jpeg"]
+        else:
+            min_side = MIN_SIDE_FLOOR
+            min_q = MIN_Q_FLOOR
+            replace_threshold = 0.92
+            skip_stream_bytes = 0
+            skip_px = SKIP_JPEG_IF_PIXELS_LT
+            skip_bytes_jpeg = SKIP_JPEG_IF_BYTES_LT
 
-        # JPEG small enough => skip (unless force=true); gentle uses higher thresholds
+        # Gentle: skip already-small streams (preserve acceptable assets)
+        if gentle and not force and len(data) < skip_stream_bytes:
+            return (sha1, None)
+
+        # JPEG small enough => skip (unless force); gentle uses higher thresholds
         if not force and "DCTDecode" in filt and w and h:
-            skip_px = 1_500_000 if gentle else SKIP_JPEG_IF_PIXELS_LT
-            skip_bytes = 3_000_000 if gentle else SKIP_JPEG_IF_BYTES_LT
-            if (w * h) < skip_px and len(data) < skip_bytes:
+            if (w * h) < skip_px and len(data) < skip_bytes_jpeg:
                 return (sha1, None)
 
         img = Image.open(BytesIO(data)).convert("RGB")
@@ -130,7 +153,7 @@ def _apply_results(imgmap, results):
     return changed
 
 
-def recompress_topk_parallel(pdf: pikepdf.Pdf, max_side: int, q: int, top_k: int, min_stream_bytes: int, force: bool, gentle: bool = False) -> int:
+def recompress_topk_parallel(pdf: pikepdf.Pdf, max_side: int, q: int, top_k: int, min_stream_bytes: int, force: bool, gentle: bool = False, gentle_level: int = 1) -> int:
     imgmap = _collect_images(pdf, min_stream_bytes=min_stream_bytes)
 
     # sort by stream bytes desc, take top_k
@@ -139,7 +162,7 @@ def recompress_topk_parallel(pdf: pikepdf.Pdf, max_side: int, q: int, top_k: int
     payloads = []
     for sha1, meta in items:
         payloads.append(
-            (sha1, meta["data"], meta["w"], meta["h"], meta["filt"], max_side, q, force, gentle)
+            (sha1, meta["data"], meta["w"], meta["h"], meta["filt"], max_side, q, force, gentle, gentle_level)
         )
 
     results = {}
@@ -175,6 +198,8 @@ def main():
     parser.add_argument("--force", action="store_true", default=False)
     parser.add_argument("--gentle", action="store_true", default=False,
                         help="Smart Quality mode: preserve readability, skip marginal gains")
+    parser.add_argument("--gentle_level", type=int, default=1,
+                        help="1=most conservative, 2=moderate, 3=slightly stronger (Zone A stepped)")
 
     args = parser.parse_args()
 
@@ -189,6 +214,7 @@ def main():
     passes = max(1, int(args.passes))
     force = bool(args.force)
     gentle = bool(args.gentle)
+    gentle_level = max(1, min(3, int(args.gentle_level)))
 
     before = os.path.getsize(inp)
     images_touched = 0
@@ -208,6 +234,7 @@ def main():
                 min_stream_bytes=min_stream_bytes,
                 force=force,
                 gentle=gentle,
+                gentle_level=gentle_level,
             )
             pdf.save(tmp_out)
 
