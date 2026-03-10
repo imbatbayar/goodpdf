@@ -2881,6 +2881,7 @@ async function processOneJob(job) {
         : null;
 
     let hardCapMet = !systemFit || maxPartB == null || maxPartB <= targetBytes;
+    let dynamicExpansionApplied = false;
 
     console.log("[FINAL_ACCEPTANCE_CHECK]", {
       jobId,
@@ -2893,10 +2894,11 @@ async function processOneJob(job) {
       hardCapMet,
     });
 
-    // Dynamic part scaling: when default max parts (5 for Zone A, 10 for Zone B)
-    // cannot satisfy the per-part limit, allow a one-time expansion up to the
-    // hard cap (SYSTEM_MAX_PARTS_HARD_CAP) using oversize-safe split.
-    if (!hardCapMet && systemFit) {
+    // Dynamic part scaling: Zone B only. When default max parts (10) cannot
+    // satisfy the per-part limit, allow a one-time expansion up to the hard cap
+    // (SYSTEM_MAX_PARTS_HARD_CAP = 25). Zone A stays fewest-files-first (1–5 parts)
+    // with no expansion; if cap cannot be met, job fails cleanly.
+    if (!hardCapMet && systemFit && zone === "B") {
       const defaultMaxParts =
         inBytes < 200 * 1024 * 1024 ? SYSTEM_MAX_PARTS_DEFAULT : 10;
       const requiredPartsRaw =
@@ -2918,6 +2920,7 @@ async function processOneJob(job) {
           targetMb,
           defaultMaxParts,
           requiredParts,
+          hardCapMax: SYSTEM_MAX_PARTS_HARD_CAP,
         });
         try {
           // Re-split from original input PDF using a higher part cap.
@@ -2952,6 +2955,7 @@ async function processOneJob(job) {
               : null;
           hardCapMet =
             !systemFit || maxPartB == null || maxPartB <= targetBytes;
+          if (hardCapMet) dynamicExpansionApplied = true;
         } catch (e) {
           console.warn(
             "[DYNAMIC_PART_EXPANSION] failed, keeping original result:",
@@ -3058,13 +3062,17 @@ async function processOneJob(job) {
     const policyMaxPartsFromInput = inBytes < 200 * 1024 * 1024 ? 5 : 10;
     const maxPartsGoal = rescueInfo?.maxPartsGoal ?? policyMaxPartsFromInput;
     const rescueMsg =
-      rescueInfo && systemFit
+      rescueInfo && systemFit && !dynamicExpansionApplied
         ? `Could not reach <=${maxPartsGoal} parts at ${SYSTEM_PART_MB}MB target.\n` +
           `Estimated parts needed: ${rescueInfo.estimatedParts ?? "unknown"}.\n` +
           `Use Manual mode or stronger compression if you need fewer parts.`
         : null;
-    const finalWarningText =
-      rescueMsg && warningText
+    const expansionNote = dynamicExpansionApplied
+      ? "Dynamic expansion applied to preserve the 9MB per-part limit."
+      : null;
+    const finalWarningText = expansionNote
+      ? expansionNote
+      : rescueMsg && warningText
         ? `${rescueMsg}\n${warningText}`
         : rescueMsg || warningText;
 
