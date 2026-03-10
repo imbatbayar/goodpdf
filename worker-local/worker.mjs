@@ -2646,12 +2646,15 @@ async function processOneJob(job) {
     if (USE_PDF_WORKER) {
       try {
         const pdfWorkerUrl = new URL(
-          "../worker/pdfWorker/dist/index.js",
+          "../worker/dist/index.js",
           import.meta.url,
         ).href;
         const { processPdf } = await import(pdfWorkerUrl);
         const pdfRes = await processPdf(inPdf, partsDir, {
-          timeoutMs: Math.max(60_000, boundedTimeout(TIMEOUT_GS_MS, expiresAtIso, 20_000, 90_000) * 2),
+          timeoutMs: Math.max(
+            60_000,
+            boundedTimeout(TIMEOUT_GS_MS, expiresAtIso, 20_000, 90_000) * 2,
+          ),
         });
         res = {
           partFiles: pdfRes.parts,
@@ -2665,7 +2668,10 @@ async function processOneJob(job) {
             : null,
         };
       } catch (pdfWorkerErr) {
-        console.warn("[PDF_WORKER] fallback to processDefaultFast:", pdfWorkerErr?.message || pdfWorkerErr);
+        console.warn(
+          "[PDF_WORKER] fallback to processDefaultFast:",
+          pdfWorkerErr?.message || pdfWorkerErr,
+        );
         const heavyLane =
           heavyHint || queuedStage === "QUEUE_HEAVY" || IS_HEAVY_PROFILE;
         res = await processDefaultFast({
