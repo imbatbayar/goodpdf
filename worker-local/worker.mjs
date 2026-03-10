@@ -2645,10 +2645,8 @@ async function processOneJob(job) {
 
     if (USE_PDF_WORKER) {
       try {
-        const pdfWorkerUrl = new URL(
-          "../worker/dist/index.js",
-          import.meta.url,
-        ).href;
+        const pdfWorkerUrl = new URL("../worker/dist/index.js", import.meta.url)
+          .href;
         const { processPdf } = await import(pdfWorkerUrl);
         const pdfRes = await processPdf(inPdf, partsDir, {
           timeoutMs: Math.max(
