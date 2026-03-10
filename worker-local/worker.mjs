@@ -194,6 +194,10 @@ const SYSTEM_TARGET_PARTS_GOAL = 5;
 const SYSTEM_MAX_PARTS_DEFAULT = 5; // hard cap for DEFAULT; Manual can exceed this
 // Absolute hard cap for dynamic system-fit expansion (final acceptance gate).
 const SYSTEM_MAX_PARTS_HARD_CAP = 25;
+// Zone A: total-size target for 5-part mode when fewest-files-first fails.
+const ZONE_A_TOTAL_TARGET_IDEAL_MIN = 43 * 1024 * 1024;
+const ZONE_A_TOTAL_TARGET_IDEAL_MAX = 44 * 1024 * 1024;
+const ZONE_A_TOTAL_TARGET_HARD_MAX = 45 * 1024 * 1024;
 const SYSTEM_TARGET_TOTAL_BYTES = Math.floor(
   SYSTEM_TARGET_PARTS_GOAL * SYSTEM_PART_BYTES * 0.97,
 );
@@ -2962,6 +2966,97 @@ async function processOneJob(job) {
             String(e?.message || e).slice(0, 300),
           );
         }
+      }
+    }
+
+    // Zone A only: when fewest-files-first (1–5 parts) fails, try compress-to-total
+    // target (43–45MB) then split into 5 parts before final failure.
+    if (!hardCapMet && systemFit && zone === "A") {
+      const beforeBytes = safeStatSize(inPdf) ?? inBytes;
+      try {
+        const zoneAOut = path.join(wd, `.__zone_a_target_${rand6()}.pdf`);
+        const pyExe = pickPythonExe();
+        const tPy = boundedTimeout(120_000, expiresAtIso, 20_000, 120_000);
+        await runCmd(
+          pyExe,
+          [
+            path.join(__dirname, "tools", "selective_recompress.py"),
+            inPdf,
+            zoneAOut,
+            "--target_mb",
+            "44",
+            "--top_k",
+            "220",
+            "--min_stream_kb",
+            "180",
+            "--max_side",
+            "1400",
+            "--jpeg_q",
+            "42",
+            "--passes",
+            "3",
+            "--force",
+          ],
+          tPy,
+          {},
+          [0],
+        );
+        const afterBytes = safeStatSize(zoneAOut) ?? 0;
+        console.log("[ZONE_A_TOTAL_TARGET]", {
+          jobId,
+          beforeMb: Math.round(bytesToMb(beforeBytes) * 100) / 100,
+          afterMb: Math.round(bytesToMb(afterBytes) * 100) / 100,
+          targetMinMb: 43,
+          targetMaxMb: 44,
+          hardMaxMb: 45,
+        });
+        if (afterBytes > 0 && afterBytes <= ZONE_A_TOTAL_TARGET_HARD_MAX) {
+          safeRm(partsDir);
+          fs.mkdirSync(partsDir, { recursive: true });
+          const zoneAWarnings = [];
+          const zoneARes = await splitOversizeSafe(
+            {
+              inPdf: zoneAOut,
+              partsDir,
+              targetBytes,
+              expiresAtIso,
+              maxParts: 5,
+            },
+            zoneAWarnings,
+          );
+          safeUnlink(zoneAOut);
+          res = zoneARes;
+          partBytes = (res.partMeta || [])
+            .map((p) => p.bytes)
+            .filter((x) => typeof x === "number" && Number.isFinite(x));
+          totalPartsBytes = partBytes.length
+            ? partBytes.reduce((a, b) => a + b, 0)
+            : null;
+          maxPartB = partBytes.length ? Math.max(...partBytes) : null;
+          maxPartMb =
+            typeof maxPartB === "number"
+              ? Math.round(bytesToMb(maxPartB) * 100) / 100
+              : null;
+          totalOutMb =
+            typeof totalPartsBytes === "number"
+              ? Math.round(bytesToMb(totalPartsBytes) * 100) / 100
+              : null;
+          hardCapMet =
+            !systemFit || maxPartB == null || maxPartB <= targetBytes;
+          console.log("[ZONE_A_5PART_AFTER_COMPRESS]", {
+            jobId,
+            totalOutMb,
+            maxPartMb,
+            hardCapMet,
+          });
+        } else {
+          safeUnlink(zoneAOut);
+        }
+      } catch (e) {
+        console.warn(
+          "[ZONE_A_TOTAL_TARGET] failed:",
+          String(e?.message || e).slice(0, 300),
+        );
       }
     }
 
