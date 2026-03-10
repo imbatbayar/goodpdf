@@ -195,9 +195,10 @@ const SYSTEM_MAX_PARTS_DEFAULT = 5; // hard cap for DEFAULT; Manual can exceed t
 // Absolute hard cap for dynamic system-fit expansion (final acceptance gate).
 const SYSTEM_MAX_PARTS_HARD_CAP = 25;
 // Zone A: total-size target for 5-part mode when fewest-files-first fails.
-const ZONE_A_TOTAL_TARGET_IDEAL_MIN = 43 * 1024 * 1024;
-const ZONE_A_TOTAL_TARGET_IDEAL_MAX = 44 * 1024 * 1024;
-const ZONE_A_TOTAL_TARGET_HARD_MAX = 45 * 1024 * 1024;
+const ZONE_A_TARGET_MB_IDEAL_MIN = 43;
+const ZONE_A_TARGET_MB_IDEAL_MAX = 44;
+const ZONE_A_TARGET_MB_HARD_MAX = 45;
+const ZONE_A_TOTAL_TARGET_HARD_MAX = ZONE_A_TARGET_MB_HARD_MAX * 1024 * 1024;
 const SYSTEM_TARGET_TOTAL_BYTES = Math.floor(
   SYSTEM_TARGET_PARTS_GOAL * SYSTEM_PART_BYTES * 0.97,
 );
@@ -404,6 +405,99 @@ function pickPythonExe() {
   // Common fallbacks
   if (process.platform === "win32") return "python";
   return "python3";
+}
+
+/**
+ * Zone A compression ladder: reduce total PDF size gradually until <=45MB.
+ * Returns path to final compressed file (or null on failure).
+ */
+async function runZoneACompressionLadder(
+  inputPdfPath,
+  outDir,
+  expiresAtIso,
+  jobId = null,
+) {
+  const ladder = [
+    { target: 70, passes: 1 },
+    { target: 60, passes: 2 },
+    { target: 50, passes: 2 },
+    { target: 45, passes: 3 },
+  ];
+  const hardMaxBytes = ZONE_A_TOTAL_TARGET_HARD_MAX;
+  let curInput = inputPdfPath;
+  let prevOutput = null;
+  const pyExe = pickPythonExe();
+  const inputBytes = safeStatSize(inputPdfPath) ?? 0;
+
+  console.log("[ZONE_A_COMPRESS_START]", {
+    jobId,
+    inputMb: Math.round(bytesToMb(inputBytes) * 100) / 100,
+  });
+
+  for (let i = 0; i < ladder.length; i++) {
+    const step = ladder[i];
+    const outPath = path.join(
+      outDir,
+      `.__zone_a_ladder_${step.target}_${rand6()}.pdf`,
+    );
+    const tPy = boundedTimeout(120_000, expiresAtIso, 20_000, 120_000);
+    await runCmd(
+      pyExe,
+      [
+        path.join(__dirname, "tools", "selective_recompress.py"),
+        curInput,
+        outPath,
+        "--target_mb",
+        String(step.target),
+        "--passes",
+        String(step.passes),
+        "--top_k",
+        "220",
+        "--min_stream_kb",
+        "180",
+        "--max_side",
+        "1400",
+        "--jpeg_q",
+        "42",
+        "--force",
+      ],
+      tPy,
+      {},
+      [0],
+    );
+
+    const outBytes = safeStatSize(outPath) ?? 0;
+    const resultMb = Math.round(bytesToMb(outBytes) * 100) / 100;
+    console.log("[ZONE_A_COMPRESS_STEP]", {
+      jobId,
+      stepTarget: step.target,
+      resultMb,
+    });
+
+    if (prevOutput && prevOutput !== inputPdfPath) safeUnlink(prevOutput);
+    prevOutput = outPath;
+
+    if (outBytes > 0 && outBytes <= hardMaxBytes) {
+      console.log("[ZONE_A_COMPRESS_STOP]", {
+        jobId,
+        resultMb,
+        reason: "under_hard_max",
+      });
+      return outPath;
+    }
+
+    curInput = outPath;
+  }
+
+  const finalMb = prevOutput
+    ? Math.round(bytesToMb(safeStatSize(prevOutput) ?? 0) * 100) / 100
+    : null;
+  console.log("[ZONE_A_COMPRESS_STOP]", {
+    jobId,
+    resultMb: finalMb,
+    reason: "ladder_exhausted",
+  });
+  return prevOutput;
 }
 
 // ----------------------
@@ -2969,62 +3063,43 @@ async function processOneJob(job) {
       }
     }
 
-    // Zone A only: when fewest-files-first (1–5 parts) fails, try compress-to-total
-    // target (43–45MB) then split into 5 parts before final failure.
+    // Zone A only: when fewest-files-first (1–5 parts) fails, run compression ladder
+    // (70→60→50→45 MB) until total <=45MB, then split into 5 parts before final failure.
     if (!hardCapMet && systemFit && zone === "A") {
-      const beforeBytes = safeStatSize(inPdf) ?? inBytes;
       try {
-        const zoneAOut = path.join(wd, `.__zone_a_target_${rand6()}.pdf`);
-        const pyExe = pickPythonExe();
-        const tPy = boundedTimeout(120_000, expiresAtIso, 20_000, 120_000);
-        await runCmd(
-          pyExe,
-          [
-            path.join(__dirname, "tools", "selective_recompress.py"),
-            inPdf,
-            zoneAOut,
-            "--target_mb",
-            "44",
-            "--top_k",
-            "220",
-            "--min_stream_kb",
-            "180",
-            "--max_side",
-            "1400",
-            "--jpeg_q",
-            "42",
-            "--passes",
-            "3",
-            "--force",
-          ],
-          tPy,
-          {},
-          [0],
-        );
-        const afterBytes = safeStatSize(zoneAOut) ?? 0;
-        console.log("[ZONE_A_TOTAL_TARGET]", {
+        const compressedPdf = await runZoneACompressionLadder(
+          inPdf,
+          wd,
+          expiresAtIso,
           jobId,
-          beforeMb: Math.round(bytesToMb(beforeBytes) * 100) / 100,
-          afterMb: Math.round(bytesToMb(afterBytes) * 100) / 100,
-          targetMinMb: 43,
-          targetMaxMb: 44,
-          hardMaxMb: 45,
-        });
-        if (afterBytes > 0 && afterBytes <= ZONE_A_TOTAL_TARGET_HARD_MAX) {
+        );
+        if (compressedPdf) {
           safeRm(partsDir);
           fs.mkdirSync(partsDir, { recursive: true });
           const zoneAWarnings = [];
-          const zoneARes = await splitOversizeSafe(
+          const pages = await qpdfPages(
+            compressedPdf,
+            expiresAtIso,
+            zoneAWarnings,
+          );
+          const compressedBytes = safeStatSize(compressedPdf) ?? 0;
+          const ranges = buildRangesByEstimatedSize({
+            bytes: compressedBytes,
+            pages,
+            targetBytes,
+            maxParts: 5,
+            parts: 5,
+          });
+          const zoneARes = await splitSinglePass(
             {
-              inPdf: zoneAOut,
+              inPdf: compressedPdf,
               partsDir,
-              targetBytes,
+              ranges,
               expiresAtIso,
-              maxParts: 5,
             },
             zoneAWarnings,
           );
-          safeUnlink(zoneAOut);
+          safeUnlink(compressedPdf);
           res = zoneARes;
           partBytes = (res.partMeta || [])
             .map((p) => p.bytes)
@@ -3043,18 +3118,16 @@ async function processOneJob(job) {
               : null;
           hardCapMet =
             !systemFit || maxPartB == null || maxPartB <= targetBytes;
-          console.log("[ZONE_A_5PART_AFTER_COMPRESS]", {
+          console.log("[ZONE_A_AFTER_COMPRESS_SPLIT]", {
             jobId,
             totalOutMb,
             maxPartMb,
             hardCapMet,
           });
-        } else {
-          safeUnlink(zoneAOut);
         }
       } catch (e) {
         console.warn(
-          "[ZONE_A_TOTAL_TARGET] failed:",
+          "[ZONE_A_COMPRESS_LADDER] failed:",
           String(e?.message || e).slice(0, 300),
         );
       }
