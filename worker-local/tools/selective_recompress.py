@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 import json
+import traceback
 import hashlib
 from io import BytesIO
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -245,9 +246,11 @@ def main():
                 os.remove(tmp_out)
             out_dir = os.path.dirname(tmp_out)
             out_dir_exists = os.path.isdir(out_dir) if out_dir else True
-            out_exists = os.path.exists(tmp_out)
+            out_exists_before = os.path.exists(tmp_out)
+            input_exists = os.path.isfile(cur_in)
+            input_size = os.path.getsize(cur_in) if input_exists else None
             print(
-                f"[SELECTIVE_RECOMPRESS] before save: input={cur_in!r} output={tmp_out!r} output_dir_exists={out_dir_exists} output_exists={out_exists}",
+                f"[SELECTIVE_RECOMPRESS] before save: input={cur_in!r} output={tmp_out!r} input_exists={input_exists} input_size_bytes={input_size} output_dir_exists={out_dir_exists} output_exists_before_save={out_exists_before}",
                 file=sys.stderr,
             )
 
@@ -255,10 +258,13 @@ def main():
             try:
                 pdf.save(tmp_out, garbage=3, deflate=True)
             except Exception as e:
-                print(f"[SELECTIVE_RECOMPRESS] save failed: {e!r}", file=sys.stderr)
+                print(f"[SELECTIVE_RECOMPRESS] save failed (full): {e!r}", file=sys.stderr)
+                print(traceback.format_exc(), file=sys.stderr)
                 try:
                     pdf.save(tmp_out)
                 except Exception as e2:
+                    print(f"[SELECTIVE_RECOMPRESS] retry save failed (full): {e2!r}", file=sys.stderr)
+                    print(traceback.format_exc(), file=sys.stderr)
                     raise RuntimeError(
                         f"selective_recompress save failed (original: {e!r}, retry: {e2!r})"
                     ) from e2

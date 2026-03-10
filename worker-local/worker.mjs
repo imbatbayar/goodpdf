@@ -448,6 +448,17 @@ async function runZoneACompressionLadder(
       `.__zone_a_ladder_${step.target}_${rand6()}.pdf`,
     );
     const tPy = boundedTimeout(120_000, expiresAtIso, 20_000, 120_000);
+    const curInputExists = safeExists(curInput);
+    const curInputSize = safeStatSize(curInput);
+    console.log("[ZONE_A_COMPRESS_PY_INVOKE]", {
+      jobId,
+      stage: "A",
+      stepTarget: step.target,
+      inputPath: curInput,
+      inputExists: curInputExists,
+      inputSizeBytes: curInputSize,
+      outputPath: outPath,
+    });
     await runCmd(
       pyExe,
       [
@@ -515,6 +526,17 @@ async function runZoneACompressionLadder(
       `.__zone_a_ladder_B${step.target}_${rand6()}.pdf`,
     );
     const tPy = boundedTimeout(120_000, expiresAtIso, 20_000, 120_000);
+    const curInputExists = safeExists(curInput);
+    const curInputSize = safeStatSize(curInput);
+    console.log("[ZONE_A_COMPRESS_PY_INVOKE]", {
+      jobId,
+      stage: "B",
+      stepTarget: step.target,
+      inputPath: curInput,
+      inputExists: curInputExists,
+      inputSizeBytes: curInputSize,
+      outputPath: outPath,
+    });
     await runCmd(
       pyExe,
       [
@@ -3219,9 +3241,10 @@ async function processOneJob(job) {
           });
         }
       } catch (e) {
+        const fullMsg = String(e?.message ?? e);
         console.warn(
-          "[ZONE_A_COMPRESS_LADDER] failed:",
-          String(e?.message || e).slice(0, 300),
+          "[ZONE_A_COMPRESS_LADDER] failed (full stderr/out):",
+          fullMsg,
         );
       }
     }
