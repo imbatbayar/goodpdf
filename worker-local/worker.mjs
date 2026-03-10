@@ -3105,6 +3105,8 @@ async function processOneJob(job) {
       maxPartMb,
       targetMb,
       hardCapMet,
+      zoneAMaxPartsMet,
+      maxPartsAllowed: zone === "A" ? SYSTEM_MAX_PARTS_DEFAULT : null,
     });
 
     // Dynamic part scaling: Zone B only. When default max parts (10) cannot
@@ -3249,26 +3251,32 @@ async function processOneJob(job) {
       }
     }
 
-    if (!hardCapMet) {
-      const partsCount = res.partFiles?.length || 0;
+    const finalPartsCount = res.partFiles?.length || 0;
+    const finalZoneAMaxPartsMet =
+      zone !== "A" || finalPartsCount <= SYSTEM_MAX_PARTS_DEFAULT;
+
+    if (!hardCapMet || !finalZoneAMaxPartsMet) {
       const errorText =
         `Could not fit all parts within the ${SYSTEM_PART_MB}MB per-part limit. ` +
-        `Max part was ${maxPartMb ?? "unknown"}MB across ${partsCount} parts. ` +
+        `Max part was ${maxPartMb ?? "unknown"}MB across ${finalPartsCount} parts. ` +
         "Use Manual mode or stronger compression if you need fewer or smaller parts.";
 
       console.log("[FINAL_ACCEPT_REJECT]", {
         jobId,
         zone,
-        parts: partsCount,
+        parts: finalPartsCount,
         totalOutMb,
         maxPartMb,
         targetMb,
         finalStatus: "FAILED",
+        maxPartsAllowed: zone === "A" ? SYSTEM_MAX_PARTS_DEFAULT : null,
+        zoneAMaxPartsMet: finalZoneAMaxPartsMet,
+        rejectReason: !hardCapMet ? "part_over_target_mb" : "too_many_parts",
       });
       console.log("[SPLIT_TARGET_NOT_MET]", {
         jobId,
         zone,
-        parts: partsCount,
+        parts: finalPartsCount,
         totalOutMb,
         maxPartMb,
         targetMb,
@@ -3300,7 +3308,7 @@ async function processOneJob(job) {
         ttl_minutes: ttlMinutes,
         expires_at: expiresAtIso,
         delete_at: expiresAtIso,
-        parts_count: partsCount || null,
+        parts_count: finalPartsCount || null,
         parts_json: res.partMeta || null,
         total_parts_bytes: totalPartsBytes,
         output_zip_bytes: null,
@@ -3328,6 +3336,8 @@ async function processOneJob(job) {
       maxPartMb,
       targetMb,
       finalStatus: "DONE",
+      maxPartsAllowed: zone === "A" ? SYSTEM_MAX_PARTS_DEFAULT : null,
+      zoneAMaxPartsMet: finalZoneAMaxPartsMet,
     });
 
     // ZIP
