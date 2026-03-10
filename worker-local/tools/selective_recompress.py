@@ -96,11 +96,11 @@ def _recompress_one(payload):
 def _collect_images(pdf: pikepdf.Pdf, min_stream_bytes: int):
     """
     Return list of unique images by sha1(stream_bytes) with metadata:
-    {sha1: {"xobjs":[xobj,...], "len":N, "w":w, "h":h, "filt":str}}
+    {sha1: {"xobjs":[xobj,...], "len":N, "w":w, "h":h, "filt":str, "pages":[1,2,...]}}
     """
     mp = {}
 
-    for page in pdf.pages:
+    for page_no, page in enumerate(pdf.pages, start=1):
         res = page.get("/Resources")
         if not res:
             continue
@@ -122,10 +122,10 @@ def _collect_images(pdf: pikepdf.Pdf, min_stream_bytes: int):
 
                 sha1 = hashlib.sha1(data).hexdigest()
                 if sha1 not in mp:
-                    mp[sha1] = {"xobjs": [xobj], "len": len(
-                        data), "w": w, "h": h, "filt": filt, "data": data}
+                    mp[sha1] = {"xobjs": [xobj], "len": len(data), "w": w, "h": h, "filt": filt, "data": data, "pages": [page_no]}
                 else:
                     mp[sha1]["xobjs"].append(xobj)
+                    mp[sha1]["pages"].append(page_no)
             except Exception:
                 continue
 
@@ -155,11 +155,34 @@ def _apply_results(imgmap, results):
     return changed
 
 
-def recompress_topk_parallel(pdf: pikepdf.Pdf, max_side: int, q: int, top_k: int, min_stream_bytes: int, force: bool, gentle: bool = False, gentle_level: int = 1) -> int:
+def recompress_topk_parallel(pdf: pikepdf.Pdf, max_side: int, q: int, top_k: int, min_stream_bytes: int, force: bool, gentle: bool = False, gentle_level: int = 1):
+    """
+    Returns (changed_count, n_images_found, n_images_selected).
+    """
     imgmap = _collect_images(pdf, min_stream_bytes=min_stream_bytes)
 
+    n_pages = len(pdf.pages)
+    n_found = len(imgmap)
     # sort by stream bytes desc, take top_k
     items = sorted(imgmap.items(), key=lambda kv: kv[1]["len"], reverse=True)[:top_k]
+    n_selected = len(items)
+
+    print(f"[SELECTIVE_RECOMPRESS] total_pages={n_pages} images_found={n_found} images_selected={n_selected} (top_k={top_k} min_stream_kb={min_stream_bytes // 1024} gentle={gentle})", file=sys.stderr)
+    if n_found == 0:
+        print(
+            f"[SELECTIVE_RECOMPRESS] no images qualify: min_stream_kb={min_stream_bytes // 1024} top_k={top_k} gentle={gentle} (lower --min_stream_kb or check PDF has embedded images above threshold)",
+            file=sys.stderr,
+        )
+    elif n_selected == 0:
+        print(f"[SELECTIVE_RECOMPRESS] no images selected: top_k={top_k} gentle={gentle}", file=sys.stderr)
+    else:
+        for idx, (sha1, meta) in enumerate(items):
+            pages = meta.get("pages", [])
+            page_str = str(pages[0]) if pages else "?"
+            print(
+                f"[SELECTIVE_RECOMPRESS] selected[{idx + 1}] page={page_str} w={meta['w']} h={meta['h']} stream_bytes={meta['len']} max_side={max_side} jpeg_q={q}",
+                file=sys.stderr,
+            )
 
     payloads = []
     for sha1, meta in items:
@@ -179,12 +202,13 @@ def recompress_topk_parallel(pdf: pikepdf.Pdf, max_side: int, q: int, top_k: int
                 results[sha1] = None
 
     changed = _apply_results(imgmap, results)
+    print(f"[SELECTIVE_RECOMPRESS] images_replaced_this_pass={changed}", file=sys.stderr)
 
     # free big bytes
     for _, meta in imgmap.items():
         meta.pop("data", None)
 
-    return changed
+    return (changed, n_found, n_selected)
 
 
 def main():
@@ -223,8 +247,11 @@ def main():
     gentle_level = max(1, min(3, int(args.gentle_level)))
 
     before = os.path.getsize(inp)
+    print(f"[SELECTIVE_RECOMPRESS] total_bytes_before={before}", file=sys.stderr)
     images_touched = 0
     passes_run = 0
+    last_n_found = 0
+    last_n_selected = 0
     base_out, ext_out = os.path.splitext(tmp_out)
 
     cur_in = inp
@@ -238,7 +265,7 @@ def main():
         )
 
         with pikepdf.open(cur_in) as pdf:
-            images_touched += recompress_topk_parallel(
+            changed, last_n_found, last_n_selected = recompress_topk_parallel(
                 pdf,
                 max_side=max_side,
                 q=jpeg_q,
@@ -248,6 +275,7 @@ def main():
                 gentle=gentle,
                 gentle_level=gentle_level,
             )
+            images_touched += changed
 
             # Robust output-path handling (Windows-safe): never read and write same path
             if os.path.exists(pass_out):
@@ -279,7 +307,7 @@ def main():
 
             saved_bytes = os.path.getsize(pass_out)
             print(
-                f"[SELECTIVE_RECOMPRESS] after save: saved_bytes={saved_bytes} path={pass_out!r}",
+                f"[SELECTIVE_RECOMPRESS] after save: saved_bytes={saved_bytes} path={pass_out!r} total_bytes_after={saved_bytes}",
                 file=sys.stderr,
             )
 
@@ -302,9 +330,17 @@ def main():
                 except OSError:
                     pass
 
+    after_bytes = os.path.getsize(tmp_out)
+    before_mb = round(before / (1024 * 1024), 2)
+    after_mb = round(after_bytes / (1024 * 1024), 2)
+    print(
+        f"[SELECTIVE_RECOMPRESS] final_summary images_found={last_n_found} images_selected={last_n_selected} images_replaced={images_touched} before_mb={before_mb} after_mb={after_mb}",
+        file=sys.stderr,
+    )
+
     summary = {
         "before_bytes": before,
-        "after_bytes": os.path.getsize(tmp_out),
+        "after_bytes": after_bytes,
         "images_touched": images_touched,
         "passes_run": passes_run,
     }
