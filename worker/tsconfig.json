@@ -3,14 +3,14 @@
     "target": "ES2020",
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "outDir": "pdfWorker/dist",
-    "rootDir": "pdfWorker",
+    "outDir": "./dist",
+    "rootDir": "./pdfWorker",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "declaration": true,
     "declarationMap": true
   },
-  "include": ["pdfWorker/**/*.ts"],
-  "exclude": ["node_modules"]
+  "include": ["./pdfWorker/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
 }
