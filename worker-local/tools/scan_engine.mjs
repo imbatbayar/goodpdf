@@ -63,6 +63,7 @@ export function buildRangesFromPageBytes({ pageBytes, parts }) {
   let startIdx = 0;
 
   for (let k = 0; k < numParts; k++) {
+    if (startIdx >= p) break;
     const remainingParts = numParts - k;
     const remainingPages = p - startIdx;
     const endIdx =
@@ -74,8 +75,10 @@ export function buildRangesFromPageBytes({ pageBytes, parts }) {
             while (e < p - 1 && cum[e + 1] < targetByte) e++;
             return e;
           })();
-    ranges.push({ start: startIdx + 1, end: endIdx + 1 });
-    startIdx = endIdx + 1;
+    const endClamped = Math.min(endIdx, p - 1);
+    if (endClamped < startIdx) break;
+    ranges.push({ start: startIdx + 1, end: endClamped + 1 });
+    startIdx = endClamped + 1;
   }
   return ranges;
 }
@@ -112,10 +115,11 @@ export function buildRangesByEstimatedSize({ bytes, pages, targetBytes, maxParts
   let running = 0;
 
   for (let k = 0; k < parts; k++) {
+    if (start >= p) break;
     const remainingParts = parts - k;
     const remainingPages = p - start;
     if (remainingParts <= 1) {
-      ranges.push({ start: start + 1, end: p });
+      if (start < p) ranges.push({ start: start + 1, end: p });
       break;
     }
     const remainingBytes = b - running;
@@ -130,6 +134,8 @@ export function buildRangesByEstimatedSize({ bytes, pages, targetBytes, maxParts
       chunk = nextChunk;
       end++;
     }
+    end = Math.min(end, p - 1);
+    if (end < start) break;
     ranges.push({ start: start + 1, end: end + 1 });
     for (let i = start; i <= end; i++) running += estBytes[i];
     start = end + 1;

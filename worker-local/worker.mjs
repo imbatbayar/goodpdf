@@ -968,6 +968,25 @@ async function cleanupExpiredOutputs() {
 // ----------------------
 // qpdf helpers
 // ----------------------
+
+function toQpdfPageRange(start, end, lastPage = null) {
+  const s = Math.max(1, Math.floor(Number(start)));
+  const e = Math.max(1, Math.floor(Number(end)));
+  if (!Number.isFinite(s) || !Number.isFinite(e) || s < 1 || e < 1) {
+    throw new Error(
+      `[QPDF_RANGE_INVALID] start=${start} end=${end} (must be integers >= 1)`,
+    );
+  }
+  if (e < s) {
+    throw new Error(
+      `[QPDF_RANGE_INVALID] end(${e}) < start(${s}) (must be start <= end)`,
+    );
+  }
+  if (s === e) return String(s);
+  if (lastPage != null && e === lastPage) return `${s}-z`;
+  return `${s}-${e}`;
+}
+
 async function qpdfPages(inPdf, expiresAtIso, warnings = null) {
   const tQ = Math.min(
     boundedTimeout(TIMEOUT_QPDF_MS, expiresAtIso, 10_000, 60_000),
@@ -1069,13 +1088,14 @@ function buildEqualRanges(pages, parts) {
   let start = 1;
 
   for (let i = 0; i < k; i++) {
+    if (start > p) break;
     const left = k - i;
     const remaining = p - start + 1;
     const size = Math.ceil(remaining / left);
-    const end = Math.min(p, start + size - 1);
+    let end = Math.min(p, start + size - 1);
+    if (end < start) break;
     ranges.push({ start, end });
     start = end + 1;
-    if (start > p) break;
   }
   return ranges;
 }
@@ -1133,9 +1153,10 @@ function buildRangesNearTarget({ pageBytes, targetBytes, maxParts }) {
   let remainingParts = parts;
 
   for (let p = 1; p <= pages; p++) {
+    if (start > pages) break;
     const remainingPages = pages - p + 1;
     if (remainingPages === remainingParts) {
-      if (start <= p - 1) ranges.push({ start, end: p - 1 });
+      if (start <= p - 1) ranges.push({ start, end: Math.min(p - 1, pages) });
       for (let q = p; q <= pages; q++) ranges.push({ start: q, end: q });
       return ranges;
     }
@@ -1151,10 +1172,13 @@ function buildRangesNearTarget({ pageBytes, targetBytes, maxParts }) {
 
     const b = pageBytes[p - 1];
     if (running > 0 && running + b > dynamicTarget) {
-      ranges.push({ start, end: p - 1 });
-      remainingParts--;
-      start = p;
-      running = 0;
+      const end = Math.min(p - 1, pages);
+      if (end >= start) {
+        ranges.push({ start, end });
+        remainingParts--;
+        start = p;
+        running = 0;
+      }
     }
     running += b;
   }
@@ -1178,9 +1202,21 @@ async function splitSinglePass(
 
   const results = await asyncPool(SPLIT_PAR, ranges, async (r, i) => {
     const outPath = tmpName(i, r.start, r.end);
+    let rangeStr;
+    try {
+      rangeStr = toQpdfPageRange(r.start, r.end);
+    } catch (e) {
+      console.error("[QPDF_RANGE_INVALID]", e.message);
+      throw e;
+    }
+    console.log("[QPDF_RANGE]", {
+      range: rangeStr,
+      start: r.start,
+      end: r.end,
+    });
     const result = await runCmd(
       QPDF_EXE,
-      ["--empty", "--pages", inPdf, `${r.start}-${r.end}`, "--", outPath],
+      ["--empty", "--pages", inPdf, rangeStr, "--", outPath],
       tEach,
       {},
       [0, 3],
@@ -1362,10 +1398,18 @@ async function qpdfExtractPage(
   { inPdf, pageNum, outPdf, expiresAtIso },
   warnings = null,
 ) {
+  let rangeStr;
+  try {
+    rangeStr = toQpdfPageRange(pageNum, pageNum);
+  } catch (e) {
+    console.error("[QPDF_RANGE_INVALID]", e.message);
+    throw e;
+  }
+  console.log("[QPDF_RANGE]", { range: rangeStr, pageNum });
   const tQ = boundedTimeout(TIMEOUT_QPDF_MS, expiresAtIso, 15_000, 60_000);
   const result = await runCmd(
     QPDF_EXE,
-    ["--empty", "--pages", inPdf, `${pageNum}-${pageNum}`, "--", outPdf],
+    ["--empty", "--pages", inPdf, rangeStr, "--", outPdf],
     tQ,
     {},
     [0, 3],
