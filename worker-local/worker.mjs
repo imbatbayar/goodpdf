@@ -3264,11 +3264,66 @@ async function processOneJob(job) {
       }
     }
 
-    const finalPartsCount = res.partFiles?.length || 0;
-    const finalZoneAMaxPartsMet =
+    let finalPartsCount = res.partFiles?.length || 0;
+    let finalZoneAMaxPartsMet =
       zone !== "A" || finalPartsCount <= SYSTEM_MAX_PARTS_DEFAULT;
+    let tempAccept6Part = false;
 
-    if (!hardCapMet || !finalZoneAMaxPartsMet) {
+    // Zone A fallback: try 6-part split when compression couldn't reduce enough
+    if ((!hardCapMet || !finalZoneAMaxPartsMet) && zone === "A" && systemFit) {
+      try {
+        safeRm(partsDir);
+        fs.mkdirSync(partsDir, { recursive: true });
+        const fallbackWarnings = [];
+        const fallbackRes = await splitOversizeSafe(
+          {
+            inPdf,
+            partsDir,
+            targetBytes,
+            expiresAtIso,
+            maxParts: 6,
+          },
+          fallbackWarnings,
+        );
+        const fbPartBytes = (fallbackRes.partMeta || [])
+          .map((p) => p.bytes)
+          .filter((x) => typeof x === "number" && Number.isFinite(x));
+        const fbMaxPart = fbPartBytes.length ? Math.max(...fbPartBytes) : null;
+        if (
+          fallbackRes.partFiles?.length === 6 &&
+          fbMaxPart != null &&
+          fbMaxPart <= targetBytes
+        ) {
+          res = fallbackRes;
+          partBytes = fbPartBytes;
+          totalPartsBytes = partBytes.reduce((a, b) => a + b, 0);
+          maxPartB = fbMaxPart;
+          maxPartMb =
+            typeof maxPartB === "number"
+              ? Math.round(bytesToMb(maxPartB) * 100) / 100
+              : null;
+          totalOutMb =
+            typeof totalPartsBytes === "number"
+              ? Math.round(bytesToMb(totalPartsBytes) * 100) / 100
+              : null;
+          hardCapMet = true;
+          finalPartsCount = 6;
+          tempAccept6Part = true;
+          console.log("[TEMP_ACCEPT_6_PART_FALLBACK]", {
+            jobId,
+            totalOutMb,
+            maxPartMb,
+          });
+        }
+      } catch (e) {
+        console.warn(
+          "[TEMP_ACCEPT_6_PART_FALLBACK] failed:",
+          String(e?.message || e).slice(0, 300),
+        );
+      }
+    }
+
+    if (!tempAccept6Part && (!hardCapMet || !finalZoneAMaxPartsMet)) {
       const errorText =
         `Could not fit all parts within the ${SYSTEM_PART_MB}MB per-part limit. ` +
         `Max part was ${maxPartMb ?? "unknown"}MB across ${finalPartsCount} parts. ` +

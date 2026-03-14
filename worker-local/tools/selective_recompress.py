@@ -287,6 +287,19 @@ def main():
             )
             images_touched += changed
 
+            if last_n_found == 0:
+                print(
+                    "[SELECTIVE_RECOMPRESS] early_stop reason=no_images_found",
+                    file=sys.stderr,
+                )
+                break
+            if last_n_selected == 0:
+                print(
+                    "[SELECTIVE_RECOMPRESS] early_stop reason=no_images_selected",
+                    file=sys.stderr,
+                )
+                break
+
             # Robust output-path handling (Windows-safe): never read and write same path
             if os.path.exists(pass_out):
                 os.remove(pass_out)
@@ -300,9 +313,11 @@ def main():
                 file=sys.stderr,
             )
 
-            # Safe save with retry
+            # Safe save with retry (garbage=3 unsupported in some pikepdf versions)
             try:
-                pdf.save(pass_out, garbage=3, deflate=True)
+                pdf.save(pass_out, deflate=True)
+            except TypeError:
+                pdf.save(pass_out)
             except Exception as e:
                 print(f"[SELECTIVE_RECOMPRESS] save failed (full): {e!r}", file=sys.stderr)
                 print(traceback.format_exc(), file=sys.stderr)
