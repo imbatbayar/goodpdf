@@ -431,6 +431,8 @@ async function runZoneACompressionLadder(
   let curInput = inputPdfPath;
   let prevOutput = null;
   const pyExe = pickPythonExe();
+  const truncLog = (s, n = 4000) =>
+    typeof s === "string" && s.length > n ? s.slice(0, n) + "..." : s || "";
   const inputBytes = safeStatSize(inputPdfPath) ?? 0;
 
   console.log("[ZONE_A_COMPRESS_START]", {
@@ -459,7 +461,7 @@ async function runZoneACompressionLadder(
       inputSizeBytes: curInputSize,
       outputPath: outPath,
     });
-    await runCmd(
+    const pyResultA = await runCmd(
       pyExe,
       [
         path.join(__dirname, "tools", "selective_recompress.py"),
@@ -483,6 +485,12 @@ async function runZoneACompressionLadder(
       {},
       [0],
     );
+    if (pyResultA.out) {
+      console.log("[ZONE_A_COMPRESS_PY_STDOUT]", truncLog(pyResultA.out));
+    }
+    if (pyResultA.err) {
+      console.log("[ZONE_A_COMPRESS_PY_STDERR]", truncLog(pyResultA.err));
+    }
 
     const outBytes = safeStatSize(outPath) ?? 0;
     const resultMb = Math.round(bytesToMb(outBytes) * 100) / 100;
@@ -537,7 +545,7 @@ async function runZoneACompressionLadder(
       inputSizeBytes: curInputSize,
       outputPath: outPath,
     });
-    await runCmd(
+    const pyResultB = await runCmd(
       pyExe,
       [
         path.join(__dirname, "tools", "selective_recompress.py"),
@@ -561,6 +569,12 @@ async function runZoneACompressionLadder(
       {},
       [0],
     );
+    if (pyResultB.out) {
+      console.log("[ZONE_A_COMPRESS_PY_STDOUT]", truncLog(pyResultB.out));
+    }
+    if (pyResultB.err) {
+      console.log("[ZONE_A_COMPRESS_PY_STDERR]", truncLog(pyResultB.err));
+    }
 
     const outBytes = safeStatSize(outPath) ?? 0;
     const resultMb = Math.round(bytesToMb(outBytes) * 100) / 100;
@@ -3105,7 +3119,6 @@ async function processOneJob(job) {
       maxPartMb,
       targetMb,
       hardCapMet,
-      zoneAMaxPartsMet,
       maxPartsAllowed: zone === "A" ? SYSTEM_MAX_PARTS_DEFAULT : null,
     });
 

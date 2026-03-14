@@ -135,6 +135,8 @@ def _collect_images(pdf: pikepdf.Pdf, min_stream_bytes: int):
 def _apply_results(imgmap, results):
     """
     Replace streams for all xobjs with returned new bytes.
+    Uses pikepdf.Stream.write() for safe replacement. Keeps /Filter as /DCTDecode,
+    removes stale /DecodeParms, logs per-image failures to stderr.
     returns changed_count
     """
     changed = 0
@@ -146,12 +148,20 @@ def _apply_results(imgmap, results):
             continue
         for xobj in meta["xobjs"]:
             try:
-                xobj.stream = new_data
-                xobj["/Filter"] = pikepdf.Name("/DCTDecode")
+                xobj.write(
+                    new_data,
+                    filter=pikepdf.Name("/DCTDecode"),
+                    decode_parms=None,
+                )
+                if "/DecodeParms" in xobj:
+                    del xobj["/DecodeParms"]
                 xobj["/ColorSpace"] = pikepdf.Name("/DeviceRGB")
                 changed += 1
-            except Exception:
-                pass
+            except Exception as e:
+                print(
+                    f"[SELECTIVE_RECOMPRESS] stream_replace_failed sha1={sha1} error={e!r}",
+                    file=sys.stderr,
+                )
     return changed
 
 
